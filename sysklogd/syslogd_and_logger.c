@@ -50,8 +50,15 @@ typedef struct _code {
  * The pointers themselves are optimized out
  * (no size change on uclibc).
  */
+#if defined(__GNUC__) && __GNUC__ >= 4
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
+#endif
 static const CODE *const bb_prioritynames = prioritynames;
 static const CODE *const bb_facilitynames = facilitynames;
+#if defined(__GNUC__) && __GNUC__ >= 4
+# pragma GCC diagnostic pop
+#endif
 
 
 #if ENABLE_SYSLOGD

@@ -1387,27 +1387,27 @@ select_and_cluster(void)
 		}
 	}
 
-	if (0) {
-		/* Combine the offsets of the clustering algorithm survivors
-		 * using a weighted average with weight determined by the root
-		 * distance. Compute the selection jitter as the weighted RMS
-		 * difference between the first survivor and the remaining
-		 * survivors. In some cases the inherent clock jitter can be
-		 * reduced by not using this algorithm, especially when frequent
-		 * clockhopping is involved. bbox: thus we don't do it.
-		 */
-		double x, y, z, w;
-		y = z = w = 0;
-		for (i = 0; i < num_survivors; i++) {
-			p = survivor[i].p;
-			x = root_distance(p);
-			y += 1 / x;
-			z += p->filter_offset / x;
-			w += SQUARE(p->filter_offset - survivor[0].p->filter_offset) / x;
-		}
-		//G.cluster_offset = z / y;
-		//G.cluster_jitter = SQRT(w / y);
+#if 0
+	/* Combine the offsets of the clustering algorithm survivors
+	 * using a weighted average with weight determined by the root
+	 * distance. Compute the selection jitter as the weighted RMS
+	 * difference between the first survivor and the remaining
+	 * survivors. In some cases the inherent clock jitter can be
+	 * reduced by not using this algorithm, especially when frequent
+	 * clockhopping is involved. bbox: thus we don't do it.
+	 */
+	double x, y, z, w;
+	y = z = w = 0;
+	for (i = 0; i < num_survivors; i++) {
+		p = survivor[i].p;
+		x = root_distance(p);
+		y += 1 / x;
+		z += p->filter_offset / x;
+		w += SQUARE(p->filter_offset - survivor[0].p->filter_offset) / x;
 	}
+	//G.cluster_offset = z / y;
+	//G.cluster_jitter = SQRT(w / y);
+#endif
 
 	/* Pick the best clock. If the old system peer is on the list
 	 * and at the same stratum as the first survivor on the list,

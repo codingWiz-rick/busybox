@@ -170,7 +170,7 @@ static void read_cstate_counts(ullong *usage, ullong *duration)
 
 	while ((d = readdir(dir)) != NULL) {
 		FILE *fp;
-		char buf[192];
+		char buf[PATH_MAX];
 		int level;
 		int len;
 
@@ -178,7 +178,7 @@ static void read_cstate_counts(ullong *usage, ullong *duration)
 		if (len < 3 || len > BIG_SYSNAME_LEN)
 			continue;
 
-		sprintf(buf, "%s/%s/power", "/proc/acpi/processor", d->d_name);
+		snprintf(buf, sizeof(buf), "%s/%s/power", "/proc/acpi/processor", d->d_name);
 		fp = fopen_for_read(buf);
 		if (!fp)
 			continue;

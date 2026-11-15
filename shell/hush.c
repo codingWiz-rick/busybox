@@ -3846,13 +3846,13 @@ static struct pipe *free_pipe(struct pipe *pi)
 		command = &pi->cmds[i];
 		debug_printf_clean("  command %d:\n", i);
 		if (command->argv) {
-			if (DEBUG_CLEAN) {
-				int a;
-				char **p;
-				for (a = 0, p = command->argv; *p; a++, p++) {
-					debug_printf_clean("   argv[%d] = %s\n", a, *p);
-				}
+#if DEBUG_CLEAN
+			int a;
+			char **p;
+			for (a = 0, p = command->argv; *p; a++, p++) {
+				debug_printf_clean("   argv[%d] = %s\n", a, *p);
 			}
+#endif
 			free_strings(command->argv);
 			//command->argv = NULL;
 		}
