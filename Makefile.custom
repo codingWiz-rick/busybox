@@ -198,4 +198,133 @@ SYN_CPPFLAGS := $(subst $(brace_close),\$(brace_close),$(SYN_CPPFLAGS))
 html: $(syn)
 	synopsis -f HTML -Wf,title="'BusyBox Documentation'" -o $@ $^
 
+# ==========================================================================
+# Cross-compilation delegation targets & GNU Make define rules
+# ==========================================================================
+
+NPROC ?= $(shell nproc 2>/dev/null || echo 4)
+BUILDROOT_MUSL_AARCH64 ?= /home/rick/open-source/buildroot/output/host/bin/aarch64-buildroot-linux-musl-
+BUILDROOT_GLIBC_AARCH64 ?= /home/rick/open-source/buildroot-glibc/output/host/bin/aarch64-buildroot-linux-gnu-
+HOST_GCC ?= gcc
+
+BIN_DIR := $(if $(srctree),$(srctree),.)/bin
+
+# GNU Make define rule to generate delegation targets
+# Arguments:
+#   $(1): Target rule prefix (e.g. cross-arm64, native-x86_64)
+#   $(2): Architecture (ARCH)
+#   $(3): CROSS_COMPILE prefix
+#   $(4): CC override
+#   $(5): Architecture output tag (e.g. arm64, x86_64, arm64-glibc)
+#   $(6): Description
+define DEFINE_CROSS_TARGET
+.PHONY: $(1) $(1)-busybox $(1)-clean $(1)-menuconfig $(1)-defconfig $(1)-%
+$(1):
+	@echo "========================================================================"
+	@echo "  [Cross-Compile] Delegating build for $(6)"
+	@echo "  ARCH=$(2) CROSS_COMPILE=$(3) CC=$(4) -j$$(NPROC) $$(if $$(TARGET),TARGET=$$(TARGET),busybox)"
+	@echo "========================================================================"
+	env -u CFLAGS -u AFLAGS -u LDFLAGS $$(MAKE) -C $$(if $$(srctree),$$(srctree),.) ARCH=$(2) $$(if $(3),CROSS_COMPILE=$(3)) $$(if $(4),CC=$(4)) -j$$(NPROC) $$(if $$(TARGET),$$(TARGET),busybox)
+	@if [ -z "$$(TARGET)" ] || [ "$$(TARGET)" = "busybox" ]; then \
+		mkdir -p $(BIN_DIR); \
+		cp -f $$(if $$(srctree),$$(srctree),.)/busybox $(BIN_DIR)/busybox-$(5); \
+		ln -sf busybox-$(5) $(BIN_DIR)/magiskboot-$(5); \
+		ln -sf bin/busybox-$(5) $$(if $$(srctree),$$(srctree),.)/busybox; \
+		ln -sf bin/magiskboot-$(5) $$(if $$(srctree),$$(srctree),.)/magiskboot; \
+		ln -sf bin/busybox-$(5) $$(if $$(srctree),$$(srctree),.)/busybox-$(5); \
+		ln -sf bin/magiskboot-$(5) $$(if $$(srctree),$$(srctree),.)/magiskboot-$(5); \
+		echo "[✓] Successfully built and saved:"; \
+		echo "    -> $(BIN_DIR)/busybox-$(5)"; \
+		echo "    -> $(BIN_DIR)/magiskboot-$(5)"; \
+		echo "    -> ./busybox (symlink -> bin/busybox-$(5))"; \
+		echo "    -> ./magiskboot (symlink -> bin/magiskboot-$(5))"; \
+		echo "    -> ./busybox-$(5) (symlink -> bin/busybox-$(5))"; \
+		echo "    -> ./magiskboot-$(5) (symlink -> bin/magiskboot-$(5))"; \
+	fi
+
+$(1)-busybox:
+	$$(MAKE) $(1) TARGET=busybox
+
+$(1)-clean:
+	@echo "[-] Cleaning build artifacts for $(6)..."
+	env -u CFLAGS -u AFLAGS -u LDFLAGS $$(MAKE) -C $$(if $$(srctree),$$(srctree),.) ARCH=$(2) $$(if $(3),CROSS_COMPILE=$(3)) $$(if $(4),CC=$(4)) clean
+	@rm -f $$(if $$(srctree),$$(srctree),.)/magiskboot $$(if $$(srctree),$$(srctree),.)/busybox $$(if $$(srctree),$$(srctree),.)/busybox_unstripped
+	@echo "[✓] Cleaned $(6) in-tree objects."
+
+$(1)-menuconfig:
+	env -u CFLAGS -u AFLAGS -u LDFLAGS $$(MAKE) -C $$(if $$(srctree),$$(srctree),.) ARCH=$(2) $$(if $(3),CROSS_COMPILE=$(3)) $$(if $(4),CC=$(4)) menuconfig
+
+$(1)-defconfig:
+	env -u CFLAGS -u AFLAGS -u LDFLAGS $$(MAKE) -C $$(if $$(srctree),$$(srctree),.) ARCH=$(2) $$(if $(3),CROSS_COMPILE=$(3)) $$(if $(4),CC=$(4)) defconfig
+
+$(1)-%:
+	@echo "========================================================================"
+	@echo "  [Cross-Compile] Delegating target '$$*' for $(6)"
+	@echo "  ARCH=$(2) CROSS_COMPILE=$(3) CC=$(4) -j$$(NPROC)"
+	@echo "========================================================================"
+	env -u CFLAGS -u AFLAGS -u LDFLAGS $$(MAKE) -C $$(if $$(srctree),$$(srctree),.) ARCH=$(2) $$(if $(3),CROSS_COMPILE=$(3)) $$(if $(4),CC=$(4)) -j$$(NPROC) $$*
+endef
+
+# Global clean & distclean targets
+.PHONY: cross-clean clean-cross cross-distclean distclean-cross clean-all cross-clean-all distclean-all
+cross-clean clean-cross:
+	@echo "[-] Cleaning all BusyBox objects and root binaries..."
+	@$(MAKE) clean
+	@rm -f $(if $(srctree),$(srctree),.)/magiskboot $(if $(srctree),$(srctree),.)/busybox $(if $(srctree),$(srctree),.)/busybox_unstripped
+	@echo "[✓] Cleaned root build objects successfully."
+
+clean-all cross-clean-all: cross-clean
+	@echo "[-] Cleaning saved architecture binaries in $(BIN_DIR)..."
+	@rm -rf $(BIN_DIR)
+	@echo "[✓] Full clean-all completed."
+
+cross-distclean distclean-cross distclean-all:
+	@echo "[-] Distcleaning all configurations, objects, and $(BIN_DIR)..."
+	@$(MAKE) distclean
+	@rm -rf $(BIN_DIR) $(if $(srctree),$(srctree),.)/magiskboot $(if $(srctree),$(srctree),.)/busybox $(if $(srctree),$(srctree),.)/busybox_unstripped
+	@echo "[✓] Full distclean completed."
+
+# Instantiate cross-compile targets using DEFINE_CROSS_TARGET
+$(eval $(call DEFINE_CROSS_TARGET,cross-aarch64,arm64,$(BUILDROOT_MUSL_AARCH64),,arm64,Android Host Target - aarch64 musl static))
+$(eval $(call DEFINE_CROSS_TARGET,cross-arm64,arm64,$(BUILDROOT_MUSL_AARCH64),,arm64,Android Host Target - aarch64 musl static alias))
+$(eval $(call DEFINE_CROSS_TARGET,cross-aarch64-glibc,arm64,$(BUILDROOT_GLIBC_AARCH64),,arm64-glibc,Debian Container Target - aarch64 glibc))
+$(eval $(call DEFINE_CROSS_TARGET,native-x86_64,x86_64,,$(HOST_GCC),x86_64,Native Host Target - x86_64 gcc))
+$(eval $(call DEFINE_CROSS_TARGET,native,x86_64,,$(HOST_GCC),x86_64,Native Host Target alias))
+
+# Multi-architecture "all" targets
+.PHONY: cross-all all-cross all-arches
+cross-all all-cross all-arches:
+	@echo "========================================================================"
+	@echo "  [Cross-All] Building all architectures into $(BIN_DIR)/"
+	@echo "========================================================================"
+	@$(MAKE) cross-clean
+	@$(MAKE) native-x86_64
+	@$(MAKE) cross-clean
+	@$(MAKE) cross-arm64
+	@$(MAKE) cross-clean
+	@$(MAKE) cross-aarch64-glibc
+	@echo "========================================================================"
+	@echo "  [✓] All architectures built successfully in $(BIN_DIR):"
+	@ls -la $(BIN_DIR)/
+	@echo "========================================================================"
+
+# Magiskboot convenience targets
+.PHONY: magiskboot-aarch64 magiskboot-native
+magiskboot-aarch64: cross-aarch64
+magiskboot-native: native-x86_64
+
+.PHONY: cross-help
+cross-help:
+	@echo "Available Cross-Compilation Delegation Targets:"
+	@echo "  cross-arm64 / cross-aarch64  - Build BusyBox + magiskboot for Android (aarch64 musl static)"
+	@echo "  native-x86_64 / native       - Build BusyBox + magiskboot natively for host (x86_64 gcc)"
+	@echo "  cross-aarch64-glibc          - Build BusyBox + magiskboot for container (aarch64 glibc dynamic)"
+	@echo "  cross-all / all-arches       - Build ALL architectures into bin/ without overwriting"
+	@echo "  TARGET=<target>              - Optional target override (e.g. make cross-arm64 TARGET=archival/magiskboot.o)"
+	@echo "  cross-clean / clean-cross    - Clean root objects, binaries, and symlinks"
+	@echo "  clean-all                    - Clean objects, binaries, AND the bin/ storage directory"
+	@echo "  distclean-all                - Full distclean of configuration, objects, and bin/"
+	@echo "  cross-arm64-clean            - In-tree clean for aarch64 build"
+	@echo "  native-clean                 - In-tree clean for native x86_64 build"
+
 -include $(srctree)/Makefile.local

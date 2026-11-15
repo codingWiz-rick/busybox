@@ -37,8 +37,6 @@
 //usage:     "\n	patch-sigenforce <img|rec> [out] Neutralize kernel module signature enforcement (CONFIG_MODULE_SIG_FORCE)"
 //usage:     "\n	patch-cfi <img|rec> [out]     Neutralize Clang Control Flow Integrity (KCFI & Forward-Edge CFI)"
 //usage:     "\n	dtb <file> [test|print|patch] Device tree blob inspector and verity patcher"
-//usage:     "\n	module <act> <mod.ko> [...]   Kernel module toolkit (info, check, audit, strip, patch, load, finit, unload)"
-//usage:     "\n	patch-vermagic <mod.ko> [opts] Patch module vermagic, altinstructions, and CFI stubs"
 //usage:     "\n	dist [opts...] <out.zip>      Create universal Magisk/AnyKernel recovery flashable ZIP"
 //usage:     "\n	zip <file.zip> <act> [...]    ZIP archive toolkit (create, list, extract)"
 //usage:     "\n	fstab <file> <print|patch...> In-place fstab configuration tool"
@@ -161,6 +159,35 @@ static int32_t boot_find_dtb_offset(const void *buf, size_t len) {
 static inline size_t align_to(size_t v, size_t a) {
 	if (a == 0) return v;
 	return (v + a - 1) / a * a;
+}
+
+static int safe_rename_or_copy(const char *src, const char *dst) {
+	if (rename(src, dst) == 0) return 0;
+	if (errno == EXDEV) {
+		int ifd = open(src, O_RDONLY | O_CLOEXEC);
+		int ofd;
+		struct stat st;
+		if (ifd < 0) return -1;
+		if (fstat(ifd, &st) < 0) { close(ifd); return -1; }
+		ofd = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, st.st_mode & 07777);
+		if (ofd < 0) { close(ifd); return -1; }
+		if (st.st_size > 0) {
+			ssize_t sret = sendfile(ofd, ifd, NULL, (size_t)st.st_size);
+			if (sret < 0) {
+				char buf[8192];
+				ssize_t n;
+				lseek(ifd, 0, SEEK_SET);
+				while ((n = full_read(ifd, buf, sizeof(buf))) > 0) {
+					full_write(ofd, buf, n);
+				}
+			}
+		}
+		close(ofd);
+		close(ifd);
+		unlink(src);
+		return 0;
+	}
+	return -1;
 }
 
 /* =========================================================================
@@ -1640,116 +1667,49 @@ static int cpio_write_all(const char *path, cpio_node_t *head) {
 	}
 
 	close(fd);
-	if (rename(tmp_path, path) != 0) {
+	if (safe_rename_or_copy(tmp_path, path) != 0) {
 		unlink(tmp_path);
 		return -1;
 	}
 	return 0;
 }
 
-static int magiskboot_cpio(int argc, char **argv) {
-	const char *cpio_file;
+static int cpio_exec_cmd(cpio_node_t **head_ptr, int argc, char **argv, bool *modified) {
 	const char *act;
-	cpio_node_t *head;
-	cpio_node_t *curr;
-	int ret = 0;
+	if (argc < 1) return 0;
+	act = argv[0];
 
-	if (argc < 4) bb_show_usage();
-	cpio_file = argv[2];
-	act = argv[3];
-
-	if (strcmp(act, "test") == 0) {
-		int fd = open(cpio_file, O_RDONLY);
-		char magic[6];
-		ssize_t n;
-		if (fd < 0) return 1;
-		n = read(fd, magic, 6);
-		close(fd);
-		if (n == 6 && (memcmp(magic, "070701", 6) == 0 || memcmp(magic, "070702", 6) == 0)) {
-			printf("0\n");
-			return 0;
-		}
-		return 1;
-	}
-
-	head = cpio_read_all(cpio_file);
-	if (!head) {
-		bb_error_msg("failed to read cpio '%s'", cpio_file);
-		return 1;
-	}
-
-	if (strcmp(act, "ls") == 0) {
-		for (curr = head; curr; curr = curr->next) {
-			printf("%06o %10u %s\n", curr->mode, curr->filesize, curr->name);
-		}
-	} else if (strcmp(act, "extract") == 0) {
-		const char *target_entry = (argc >= 5) ? argv[4] : NULL;
-		const char *out_file = (argc >= 6) ? argv[5] : target_entry;
-
-		if (target_entry) {
-			bool found = false;
-			for (curr = head; curr; curr = curr->next) {
-				if (strcmp(curr->name, target_entry) == 0) {
-					int out_fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, curr->mode & 07777);
-					if (out_fd >= 0) {
-						if (curr->data && curr->filesize > 0) {
-							full_write(out_fd, curr->data, curr->filesize);
-						}
-						close(out_fd);
-						chmod(out_file, curr->mode & 07777);
-						found = true;
-						fprintf(stderr, "[+] Extracted '%s' -> '%s'\n", target_entry, out_file);
-					}
-					break;
-				}
-			}
-			if (!found) {
-				bb_error_msg("entry '%s' not found in '%s'", target_entry, cpio_file);
-				ret = 1;
-			}
-		} else {
-			for (curr = head; curr; curr = curr->next) {
-				if (S_ISDIR(curr->mode)) {
-					bb_make_directory(curr->name, curr->mode & 07777, FILEUTILS_RECUR);
-				} else {
-					int out_fd;
-					char *slash = strrchr(curr->name, '/');
-					if (slash) {
-						char *d = xstrndup(curr->name, slash - curr->name);
-						bb_make_directory(d, 0755, FILEUTILS_RECUR);
-						free(d);
-					}
-					out_fd = open(curr->name, O_WRONLY | O_CREAT | O_TRUNC, curr->mode & 07777);
-					if (out_fd >= 0) {
-						if (curr->data && curr->filesize > 0) {
-							full_write(out_fd, curr->data, curr->filesize);
-						}
-						close(out_fd);
-						chmod(curr->name, curr->mode & 07777);
-					}
-				}
-			}
-			fprintf(stderr, "[+] Extracted all cpio entries into current directory\n");
-		}
-	} else if (strcmp(act, "mkdir") == 0) {
+	if (strcmp(act, "mkdir") == 0) {
 		uint32_t mode;
 		const char *path;
 		cpio_node_t *node;
+		if (argc < 3) return 1;
+		mode = (uint32_t)strtoul(argv[1], NULL, 8) | 0040000;
+		path = argv[2];
 
-		if (argc < 6) bb_show_usage();
-		mode = (uint32_t)strtoul(argv[4], NULL, 8) | 0040000;
-		path = argv[5];
-
+		/* Check if already exists */
+		for (node = *head_ptr; node; node = node->next) {
+			if (strcmp(node->name, path) == 0) {
+				node->mode = mode;
+				*modified = true;
+				return 3;
+			}
+		}
 		node = xzalloc(sizeof(*node));
 		node->name = xstrdup(path);
 		node->mode = mode;
 		node->nlink = 2;
-		node->next = head;
-		head = node;
+		{
+			cpio_node_t **tail_ptr = head_ptr;
+			while (*tail_ptr) tail_ptr = &(*tail_ptr)->next;
+			node->next = NULL;
+			*tail_ptr = node;
+		}
+		*modified = true;
+		return 3;
+	}
 
-		ret = cpio_write_all(cpio_file, head);
-		if (ret == 0) fprintf(stderr, "[+] Created directory '%s' (%04o) in '%s'\n", path, mode & 07777, cpio_file);
-	} else if (strcmp(act, "add") == 0) {
+	if (strcmp(act, "add") == 0) {
 		uint32_t mode;
 		const char *entry_name;
 		const char *infile;
@@ -1758,13 +1718,14 @@ static int magiskboot_cpio(int argc, char **argv) {
 		void *buf = NULL;
 		size_t in_sz = 0;
 		cpio_node_t *node = NULL;
+		cpio_node_t *curr;
 
-		if (argc < 7) bb_show_usage();
-		mode = (uint32_t)strtoul(argv[4], NULL, 8) | 0100000;
-		entry_name = argv[5];
-		infile = argv[6];
+		if (argc < 4) return 1;
+		mode = (uint32_t)strtoul(argv[1], NULL, 8) | 0100000;
+		entry_name = argv[2];
+		infile = argv[3];
 
-		in_fd = open(infile, O_RDONLY);
+		in_fd = open(infile, O_RDONLY | O_CLOEXEC);
 		if (in_fd >= 0 && fstat(in_fd, &st) == 0 && st.st_size > 0) {
 			in_sz = (size_t)st.st_size;
 			buf = xmalloc(in_sz);
@@ -1778,8 +1739,7 @@ static int magiskboot_cpio(int argc, char **argv) {
 			close(in_fd);
 		}
 
-		/* Check if entry already exists */
-		for (curr = head; curr; curr = curr->next) {
+		for (curr = *head_ptr; curr; curr = curr->next) {
 			if (strcmp(curr->name, entry_name) == 0) {
 				node = curr;
 				break;
@@ -1798,27 +1758,75 @@ static int magiskboot_cpio(int argc, char **argv) {
 			node->filesize = (uint32_t)in_sz;
 			node->data = buf;
 			node->nlink = 1;
-			node->next = head;
-			head = node;
+			{
+				cpio_node_t **tail_ptr = head_ptr;
+				while (*tail_ptr) tail_ptr = &(*tail_ptr)->next;
+				node->next = NULL;
+				*tail_ptr = node;
+			}
+		}
+		*modified = true;
+		return 4;
+	}
+
+	if (strcmp(act, "ln") == 0) {
+		const char *target;
+		const char *entry_name;
+		cpio_node_t *node = NULL;
+		cpio_node_t *curr;
+		size_t tlen;
+
+		if (argc < 3) return 1;
+		target = argv[1];
+		entry_name = argv[2];
+		tlen = strlen(target);
+
+		for (curr = *head_ptr; curr; curr = curr->next) {
+			if (strcmp(curr->name, entry_name) == 0) {
+				node = curr;
+				break;
+			}
 		}
 
-		ret = cpio_write_all(cpio_file, head);
-		if (ret == 0) fprintf(stderr, "[+] Added file '%s' (%zu bytes) into '%s'\n", entry_name, in_sz, cpio_file);
-	} else if (strcmp(act, "rm") == 0) {
+		if (node) {
+			free(node->data);
+			node->data = xstrdup(target);
+			node->filesize = (uint32_t)tlen;
+			node->mode = 0120777; /* S_IFLNK | 0777 */
+		} else {
+			node = xzalloc(sizeof(*node));
+			node->name = xstrdup(entry_name);
+			node->mode = 0120777; /* S_IFLNK | 0777 */
+			node->filesize = (uint32_t)tlen;
+			node->data = xstrdup(target);
+			node->nlink = 1;
+			{
+				cpio_node_t **tail_ptr = head_ptr;
+				while (*tail_ptr) tail_ptr = &(*tail_ptr)->next;
+				node->next = NULL;
+				*tail_ptr = node;
+			}
+		}
+		*modified = true;
+		return 3;
+	}
+
+	if (strcmp(act, "rm") == 0) {
 		bool recur = false;
 		const char *entry_name;
-		int idx = 4;
+		int idx = 1;
 		cpio_node_t *prev = NULL;
+		cpio_node_t *curr;
 
-		if (argc < 5) bb_show_usage();
+		if (argc < 2) return 1;
 		if (strcmp(argv[idx], "-r") == 0) {
 			recur = true;
 			idx++;
-			if (idx >= argc) bb_show_usage();
+			if (idx >= argc) return 1;
 		}
 		entry_name = argv[idx];
 
-		curr = head;
+		curr = *head_ptr;
 		while (curr) {
 			bool match = (strcmp(curr->name, entry_name) == 0);
 			if (!match && recur) {
@@ -1834,23 +1842,140 @@ static int magiskboot_cpio(int argc, char **argv) {
 					prev->next = curr->next;
 					curr = curr->next;
 				} else {
-					head = curr->next;
-					curr = head;
+					*head_ptr = curr->next;
+					curr = *head_ptr;
 				}
 				free(to_del->name);
 				free(to_del->data);
 				free(to_del);
+				*modified = true;
 			} else {
 				prev = curr;
 				curr = curr->next;
 			}
 		}
+		return idx + 1;
+	}
 
+	if (strcmp(act, "extract") == 0) {
+		const char *target_entry = (argc >= 2) ? argv[1] : NULL;
+		const char *out_file = (argc >= 3) ? argv[2] : target_entry;
+		cpio_node_t *curr;
+		if (target_entry) {
+			bool found = false;
+			for (curr = *head_ptr; curr; curr = curr->next) {
+				if (strcmp(curr->name, target_entry) == 0) {
+					int out_fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, curr->mode & 07777);
+					if (out_fd >= 0) {
+						if (curr->data && curr->filesize > 0) {
+							full_write(out_fd, curr->data, curr->filesize);
+						}
+						close(out_fd);
+						chmod(out_file, curr->mode & 07777);
+						found = true;
+						fprintf(stderr, "[+] Extracted '%s' -> '%s'\n", target_entry, out_file);
+					}
+					break;
+				}
+			}
+			if (!found) {
+				bb_error_msg("entry '%s' not found", target_entry);
+			}
+			return (argc >= 3) ? 3 : 2;
+		} else {
+			for (curr = *head_ptr; curr; curr = curr->next) {
+				if (S_ISDIR(curr->mode)) {
+					bb_make_directory(curr->name, curr->mode & 07777, FILEUTILS_RECUR);
+				} else {
+					int out_fd;
+					char *slash = strrchr(curr->name, '/');
+					if (slash) {
+						char *d = xstrndup(curr->name, slash - curr->name);
+						bb_make_directory(d, 0755, FILEUTILS_RECUR);
+						free(d);
+					}
+					out_fd = open(curr->name, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, curr->mode & 07777);
+					if (out_fd >= 0) {
+						if (curr->data && curr->filesize > 0) {
+							full_write(out_fd, curr->data, curr->filesize);
+						}
+						close(out_fd);
+						chmod(curr->name, curr->mode & 07777);
+					}
+				}
+			}
+			fprintf(stderr, "[+] Extracted all cpio entries into current directory\n");
+			return 1;
+		}
+	}
+
+	if (strcmp(act, "ls") == 0) {
+		cpio_node_t *curr;
+		for (curr = *head_ptr; curr; curr = curr->next) {
+			printf("%06o %10u %s\n", curr->mode, curr->filesize, curr->name);
+		}
+		return 1;
+	}
+
+	bb_error_msg("unknown cpio action '%s' (supported: test, ls, extract, mkdir, add, ln, rm)", act);
+	return 1;
+}
+
+static int magiskboot_cpio(int argc, char **argv) {
+	const char *cpio_file;
+	cpio_node_t *head = NULL;
+	bool modified = false;
+	int i;
+	int ret = 0;
+
+	if (argc < 4) bb_show_usage();
+	cpio_file = argv[2];
+
+	/* Fast-path test command */
+	if (strcmp(argv[3], "test") == 0) {
+		int fd = open(cpio_file, O_RDONLY | O_CLOEXEC);
+		char magic[6];
+		ssize_t n;
+		if (fd < 0) return 1;
+		n = read(fd, magic, 6);
+		close(fd);
+		if (n == 6 && (memcmp(magic, "070701", 6) == 0 || memcmp(magic, "070702", 6) == 0)) {
+			printf("0\n");
+			return 0;
+		}
+		return 1;
+	}
+
+	head = cpio_read_all(cpio_file);
+
+	i = 3;
+	while (i < argc) {
+		const char *arg = argv[i];
+		if (strchr(arg, ' ')) {
+			/* Quoted multi-word command, e.g. "add 0755 init path" */
+			char *copy = xstrdup(arg);
+			char *toks[16];
+			int tok_cnt = 0;
+			char *saveptr = NULL;
+			char *tok = strtok_r(copy, " \t\r\n", &saveptr);
+			while (tok && tok_cnt < 16) {
+				toks[tok_cnt++] = tok;
+				tok = strtok_r(NULL, " \t\r\n", &saveptr);
+			}
+			if (tok_cnt > 0) {
+				cpio_exec_cmd(&head, tok_cnt, toks, &modified);
+			}
+			free(copy);
+			i++;
+		} else {
+			/* Separate argv tokens */
+			int consumed = cpio_exec_cmd(&head, argc - i, &argv[i], &modified);
+			i += (consumed > 0) ? consumed : 1;
+		}
+	}
+
+	if (modified) {
 		ret = cpio_write_all(cpio_file, head);
-		if (ret == 0) fprintf(stderr, "[+] Removed '%s' from '%s'\n", entry_name, cpio_file);
-	} else {
-		bb_error_msg("unknown cpio action '%s' (supported: test, ls, extract, mkdir, add, rm)", act);
-		ret = 1;
 	}
 
 	cpio_free_all(head);
@@ -2537,51 +2662,430 @@ static inline void arm64_write_u32(uint8_t *buf, size_t off, uint32_t val) {
 	buf[off + 3] = (uint8_t)((val >> 24) & 0xff);
 }
 
-static bool arm64_decode_adrp(uint32_t insn, uint64_t pc, int *rd, uint64_t *page_addr) {
-	int64_t immlo;
-	int64_t immhi;
-	int64_t imm;
+static inline int64_t arm64_decode_adrp_imm(uint32_t adrp_insn) {
+	int64_t immlo = (int64_t)((adrp_insn >> 29) & 0x3U);
+	int64_t immhi = (int64_t)((adrp_insn >> 5) & 0x7ffffU);
+	int64_t imm = (immhi << 2) | immlo;
+	if (imm & (1LL << 20))
+		imm -= (1LL << 21);
+	return imm;
+}
 
+static inline bool arm64_decode_adrp(uint32_t insn, uint64_t pc, int *rd, uint64_t *page_addr) {
 	if ((insn & ARM64_ADRP_MASK) != ARM64_ADRP_VAL)
 		return false;
 
 	if (rd) *rd = (int)(insn & 0x1fU);
 
-	immlo = (int64_t)((insn >> 29) & 0x3U);
-	immhi = (int64_t)((insn >> 5) & 0x7ffffU);
-	imm = (immhi << 2) | immlo;
-	if (imm & (1LL << 20)) imm -= (1LL << 21);
-
 	if (page_addr) {
+		int64_t imm = arm64_decode_adrp_imm(insn);
 		*page_addr = (pc & ~0xfffULL) + (uint64_t)(imm << 12);
 	}
 	return true;
 }
 
-static bool arm64_decode_mov_wide(uint32_t insn, int *rd, uint16_t *imm16, int *shift, int *opc) {
+static inline bool arm64_decode_ldr_imm(uint32_t insn, int *rt, int *rn,
+                                        int32_t *offset, int *size, bool *is_signed) {
+	uint32_t u_cls = insn & 0x3fc00000U;
+	uint32_t s_cls;
+
+	if (u_cls == 0x39400000U || u_cls == 0x39800000U) {
+		int sz = 1 << ((insn >> 30) & 0x3);
+		if (rt) *rt = (int)(insn & 0x1fU);
+		if (rn) *rn = (int)((insn >> 5) & 0x1fU);
+		if (offset) *offset = (int32_t)(((insn >> 10) & 0xfffU) * sz);
+		if (size) *size = sz;
+		if (is_signed) *is_signed = (u_cls == 0x39800000U);
+		return true;
+	}
+
+	s_cls = insn & 0x3fe00c00U;
+	if (s_cls == 0x38400000U || s_cls == 0x38800000U) {
+		int sz = 1 << ((insn >> 30) & 0x3);
+		int32_t simm9 = (int32_t)((insn >> 12) & 0x1ffU);
+		if (simm9 & 0x100U)
+			simm9 |= ~0x1ff;
+		if (rt) *rt = (int)(insn & 0x1fU);
+		if (rn) *rn = (int)((insn >> 5) & 0x1fU);
+		if (offset) *offset = simm9;
+		if (size) *size = sz;
+		if (is_signed) *is_signed = (s_cls == 0x38800000U);
+		return true;
+	}
+
+	return false;
+}
+
+static inline bool arm64_decode_str_imm(uint32_t insn, int *rt, int *rn,
+                                        int32_t *offset, int *size) {
+	if ((insn & 0x3fc00000U) == 0x39000000U) {
+		int sz = 1 << ((insn >> 30) & 0x3);
+		if (rt) *rt = (int)(insn & 0x1fU);
+		if (rn) *rn = (int)((insn >> 5) & 0x1fU);
+		if (offset) *offset = (int32_t)(((insn >> 10) & 0xfffU) * sz);
+		if (size) *size = sz;
+		return true;
+	}
+	return false;
+}
+
+static inline bool arm64_decode_cbz(uint32_t insn, uint64_t pc, int *rt,
+                                    bool *is_cbnz, bool *is_64bit, uint64_t *target) {
+	if ((insn & 0x7e000000U) != 0x34000000U)
+		return false;
+
+	if (rt) *rt = (int)(insn & 0x1fU);
+	if (is_cbnz) *is_cbnz = ((insn & (1U << 24)) != 0);
+	if (is_64bit) *is_64bit = ((insn & (1U << 31)) != 0);
+
+	if (target) {
+		int64_t imm19 = (int64_t)((insn >> 5) & 0x7ffffU);
+		if (imm19 & (1LL << 18))
+			imm19 -= (1LL << 19);
+		*target = pc + (uint64_t)(imm19 << 2);
+	}
+	return true;
+}
+
+static inline bool arm64_decode_b_bl(uint32_t insn, uint64_t pc, bool *is_bl, uint64_t *target) {
+	if ((insn & 0x7c000000U) != 0x14000000U)
+		return false;
+
+	if (is_bl) *is_bl = ((insn & 0x80000000U) != 0);
+
+	if (target) {
+		int64_t imm26 = (int64_t)(insn & 0x03ffffffU);
+		if (imm26 & (1LL << 25))
+			imm26 -= (1LL << 26);
+		*target = pc + (uint64_t)(imm26 << 2);
+	}
+	return true;
+}
+
+static inline bool arm64_decode_blr(uint32_t insn, int *rn) {
+	if ((insn & 0xfffffc1fU) == 0xd63f0000U) {
+		if (rn) *rn = (int)((insn >> 5) & 0x1fU);
+		return true;
+	}
+	return false;
+}
+
+static inline bool arm64_decode_blr_auth(uint32_t insn, int *rn, bool *use_b_key, bool *use_zero) {
+	if ((insn & 0xffff0800U) == 0xd73f0800U) {
+		if (rn) *rn = (int)((insn >> 5) & 0x1fU);
+		if (use_b_key) *use_b_key = ((insn >> 10) & 1) != 0;
+		if (use_zero) *use_zero = (insn & 0x1fU) == 31;
+		return true;
+	}
+	return false;
+}
+
+static inline bool arm64_decode_mov_wide(uint32_t insn, int *rd, uint16_t *imm16,
+                                         int *shift, int *opcode) {
 	if ((insn & 0x1f800000U) != 0x12800000U)
 		return false;
 
 	if (rd) *rd = (int)(insn & 0x1fU);
 	if (imm16) *imm16 = (uint16_t)((insn >> 5) & 0xffffU);
 	if (shift) *shift = (int)(((insn >> 21) & 0x3U) * 16);
-	if (opc) *opc = (int)((insn >> 29) & 0x3U);
+	if (opcode) *opcode = (int)((insn >> 29) & 0x3U);
 	return true;
 }
 
-static bool arm64_decode_add_sub_imm(uint32_t insn, int *rd, int *rn, uint32_t *imm, bool *is_sub) {
-	uint32_t val;
+static inline bool arm64_decode_add_sub_imm(uint32_t insn, int *rd, int *rn,
+                                            uint32_t *imm, bool *is_sub, bool *is_64bit) {
 	if ((insn & 0x1f000000U) != 0x11000000U)
 		return false;
 
 	if (rd) *rd = (int)(insn & 0x1fU);
 	if (rn) *rn = (int)((insn >> 5) & 0x1fU);
 	if (is_sub) *is_sub = ((insn & (1U << 30)) != 0);
+	if (is_64bit) *is_64bit = ((insn & (1U << 31)) != 0);
 
-	val = (insn >> 10) & 0xfffU;
-	if (insn & (1U << 22)) val <<= 12;
-	if (imm) *imm = val;
+	if (imm) {
+		uint32_t val = (insn >> 10) & 0xfffU;
+		if (insn & (1U << 22))
+			val <<= 12;
+		*imm = val;
+	}
 	return true;
+}
+
+static inline bool arm64_decode_tbz(uint32_t insn, uint64_t pc, int *rt,
+                                    int *bit_pos, bool *is_tbnz, uint64_t *target) {
+	if ((insn & 0x7e000000U) != 0x36000000U)
+		return false;
+
+	if (rt) *rt = (int)(insn & 0x1fU);
+	if (is_tbnz) *is_tbnz = ((insn & (1U << 24)) != 0);
+
+	if (bit_pos) {
+		uint32_t b5 = (insn >> 31) & 0x1U;
+		uint32_t b40 = (insn >> 19) & 0x1fU;
+		*bit_pos = (int)((b5 << 5) | b40);
+	}
+
+	if (target) {
+		int64_t imm14 = (int64_t)((insn >> 5) & 0x3fffU);
+		if (imm14 & (1LL << 13))
+			imm14 -= (1LL << 14);
+		*target = pc + (uint64_t)(imm14 << 2);
+	}
+	return true;
+}
+
+static inline bool arm64_decode_ldp_stp(uint32_t insn, int *rt, int *rt2, int *rn,
+                                        int32_t *offset, bool *is_load, bool *is_64bit) {
+	bool sf;
+
+	if ((insn & 0x3a000000U) != 0x28000000U)
+		return false;
+
+	if (rt) *rt = (int)(insn & 0x1fU);
+	if (rn) *rn = (int)((insn >> 5) & 0x1fU);
+	if (rt2) *rt2 = (int)((insn >> 10) & 0x1fU);
+	if (is_load) *is_load = ((insn & (1U << 22)) != 0);
+
+	sf = ((insn & (1U << 31)) != 0);
+	if (is_64bit) *is_64bit = sf;
+
+	if (offset) {
+		int scale = sf ? 8 : 4;
+		int32_t imm7 = (int32_t)((insn >> 15) & 0x7fU);
+		if (imm7 & 0x40)
+			imm7 |= ~0x7f;
+		*offset = imm7 * scale;
+	}
+	return true;
+}
+
+static inline bool arm64_decode_ret(uint32_t insn, int *rn, bool *is_auth) {
+	if ((insn & 0xfffffc1fU) == 0xd65f0000U) {
+		if (rn) *rn = (int)((insn >> 5) & 0x1fU);
+		if (is_auth) *is_auth = false;
+		return true;
+	}
+	if ((insn & 0xfffffbffU) == 0xd65f0bffU) {
+		if (rn) *rn = 30; /* LR */
+		if (is_auth) *is_auth = true;
+		return true;
+	}
+	return false;
+}
+
+static inline bool arm64_decode_pac_bti(uint32_t insn, bool *is_pac, bool *is_bti) {
+	if ((insn & 0xfffff01fU) == 0xd503201fU) {
+		uint32_t crm_op2 = (insn >> 5) & 0x7fU;
+		if (crm_op2 == 0x19 || crm_op2 == 0x1b || crm_op2 == 0x07) {
+			if (is_pac) *is_pac = true;
+			if (is_bti) *is_bti = false;
+			return true;
+		}
+		if (crm_op2 == 0x22 || crm_op2 == 0x24 || crm_op2 == 0x26) {
+			if (is_pac) *is_pac = false;
+			if (is_bti) *is_bti = true;
+			return true;
+		}
+	}
+	return false;
+}
+
+static inline bool arm64_decode_mrs_sp_el0(uint32_t insn, int *rt) {
+	if ((insn & 0xffffffe0U) == 0xd5384100U) {
+		if (rt) *rt = (int)(insn & 0x1fU);
+		return true;
+	}
+	return false;
+}
+
+static inline uint64_t arm64_peel_branch(const uint8_t *data, size_t size, uint64_t pc, int max_depth) {
+	uint64_t cur = pc;
+	int d;
+	bool is_bl;
+	uint64_t branch_target;
+
+	for (d = 0; d < max_depth && cur + 4 <= size; d++) {
+		uint32_t insn = *(const uint32_t *)(data + cur);
+		bool is_pac = false, is_bti = false;
+		if (arm64_decode_pac_bti(insn, &is_pac, &is_bti)) {
+			cur += 4;
+			continue;
+		}
+		is_bl = false;
+		branch_target = 0;
+		if (arm64_decode_b_bl(insn, cur, &is_bl, &branch_target) && !is_bl) {
+			if (branch_target + 4 <= size && branch_target != cur) {
+				cur = branch_target;
+				continue;
+			}
+		}
+		break;
+	}
+	return cur;
+}
+
+static inline bool arm64_decode_adr(uint32_t insn, uint64_t pc, int *rd, uint64_t *target_addr) {
+	if ((insn & 0x9f000000U) != 0x10000000U)
+		return false;
+
+	if (rd) *rd = (int)(insn & 0x1fU);
+
+	if (target_addr) {
+		int64_t immlo = (int64_t)((insn >> 29) & 0x3U);
+		int64_t immhi = (int64_t)((insn >> 5) & 0x7ffffU);
+		int64_t imm = (immhi << 2) | immlo;
+		if (imm & (1LL << 20))
+			imm -= (1LL << 21);
+		*target_addr = pc + (uint64_t)imm;
+	}
+	return true;
+}
+
+static inline bool arm64_decode_brk(uint32_t insn, uint16_t *imm16) {
+	if ((insn & 0xffe0001fU) == 0xd4200000U) {
+		if (imm16) *imm16 = (uint16_t)((insn >> 5) & 0xffffU);
+		return true;
+	}
+	return false;
+}
+
+static inline bool arm64_decode_sysreg_mrs_msr(uint32_t insn, bool *is_mrs, int *rt, uint16_t *sysreg_id) {
+	if ((insn & 0xffd00000U) != 0xd5100000U)
+		return false;
+
+	if (is_mrs) *is_mrs = ((insn & 0x00200000U) != 0);
+	if (rt) *rt = (int)(insn & 0x1fU);
+	if (sysreg_id) *sysreg_id = (uint16_t)((insn >> 5) & 0xffffU);
+	return true;
+}
+
+static inline bool arm64_decode_uaccess(uint32_t insn, bool *is_load, int *rt, int *rn,
+                                        int32_t *offset, int *size) {
+	uint32_t cls = insn & 0x3fc00c00U;
+	int sz;
+
+	if (cls != 0x38400800U && cls != 0x38000800U)
+		return false;
+
+	if (is_load) *is_load = (cls == 0x38400800U);
+	if (rt) *rt = (int)(insn & 0x1fU);
+	if (rn) *rn = (int)((insn >> 5) & 0x1fU);
+
+	sz = 1 << ((insn >> 30) & 0x3);
+	if (size) *size = sz;
+
+	if (offset) {
+		int32_t simm9 = (int32_t)((insn >> 12) & 0x1ffU);
+		if (simm9 & 0x100)
+			simm9 |= ~0x1ff;
+		*offset = simm9;
+	}
+	return true;
+}
+
+static inline bool arm64_decode_b_cond(uint32_t insn, uint64_t pc, int *cond, uint64_t *target) {
+	if ((insn & 0xff000010U) != 0x54000000U)
+		return false;
+
+	if (cond) *cond = (int)(insn & 0x0fU);
+
+	if (target) {
+		int64_t imm19 = (int64_t)((insn >> 5) & 0x7ffffU);
+		if (imm19 & (1LL << 18))
+			imm19 -= (1LL << 19);
+		*target = pc + (uint64_t)(imm19 << 2);
+	}
+	return true;
+}
+
+static inline bool arm64_decode_cmp_imm(uint32_t insn, int *rn, uint32_t *imm, bool *is_64bit) {
+	if ((insn & 0x3f80001fU) != 0x3100001fU)
+		return false;
+
+	if (is_64bit) *is_64bit = ((insn & (1U << 31)) != 0);
+	if (rn) *rn = (int)((insn >> 5) & 0x1fU);
+
+	if (imm) {
+		uint32_t shift = (insn >> 22) & 1U;
+		uint32_t imm12 = (insn >> 10) & 0xfffU;
+		*imm = imm12 << (shift ? 12 : 0);
+	}
+	return true;
+}
+
+/**
+ * kroot_elf_locate_kernel_payload - Dynamically locate uncompressed ARM64 kernel within a buffer
+ */
+static int kroot_elf_locate_kernel_payload(const uint8_t *buf, size_t buf_size,
+                                           const uint8_t **out_payload, size_t *out_payload_size) {
+	const arm64_image_header_t *arm64_hdr;
+	size_t scan_limit;
+	size_t off;
+
+	if (!buf || buf_size < sizeof(arm64_image_header_t) || !out_payload || !out_payload_size)
+		return -EINVAL;
+
+	/* 1. Direct ARM64 kernel Image detection */
+	arm64_hdr = (const arm64_image_header_t *)buf;
+	if (arm64_hdr->magic == ARM64_IMAGE_MAGIC) {
+		*out_payload = buf;
+		*out_payload_size = (arm64_hdr->image_size > 0 && arm64_hdr->image_size <= buf_size) ?
+			(size_t)arm64_hdr->image_size : buf_size;
+		return 0;
+	}
+
+	/* 2. Android boot.img header detection (v0 - v4) */
+	if (buf_size >= sizeof(struct boot_img_hdr_v0) && memcmp(buf, BOOT_MAGIC, BOOT_MAGIC_SIZE) == 0) {
+		const struct boot_img_hdr_v0 *v0 = (const struct boot_img_hdr_v0 *)buf;
+		size_t k_off = 0;
+		size_t k_sz = 0;
+
+		if (v0->header_version >= 3) {
+			const struct boot_img_hdr_v3 *v3 = (const struct boot_img_hdr_v3 *)buf;
+			k_off = 4096;
+			k_sz = v3->kernel_size;
+		} else {
+			size_t page_sz = (v0->page_size >= 2048 && (v0->page_size & (v0->page_size - 1)) == 0) ?
+				v0->page_size : 2048;
+			k_off = page_sz;
+			k_sz = v0->kernel_size;
+		}
+
+		if (k_off < buf_size) {
+			const uint8_t *k_start = buf + k_off;
+			size_t max_avail = buf_size - k_off;
+			size_t actual_sz = (k_sz > 0 && k_sz <= max_avail) ? k_sz : max_avail;
+
+			if (actual_sz >= sizeof(arm64_image_header_t)) {
+				const arm64_image_header_t *inner_hdr = (const arm64_image_header_t *)k_start;
+				if (inner_hdr->magic == ARM64_IMAGE_MAGIC) {
+					*out_payload = k_start;
+					*out_payload_size = (inner_hdr->image_size > 0 && inner_hdr->image_size <= actual_sz) ?
+						(size_t)inner_hdr->image_size : actual_sz;
+					return 0;
+				}
+			}
+
+			*out_payload = k_start;
+			*out_payload_size = actual_sz;
+			return 0;
+		}
+	}
+
+	/* 3. Dynamic scan: search for canonical ARM64 Image magic on 64-byte aligned boundaries */
+	scan_limit = (buf_size > 64 * 1024 * 1024) ? (64 * 1024 * 1024) : buf_size;
+	for (off = 0; off + sizeof(arm64_image_header_t) <= scan_limit; off += 64) {
+		const arm64_image_header_t *cand = (const arm64_image_header_t *)(buf + off);
+		if (cand->magic == ARM64_IMAGE_MAGIC && cand->image_size > 0 && off + cand->image_size <= buf_size) {
+			*out_payload = buf + off;
+			*out_payload_size = (size_t)cand->image_size;
+			return 0;
+		}
+	}
+
+	*out_payload = buf;
+	*out_payload_size = buf_size;
+	return 0;
 }
 
 static bool patch_sigenforce_buf(uint8_t *buf, size_t size, int *out_checks, int *out_setters) {
@@ -2593,15 +3097,41 @@ static bool patch_sigenforce_buf(uint8_t *buf, size_t size, int *out_checks, int
 	uint8_t old_val;
 	uint64_t target_page;
 	uint32_t target_off;
+	const uint8_t *k_payload = NULL;
+	size_t k_payload_sz = 0;
+	size_t k_off = 0;
+	size_t k_sz = size;
+	uint32_t inst0, inst1, inst2, inst3;
+	int mov_rd, mov_shift, mov_opc;
+	uint16_t mov_imm;
+	bool is_errno_mov;
+	int cbz_reg;
+	bool is_cbnz, is_64bit;
+	int ldr_rt, ldr_rn, ldr_sz;
+	int32_t ldr_off;
+	bool is_signed;
+	int adrp_rd;
+	uint64_t page_addr;
+	size_t target_addr;
+	int str_rt, str_rn, str_sz;
+	int32_t str_off;
+	int add_rd, add_rn;
+	uint32_t add_imm;
+	bool is_sub;
+	int s2_rt, s2_rn, s2_sz;
+	int32_t s2_off;
 
 	if (!buf || size < 64) return false;
 
-	limit = size - 16;
+	if (kroot_elf_locate_kernel_payload(buf, size, &k_payload, &k_payload_sz) == 0 && k_payload) {
+		k_off = (size_t)(k_payload - buf);
+		k_sz = k_payload_sz;
+	}
+
+	limit = (k_sz >= 16) ? (k_sz - 16) : 0;
 	for (i = 0; i < limit; i += 4) {
-		uint32_t inst3 = arm64_read_u32(buf, i + 12);
-		int mov_rd, mov_shift, mov_opc;
-		uint16_t mov_imm;
-		bool is_errno_mov = false;
+		inst3 = arm64_read_u32(buf, k_off + i + 12);
+		is_errno_mov = false;
 
 		if (arm64_decode_mov_wide(inst3, &mov_rd, &mov_imm, &mov_shift, &mov_opc) &&
 		    mov_opc == 0 && mov_shift == 0) {
@@ -2612,39 +3142,28 @@ static bool patch_sigenforce_buf(uint8_t *buf, size_t size, int *out_checks, int
 		}
 		if (!is_errno_mov) continue;
 
-		{
-			uint32_t inst2 = arm64_read_u32(buf, i + 8);
-			int cbz_reg;
-			uint32_t inst1;
-			int ldr_rt, ldr_rn;
-			uint32_t inst0;
-			int adrp_rd;
-			uint64_t page_addr;
-			size_t target_addr;
+		inst2 = arm64_read_u32(buf, k_off + i + 8);
+		if (!arm64_decode_cbz(inst2, (uint64_t)(i + 8), &cbz_reg, &is_cbnz, &is_64bit, NULL) || is_cbnz)
+			continue;
 
-			if ((inst2 & ARM64_CBZ_MASK) != ARM64_CBZ_VAL) continue;
-			cbz_reg = (int)(inst2 & 0x1fU);
+		inst1 = arm64_read_u32(buf, k_off + i + 4);
+		if (!arm64_decode_ldr_imm(inst1, &ldr_rt, &ldr_rn, &ldr_off, &ldr_sz, &is_signed) ||
+		    ldr_rt != cbz_reg || ldr_sz != 1)
+			continue;
 
-			inst1 = arm64_read_u32(buf, i + 4);
-			if ((inst1 & ARM64_LDRB_IMM_MASK) != ARM64_LDRB_IMM_VAL) continue;
-			ldr_rt = (int)(inst1 & 0x1fU);
-			ldr_rn = (int)((inst1 >> 5) & 0x1fU);
-			if (ldr_rt != cbz_reg) continue;
+		inst0 = arm64_read_u32(buf, k_off + i);
+		if (!arm64_decode_adrp(inst0, (uint64_t)i, &adrp_rd, &page_addr) || adrp_rd != ldr_rn)
+			continue;
 
-			inst0 = arm64_read_u32(buf, i);
-			if (!arm64_decode_adrp(inst0, (uint64_t)i, &adrp_rd, &page_addr) || adrp_rd != ldr_rn)
-				continue;
-
-			target_addr = (size_t)(page_addr + (((inst1 >> 10) & 0xfffU)));
-			if (target_addr < size) {
-				uint32_t mov_wzr = ARM64_MOV_W0_WZR_OPCODE | (uint32_t)cbz_reg;
-				sig_enforce_offset = target_addr;
-				arm64_write_u32(buf, i + 4, mov_wzr);
-				fprintf(stderr, "[+] Found inlined module_sig_check @ 0x%08zX (sig_enforce @ 0x%08zX)\n", i, target_addr);
-				fprintf(stderr, "[+] Patched check @ 0x%08zX to MOV w%d, wzr (0x%08X)\n", i + 4, cbz_reg, mov_wzr);
-				patched_checks++;
-				break;
-			}
+		target_addr = (size_t)(page_addr + (uint32_t)ldr_off);
+		if (target_addr < k_sz) {
+			uint32_t mov_wzr = ARM64_MOV_W0_WZR_OPCODE | (uint32_t)cbz_reg;
+			sig_enforce_offset = target_addr;
+			arm64_write_u32(buf, k_off + i + 4, mov_wzr);
+			fprintf(stderr, "[+] Found inlined module_sig_check @ image 0x%08zX (file 0x%08zX)\n", i, k_off + i);
+			fprintf(stderr, "[+] Patched check @ image 0x%08zX to MOV w%d, wzr (0x%08X)\n", i + 4, cbz_reg, mov_wzr);
+			patched_checks++;
+			break;
 		}
 	}
 
@@ -2661,58 +3180,44 @@ static bool patch_sigenforce_buf(uint8_t *buf, size_t size, int *out_checks, int
 		return (patched_checks > 0);
 	}
 
-	old_val = buf[sig_enforce_offset];
-	buf[sig_enforce_offset] = 0x00;
+	old_val = buf[k_off + sig_enforce_offset];
+	buf[k_off + sig_enforce_offset] = 0x00;
 	fprintf(stderr, "[+] Cleared sig_enforce variable in .data: 0x%02X -> 0x00\n", old_val);
 
 	target_page = (uint64_t)(sig_enforce_offset & ~0xfffULL);
 	target_off = (uint32_t)(sig_enforce_offset & 0xfffULL);
 
 	for (i = 0; i < limit; i += 4) {
-		uint32_t inst0 = arm64_read_u32(buf, i);
-		int adrp_rd;
-		uint64_t page_addr;
+		inst0 = arm64_read_u32(buf, k_off + i);
 
 		if (!arm64_decode_adrp(inst0, (uint64_t)i, &adrp_rd, &page_addr) || page_addr != target_page)
 			continue;
 
 		for (j = 1; j <= 4; j++) {
-			uint32_t inst1;
-			int str_rn;
-			uint32_t str_off;
-			int add_rd, add_rn;
-			uint32_t add_imm;
-			bool is_sub;
+			if (i + j * 4 >= k_sz) break;
+			inst1 = arm64_read_u32(buf, k_off + i + j * 4);
 
-			if (i + j * 4 >= size) break;
-			inst1 = arm64_read_u32(buf, i + j * 4);
-
-			if ((inst1 & ARM64_STRB_IMM_MASK) == ARM64_STRB_IMM_VAL) {
-				str_rn = (int)((inst1 >> 5) & 0x1fU);
-				str_off = (inst1 >> 10) & 0xfffU;
-				if (str_rn == adrp_rd && str_off == target_off) {
-					arm64_write_u32(buf, i + j * 4, ARM64_NOP_OPCODE);
-					fprintf(stderr, "[+] Neutralized runtime setter (STRB) @ 0x%08zX -> NOP\n", i + j * 4);
-					neutralized_setters++;
-				}
+			/* Case 1: Direct single-instruction store: STRB wT, [xN, #target_off] */
+			if (arm64_decode_str_imm(inst1, &str_rt, &str_rn, &str_off, &str_sz) &&
+			    str_rn == adrp_rd && str_sz == 1 && (uint32_t)str_off == target_off) {
+				arm64_write_u32(buf, k_off + i + j * 4, ARM64_NOP_OPCODE);
+				fprintf(stderr, "[+] Neutralized runtime setter (STRB) @ image 0x%08zX (file 0x%08zX) -> NOP\n",
+				        i + j * 4, k_off + i + j * 4);
+				neutralized_setters++;
 			}
 
-			if (arm64_decode_add_sub_imm(inst1, &add_rd, &add_rn, &add_imm, &is_sub) &&
+			/* Case 2: Two-instruction store: ADD xM, xN, #target_off ... STRB wT, [xM, #0] */
+			if (arm64_decode_add_sub_imm(inst1, &add_rd, &add_rn, &add_imm, &is_sub, &is_64bit) &&
 			    !is_sub && add_rn == adrp_rd && add_imm == target_off) {
 				for (k = j + 1; k <= j + 3; k++) {
-					uint32_t inst2;
-					int s2_rn;
-					uint32_t s2_off;
-					if (i + k * 4 >= size) break;
-					inst2 = arm64_read_u32(buf, i + k * 4);
-					if ((inst2 & ARM64_STRB_IMM_MASK) == ARM64_STRB_IMM_VAL) {
-						s2_rn = (int)((inst2 >> 5) & 0x1fU);
-						s2_off = (inst2 >> 10) & 0xfffU;
-						if (s2_rn == add_rd && s2_off == 0) {
-							arm64_write_u32(buf, i + k * 4, ARM64_NOP_OPCODE);
-							fprintf(stderr, "[+] Neutralized runtime setter (ADD+STRB) @ 0x%08zX -> NOP\n", i + k * 4);
-							neutralized_setters++;
-						}
+					if (i + k * 4 >= k_sz) break;
+					inst2 = arm64_read_u32(buf, k_off + i + k * 4);
+					if (arm64_decode_str_imm(inst2, &s2_rt, &s2_rn, &s2_off, &s2_sz) &&
+					    s2_rn == add_rd && s2_sz == 1 && s2_off == 0) {
+						arm64_write_u32(buf, k_off + i + k * 4, ARM64_NOP_OPCODE);
+						fprintf(stderr, "[+] Neutralized runtime setter (ADD+STRB) @ image 0x%08zX (file 0x%08zX) -> NOP\n",
+						        i + k * 4, k_off + i + k * 4);
+						neutralized_setters++;
 					}
 				}
 			}
@@ -3106,7 +3611,7 @@ static int magiskboot_kernel_op(const char *image, const char *action, int argc,
 			return 1;
 		}
 		k_fmt = boot.k_fmt;
-		snprintf(tmp_kdecomp, sizeof(tmp_kdecomp), "/tmp/mb_kraw_%d.raw", (int)getpid());
+		snprintf(tmp_kdecomp, sizeof(tmp_kdecomp), "%s.kraw.%d", image, (int)getpid());
 		kd_fd = open(tmp_kdecomp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
 		if (kd_fd < 0) {
 			bb_perror_msg("failed to create temporary kernel file");
@@ -3136,7 +3641,7 @@ static int magiskboot_kernel_op(const char *image, const char *action, int argc,
 		}
 		k_fmt = boot_check_fmt(in_map, st.st_size);
 
-		snprintf(tmp_kdecomp, sizeof(tmp_kdecomp), "/tmp/mb_kraw_%d.raw", (int)getpid());
+		snprintf(tmp_kdecomp, sizeof(tmp_kdecomp), "%s.kraw.%d", image, (int)getpid());
 		kd_fd = open(tmp_kdecomp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
 		if (kd_fd < 0) {
 			munmap(in_map, st.st_size);
@@ -3410,7 +3915,7 @@ static int magiskboot_kernel_op(const char *image, const char *action, int argc,
 		close(out_fd);
 		boot_img_free(&boot);
 
-		if (rename(tmp_out_boot, final_target) != 0) {
+		if (safe_rename_or_copy(tmp_out_boot, final_target) != 0) {
 			bb_perror_msg("failed to update '%s'", final_target);
 			unlink(tmp_out_boot);
 			return 1;
@@ -3428,14 +3933,14 @@ static int magiskboot_kernel_op(const char *image, const char *action, int argc,
 			}
 			unlink(tmp_kdecomp);
 		} else {
-			if (rename(tmp_kdecomp, tmp_out_boot) != 0) {
+			if (safe_rename_or_copy(tmp_kdecomp, tmp_out_boot) != 0) {
 				bb_perror_msg("failed to create '%s'", tmp_out_boot);
 				unlink(tmp_kdecomp);
 				return 1;
 			}
 		}
 
-		if (rename(tmp_out_boot, final_target) != 0) {
+		if (safe_rename_or_copy(tmp_out_boot, final_target) != 0) {
 			bb_perror_msg("failed to update '%s'", final_target);
 			unlink(tmp_out_boot);
 			return 1;
@@ -3444,1003 +3949,6 @@ static int magiskboot_kernel_op(const char *image, const char *action, int argc,
 		fprintf(stderr, "[+] Successfully updated kernel -> '%s'\n", final_target);
 		return 0;
 	}
-}
-
-/* =========================================================================
- * 11. Direct ELF Kernel Module Manipulation & Lifecycle Engine
- * ========================================================================= */
-
-static bool elf_init_ctx(struct elf_ctx *ctx, uint8_t *buf, size_t size) {
-	Elf64_Shdr *str_sh;
-	if (!ctx || !buf || size < sizeof(Elf64_Ehdr)) return false;
-	memset(ctx, 0, sizeof(*ctx));
-	ctx->buf = buf;
-	ctx->size = size;
-
-	if (memcmp(buf, ELFMAG, SELFMAG) != 0) return false;
-
-	if (buf[EI_CLASS] == ELFCLASS64) {
-		ctx->is_64 = true;
-	} else {
-		return false;
-	}
-
-	ctx->is_le = (buf[EI_DATA] == ELFDATA2LSB);
-	ctx->ehdr64 = (Elf64_Ehdr *)buf;
-	ctx->machine = ctx->ehdr64->e_machine;
-
-	if (ctx->ehdr64->e_shoff >= size ||
-	    ctx->ehdr64->e_shoff + (size_t)ctx->ehdr64->e_shnum * sizeof(Elf64_Shdr) > size) {
-		return false;
-	}
-
-	ctx->shdrs64 = (Elf64_Shdr *)(buf + ctx->ehdr64->e_shoff);
-	ctx->shnum = ctx->ehdr64->e_shnum;
-
-	if (ctx->ehdr64->e_shstrndx >= ctx->shnum) return false;
-
-	str_sh = &ctx->shdrs64[ctx->ehdr64->e_shstrndx];
-	if (str_sh->sh_offset >= size || str_sh->sh_offset + str_sh->sh_size > size) {
-		return false;
-	}
-
-	ctx->shstrtab = (const char *)(buf + str_sh->sh_offset);
-	return true;
-}
-
-static Elf64_Shdr *elf_find_shdr(struct elf_ctx *ctx, const char *name, size_t *out_idx) {
-	size_t i;
-	if (!ctx || !ctx->shdrs64 || !ctx->shstrtab || !name) return NULL;
-	for (i = 0; i < ctx->shnum; i++) {
-		const char *sec_name = ctx->shstrtab + ctx->shdrs64[i].sh_name;
-		if (strcmp(sec_name, name) == 0) {
-			if (out_idx) *out_idx = i;
-			return &ctx->shdrs64[i];
-		}
-	}
-	return NULL;
-}
-
-static bool elf_get_build_id(struct elf_ctx *ctx, char *out_hex, size_t max_len) {
-	Elf64_Shdr *shdr;
-	const uint8_t *note_buf;
-	size_t offset = 0;
-
-	if (!ctx || !out_hex || max_len < 3) return false;
-	out_hex[0] = '\0';
-
-	shdr = elf_find_shdr(ctx, ".note.gnu.build-id", NULL);
-	if (!shdr || shdr->sh_type != SHT_NOTE || shdr->sh_offset + shdr->sh_size > ctx->size)
-		return false;
-
-	note_buf = ctx->buf + shdr->sh_offset;
-	while (offset + 12 <= shdr->sh_size) {
-		uint32_t namesz = *(const uint32_t *)(note_buf + offset);
-		uint32_t descsz = *(const uint32_t *)(note_buf + offset + 4);
-		uint32_t type   = *(const uint32_t *)(note_buf + offset + 8);
-		size_t name_aligned = (namesz + 3) & ~3U;
-		size_t desc_aligned = (descsz + 3) & ~3U;
-		offset += 12;
-
-		if (offset + name_aligned + descsz > shdr->sh_size) break;
-		if (type == 3 && namesz == 4 && memcmp(note_buf + offset, "GNU", 3) == 0) {
-			const uint8_t *desc = note_buf + offset + name_aligned;
-			size_t hex_len = 0;
-			size_t b;
-			for (b = 0; b < descsz && hex_len + 3 <= max_len; b++) {
-				hex_len += snprintf(out_hex + hex_len, max_len - hex_len, "%02x", desc[b]);
-			}
-			out_hex[hex_len] = '\0';
-			return true;
-		}
-		offset += name_aligned + desc_aligned;
-	}
-	return false;
-}
-
-static void elf_list_modinfo(struct elf_ctx *ctx) {
-	Elf64_Shdr *shdr = elf_find_shdr(ctx, ".modinfo", NULL);
-	const char *buf;
-	size_t len, pos = 0;
-	int count = 0;
-
-	if (!shdr || shdr->sh_offset + shdr->sh_size > ctx->size) {
-		printf("  <none>\n");
-		return;
-	}
-
-	buf = (const char *)(ctx->buf + shdr->sh_offset);
-	len = shdr->sh_size;
-
-	while (pos < len) {
-		const char *entry = buf + pos;
-		size_t elen = strnlen(entry, len - pos);
-		if (elen > 0) {
-			const char *eq = strchr(entry, '=');
-			if (eq) {
-				char key[128];
-				size_t klen = (size_t)(eq - entry);
-				if (klen >= sizeof(key)) klen = sizeof(key) - 1;
-				memcpy(key, entry, klen);
-				key[klen] = '\0';
-				printf("  %-20s = %s\n", key, eq + 1);
-			} else {
-				printf("  %-20s\n", entry);
-			}
-			count++;
-		}
-		pos += elen + 1;
-	}
-	if (count == 0) printf("  <none>\n");
-}
-
-static bool elf_get_modinfo_entry(struct elf_ctx *ctx, const char *key, char *out_val, size_t max_len) {
-	Elf64_Shdr *shdr = elf_find_shdr(ctx, ".modinfo", NULL);
-	const char *buf;
-	size_t len, pos = 0;
-	size_t klen;
-
-	if (!shdr || !key || !out_val || max_len == 0 || shdr->sh_offset + shdr->sh_size > ctx->size)
-		return false;
-
-	buf = (const char *)(ctx->buf + shdr->sh_offset);
-	len = shdr->sh_size;
-	klen = strlen(key);
-
-	while (pos < len) {
-		const char *entry = buf + pos;
-		size_t elen = strnlen(entry, len - pos);
-		if (elen > klen && strncmp(entry, key, klen) == 0 && entry[klen] == '=') {
-			strncpy(out_val, entry + klen + 1, max_len - 1);
-			out_val[max_len - 1] = '\0';
-			return true;
-		}
-		pos += elen + 1;
-	}
-	return false;
-}
-
-static bool detect_running_vermagic(char *out_magic, size_t max_len) {
-	struct utsname uts;
-	bool has_smp = false, has_preempt = false;
-	bool has_mod_unload = true, has_modversions = false;
-	FILE *vf, *kf;
-	char line[512];
-
-	if (!out_magic || max_len < 16) return false;
-	if (uname(&uts) != 0) return false;
-
-	/* 1. Check /proc/version */
-	vf = fopen("/proc/version", "r");
-	if (vf) {
-		if (fgets(line, sizeof(line), vf)) {
-			has_smp = (strstr(line, "SMP") != NULL);
-			has_preempt = (strstr(line, "PREEMPT") != NULL);
-		}
-		fclose(vf);
-	}
-
-	/* 2. Check /proc/kallsyms for modversions */
-	kf = fopen("/proc/kallsyms", "r");
-	if (kf) {
-		while (fgets(line, sizeof(line), kf)) {
-			if (strstr(line, "module_layout") != NULL) {
-				has_modversions = true;
-				break;
-			}
-		}
-		fclose(kf);
-	}
-
-	snprintf(out_magic, max_len, "%s%s%s%s%s aarch64",
-	         uts.release,
-	         has_smp ? " SMP" : "",
-	         has_preempt ? " preempt" : "",
-	         has_mod_unload ? " mod_unload" : "",
-	         has_modversions ? " modversions" : "");
-	return true;
-}
-
-static bool extract_vermagic_from_kernel_buf(const uint8_t *buf, size_t size, char *out_magic, size_t max_len) {
-	const char *needle = "aarch64";
-	size_t nlen = 7;
-	size_t i;
-
-	if (!buf || size < 64 || !out_magic || max_len < 16) return false;
-
-	for (i = 0; i + nlen <= size; i++) {
-		if (memcmp(buf + i, needle, nlen) == 0) {
-			size_t start = i;
-			size_t end = i + nlen;
-			while (start > 0 && buf[start - 1] >= 0x20 && buf[start - 1] <= 0x7E) {
-				start--;
-			}
-			if (end - start >= 20) {
-				const char *cand = (const char *)(buf + start);
-				size_t clen = end - start;
-				if (cand[0] >= '2' && cand[0] <= '9' && memchr(cand, '.', clen) != NULL) {
-					if (memmem(cand, clen, " SMP ", 5) || memmem(cand, clen, " preempt ", 9) ||
-					    memmem(cand, clen, " mod_unload ", 12)) {
-						size_t cpy = (clen < max_len - 1) ? clen : (max_len - 1);
-						memcpy(out_magic, cand, cpy);
-						out_magic[cpy] = '\0';
-						return true;
-					}
-				}
-			}
-		}
-	}
-	return false;
-}
-
-static bool extract_vermagic_from_path(const char *path, char *out_magic, size_t max_len) {
-	boot_img_t boot;
-	int fd;
-	struct stat st;
-	uint8_t *map;
-	bool found = false;
-
-	if (!path || !out_magic) return false;
-
-	/* If boot image */
-	if (boot_img_parse(&boot, path)) {
-		if (boot.kernel && boot.kernel_size > 0) {
-			if (boot_fmt_compressed(boot.k_fmt)) {
-				char tmp_k[PATH_MAX];
-				int kd_fd;
-				snprintf(tmp_k, sizeof(tmp_k), "/tmp/mb_vmgk_%d.raw", (int)getpid());
-				kd_fd = open(tmp_k, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-				if (kd_fd >= 0) {
-					bb_decompress_data(boot.k_fmt, boot.kernel, boot.kernel_size, kd_fd);
-					if (fstat(kd_fd, &st) == 0 && st.st_size > 64) {
-						uint8_t *kmap = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, kd_fd, 0);
-						if (kmap != MAP_FAILED) {
-							found = extract_vermagic_from_kernel_buf(kmap, st.st_size, out_magic, max_len);
-							munmap(kmap, st.st_size);
-						}
-					}
-					close(kd_fd);
-					unlink(tmp_k);
-				}
-			} else {
-				found = extract_vermagic_from_kernel_buf(boot.kernel, boot.kernel_size, out_magic, max_len);
-			}
-		}
-		boot_img_free(&boot);
-		return found;
-	}
-
-	/* Loose kernel file */
-	fd = open(path, O_RDONLY | O_CLOEXEC);
-	if (fd < 0) return false;
-	if (fstat(fd, &st) < 0 || st.st_size < 64) { close(fd); return false; }
-	map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-	if (map != MAP_FAILED) {
-		uint8_t fmt = boot_check_fmt(map, st.st_size);
-		if (boot_fmt_compressed(fmt)) {
-			char tmp_k[PATH_MAX];
-			int kd_fd;
-			struct stat kst;
-			snprintf(tmp_k, sizeof(tmp_k), "/tmp/mb_vmgk_%d.raw", (int)getpid());
-			kd_fd = open(tmp_k, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-			if (kd_fd >= 0) {
-				bb_decompress_data(fmt, map, st.st_size, kd_fd);
-				if (fstat(kd_fd, &kst) == 0 && kst.st_size > 64) {
-					uint8_t *kmap = mmap(NULL, kst.st_size, PROT_READ, MAP_SHARED, kd_fd, 0);
-					if (kmap != MAP_FAILED) {
-						found = extract_vermagic_from_kernel_buf(kmap, kst.st_size, out_magic, max_len);
-						munmap(kmap, kst.st_size);
-					}
-				}
-				close(kd_fd);
-				unlink(tmp_k);
-			}
-		} else {
-			found = extract_vermagic_from_kernel_buf(map, st.st_size, out_magic, max_len);
-		}
-		munmap(map, st.st_size);
-	}
-	close(fd);
-	return found;
-}
-
-static bool patch_vermagic_buf(struct elf_ctx *ctx, const char *new_vermagic) {
-	Elf64_Shdr *shdr = elf_find_shdr(ctx, ".modinfo", NULL);
-	char *buf;
-	size_t len, pos = 0;
-	size_t new_len, old_len;
-
-	if (!shdr || !new_vermagic || shdr->sh_offset + shdr->sh_size > ctx->size)
-		return false;
-
-	buf = (char *)(ctx->buf + shdr->sh_offset);
-	len = shdr->sh_size;
-	new_len = strlen(new_vermagic);
-
-	while (pos < len) {
-		char *entry = buf + pos;
-		size_t elen = strnlen(entry, len - pos);
-		if (elen > 9 && strncmp(entry, "vermagic=", 9) == 0) {
-			old_len = elen - 9;
-			if (new_len <= old_len) {
-				memcpy(entry + 9, new_vermagic, new_len);
-				memset(entry + 9 + new_len, 0, old_len - new_len);
-				fprintf(stderr, "[+] Patched vermagic in-place: \"%s\" (padded: %zu bytes)\n", new_vermagic, old_len - new_len);
-				return true;
-			} else {
-				size_t extra = new_len - old_len;
-				if (len - (pos + elen + 1) >= extra) {
-					memmove(entry + 9 + new_len + 1, entry + 9 + old_len + 1, len - (pos + 9 + old_len + 1 + extra));
-					memcpy(entry + 9, new_vermagic, new_len);
-					entry[9 + new_len] = '\0';
-					fprintf(stderr, "[+] Patched expanded vermagic in-place: \"%s\"\n", new_vermagic);
-					return true;
-				}
-				memcpy(entry + 9, new_vermagic, old_len);
-				fprintf(stderr, "[!] Warning: Truncated vermagic to fit in-place .modinfo slot: \"%s\"\n", entry + 9);
-				return true;
-			}
-		}
-		pos += elen + 1;
-	}
-	return false;
-}
-
-static int patch_module_relocations_and_cfi(struct elf_ctx *ctx) {
-	int modified = 0;
-	Elf64_Shdr *shdr;
-	size_t i;
-
-	/* 1. Neutralize .altinstructions and .rela.altinstructions */
-	shdr = elf_find_shdr(ctx, ".altinstructions", NULL);
-	if (shdr && shdr->sh_type != SHT_NOBITS) {
-		shdr->sh_type = SHT_NOBITS;
-		shdr->sh_size = 0;
-		modified++;
-		fprintf(stderr, "[+] Neutralized .altinstructions (converted to SHT_NOBITS)\n");
-	}
-	shdr = elf_find_shdr(ctx, ".rela.altinstructions", NULL);
-	if (shdr && shdr->sh_type != SHT_NOBITS) {
-		shdr->sh_type = SHT_NOBITS;
-		shdr->sh_size = 0;
-		modified++;
-		fprintf(stderr, "[+] Neutralized .rela.altinstructions (converted to SHT_NOBITS)\n");
-	}
-
-	/* 2. Sanitize .gnu.linkonce.this_module */
-	shdr = elf_find_shdr(ctx, ".gnu.linkonce.this_module", NULL);
-	if (shdr && shdr->sh_size > 80 && shdr->sh_offset + shdr->sh_size <= ctx->size) {
-		size_t zero_bytes = shdr->sh_size - 80;
-		memset(ctx->buf + shdr->sh_offset + 80, 0, zero_bytes);
-		modified++;
-		fprintf(stderr, "[+] Sanitized .gnu.linkonce.this_module: preserved 80-byte header, zeroed %zu trailing bytes\n", zero_bytes);
-	}
-
-	/* 3. Neutralize synthesized Cross-DSO __cfi_check stub */
-	shdr = elf_find_shdr(ctx, ".symtab", NULL);
-	if (shdr && shdr->sh_type == SHT_SYMTAB && shdr->sh_offset + shdr->sh_size <= ctx->size) {
-		Elf64_Shdr *strtab_sh = &ctx->shdrs64[shdr->sh_link];
-		if (shdr->sh_link < ctx->shnum && strtab_sh->sh_offset + strtab_sh->sh_size <= ctx->size) {
-			const char *strtab = (const char *)(ctx->buf + strtab_sh->sh_offset);
-			Elf64_Sym *syms = (Elf64_Sym *)(ctx->buf + shdr->sh_offset);
-			size_t nsyms = shdr->sh_size / sizeof(Elf64_Sym);
-			for (i = 0; i < nsyms; i++) {
-				if (syms[i].st_name && strcmp(strtab + syms[i].st_name, "__cfi_check") == 0) {
-					if (syms[i].st_shndx < ctx->shnum) {
-						Elf64_Shdr *t_sh = &ctx->shdrs64[syms[i].st_shndx];
-						if (t_sh->sh_offset + syms[i].st_value + 4 <= ctx->size) {
-							uint32_t *p_insn = (uint32_t *)(ctx->buf + t_sh->sh_offset + syms[i].st_value);
-							if (*p_insn != ARM64_RET_OPCODE) {
-								*p_insn = ARM64_RET_OPCODE;
-								modified++;
-								fprintf(stderr, "[+] Neutralized synthesized __cfi_check stub -> RET (0x%08X)\n", ARM64_RET_OPCODE);
-							}
-						}
-					}
-					break;
-				}
-			}
-		}
-	}
-
-	return modified;
-}
-
-static int strip_module_sections(struct elf_ctx *ctx) {
-	int stripped = 0;
-	size_t i;
-	for (i = 1; i < ctx->shnum; i++) {
-		const char *name = ctx->shstrtab + ctx->shdrs64[i].sh_name;
-		bool do_strip = false;
-		if (strncmp(name, ".debug_", 7) == 0 ||
-		    strcmp(name, ".comment") == 0 ||
-		    strcmp(name, ".note.GNU-stack") == 0) {
-			do_strip = true;
-		}
-		if (do_strip && ctx->shdrs64[i].sh_type != SHT_NOBITS && ctx->shdrs64[i].sh_size > 0) {
-			ctx->shdrs64[i].sh_type = SHT_NOBITS;
-			ctx->shdrs64[i].sh_size = 0;
-			stripped++;
-		}
-	}
-	return stripped;
-}
-
-static int audit_module_symbols(struct elf_ctx *ctx, const char *kallsyms_file) {
-	Elf64_Shdr *shdr = elf_find_shdr(ctx, ".symtab", NULL);
-	const char *strtab;
-	Elf64_Sym *syms;
-	size_t nsyms, i, idx;
-	size_t total_undef = 0, missing_strong = 0, missing_weak = 0, resolved_cnt = 0;
-	FILE *kf;
-	char line[512];
-	char **undef_names = NULL;
-	bool *is_weak_arr = NULL;
-	bool *is_res_arr = NULL;
-
-	if (!shdr || shdr->sh_type != SHT_SYMTAB || shdr->sh_offset + shdr->sh_size > ctx->size) {
-		fprintf(stderr, "[-] No symbol table found in module\n");
-		return 1;
-	}
-
-	strtab = (const char *)(ctx->buf + ctx->shdrs64[shdr->sh_link].sh_offset);
-	syms = (Elf64_Sym *)(ctx->buf + shdr->sh_offset);
-	nsyms = shdr->sh_size / sizeof(Elf64_Sym);
-
-	for (i = 1; i < nsyms; i++) {
-		if (syms[i].st_shndx == SHN_UNDEF && syms[i].st_name) {
-			const char *sname = strtab + syms[i].st_name;
-			if (sname[0] && ELF64_ST_BIND(syms[i].st_info) != STB_LOCAL) {
-				total_undef++;
-			}
-		}
-	}
-
-	if (total_undef == 0) {
-		printf("[+] Pre-flight audit: Zero unresolved external dependencies (self-contained module).\n");
-		return 0;
-	}
-
-	undef_names = xzalloc(total_undef * sizeof(char *));
-	is_weak_arr = xzalloc(total_undef * sizeof(bool));
-	is_res_arr = xzalloc(total_undef * sizeof(bool));
-
-	idx = 0;
-	for (i = 1; i < nsyms; i++) {
-		if (syms[i].st_shndx == SHN_UNDEF && syms[i].st_name) {
-			const char *sname = strtab + syms[i].st_name;
-			if (sname[0] && ELF64_ST_BIND(syms[i].st_info) != STB_LOCAL) {
-				undef_names[idx] = xstrdup(sname);
-				is_weak_arr[idx] = (ELF64_ST_BIND(syms[i].st_info) == STB_WEAK);
-				is_res_arr[idx] = false;
-				idx++;
-			}
-		}
-	}
-
-	printf("[*] Pre-flight audit: Checking %zu external symbol(s) against %s...\n",
-	       total_undef, kallsyms_file ? kallsyms_file : "/proc/kallsyms");
-
-	kf = fopen(kallsyms_file ? kallsyms_file : "/proc/kallsyms", "r");
-	if (!kf) {
-		fprintf(stderr, "[!] Warning: Cannot open %s for live verification.\n", kallsyms_file ? kallsyms_file : "/proc/kallsyms");
-		for (i = 0; i < total_undef; i++) {
-			printf("  [%s] %s\n", is_weak_arr[i] ? "WEAK" : "GLOBAL", undef_names[i]);
-			free(undef_names[i]);
-		}
-		free(undef_names);
-		free(is_weak_arr);
-		free(is_res_arr);
-		return 0;
-	}
-
-	while (fgets(line, sizeof(line), kf)) {
-		char *p = strrchr(line, ' ');
-		size_t slen;
-		if (!p) p = strrchr(line, '\t');
-		if (!p) continue;
-		p++;
-		slen = strlen(p);
-		while (slen > 0 && (p[slen - 1] == '\n' || p[slen - 1] == '\r')) p[--slen] = '\0';
-
-		for (i = 0; i < total_undef; i++) {
-			if (!is_res_arr[i] && strcmp(undef_names[i], p) == 0) {
-				is_res_arr[i] = true;
-			}
-		}
-	}
-	fclose(kf);
-
-	for (i = 0; i < total_undef; i++) {
-		if (is_res_arr[i]) {
-			resolved_cnt++;
-		} else if (is_weak_arr[i]) {
-			missing_weak++;
-			printf("[?] Unresolved WEAK symbol  : %s\n", undef_names[i]);
-		} else {
-			missing_strong++;
-			fprintf(stderr, "[-] UNRESOLVED GLOBAL symbol: %s\n", undef_names[i]);
-		}
-		free(undef_names[i]);
-	}
-	free(undef_names);
-	free(is_weak_arr);
-	free(is_res_arr);
-
-	printf("[*] Audit Summary: %zu resolved, %zu missing strong, %zu missing weak\n",
-	       resolved_cnt, missing_strong, missing_weak);
-	if (missing_strong > 0) {
-		fprintf(stderr, "[-] PRE-FLIGHT AUDIT FAILED: %zu required kernel symbol(s) missing!\n", missing_strong);
-		return 2;
-	}
-
-	printf("[+] PRE-FLIGHT AUDIT PASSED: All required external kernel symbols resolved.\n");
-	return 0;
-}
-
-static void log_kmsg_msg(const char *msg) {
-	int fd = open("/dev/kmsg", O_WRONLY | O_NOCTTY | O_CLOEXEC);
-	if (fd >= 0) {
-		full_write(fd, msg, strlen(msg));
-		close(fd);
-	}
-}
-
-static int module_info_file(const char *file) {
-	int fd = open(file, O_RDONLY | O_CLOEXEC);
-	struct stat st;
-	uint8_t *map;
-	struct elf_ctx ctx;
-	char build_id[128];
-
-	if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < sizeof(Elf64_Ehdr)) {
-		bb_perror_msg("cannot open module file '%s'", file);
-		if (fd >= 0) close(fd);
-		return 1;
-	}
-
-	map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-	close(fd);
-	if (map == MAP_FAILED) {
-		bb_perror_msg("failed to mmap '%s'", file);
-		return 1;
-	}
-
-	if (!elf_init_ctx(&ctx, map, st.st_size)) {
-		bb_error_msg("'%s' is not a valid 64-bit ELF kernel module", file);
-		munmap(map, st.st_size);
-		return 1;
-	}
-
-	printf("======================================================================\n");
-	printf("  Kernel Module Inspection: %s\n", file);
-	printf("======================================================================\n");
-	printf("[*] Architecture    : %s (0x%04x)\n",
-	       (ctx.machine == EM_AARCH64) ? "AArch64 (ARM64)" : (ctx.machine == EM_X86_64 ? "x86_64" : "Other"),
-	       ctx.machine);
-	printf("[*] ELF Class       : %s\n", ctx.is_64 ? "64-bit" : "32-bit");
-	printf("[*] Data Encoding   : %s\n", ctx.is_le ? "2's complement, little endian" : "big endian");
-	printf("[*] Section Count   : %u\n", (unsigned int)ctx.shnum);
-
-	if (elf_get_build_id(&ctx, build_id, sizeof(build_id))) {
-		printf("[*] GNU Build-ID    : %s\n", build_id);
-	} else {
-		printf("[*] GNU Build-ID    : <none / stripped>\n");
-	}
-
-	printf("\n[*] Module Info (.modinfo):\n");
-	elf_list_modinfo(&ctx);
-	printf("======================================================================\n");
-
-	munmap(map, st.st_size);
-	return 0;
-}
-
-static int module_check_file(const char *file) {
-	int fd = open(file, O_RDONLY | O_CLOEXEC);
-	struct stat st;
-	uint8_t *map;
-	struct elf_ctx ctx;
-	char mod_ver[256] = {0};
-	char run_ver[256] = {0};
-	bool found;
-
-	if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < sizeof(Elf64_Ehdr)) {
-		bb_perror_msg("cannot open module file '%s'", file);
-		if (fd >= 0) close(fd);
-		return 1;
-	}
-
-	map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-	close(fd);
-	if (map == MAP_FAILED) {
-		bb_perror_msg("failed to mmap '%s'", file);
-		return 1;
-	}
-
-	if (!elf_init_ctx(&ctx, map, st.st_size)) {
-		bb_error_msg("'%s' is not a valid 64-bit ELF kernel module", file);
-		munmap(map, st.st_size);
-		return 1;
-	}
-
-	found = elf_get_modinfo_entry(&ctx, "vermagic", mod_ver, sizeof(mod_ver));
-	detect_running_vermagic(run_ver, sizeof(run_ver));
-
-	printf("======================================================================\n");
-	printf("  Module Path    : %s\n", file);
-	printf("  Module Vermagic: %s\n", found ? mod_ver : "(not found)");
-	printf("  Running Kernel : %s\n", run_ver);
-	printf("======================================================================\n");
-
-	if (found && strcmp(mod_ver, run_ver) == 0) {
-		printf("[✓] Status: 100%% EXACT MATCH — loads natively via insmod/modprobe.\n");
-		munmap(map, st.st_size);
-		return 0;
-	} else {
-		printf("[!] Status: MISMATCH — requires vermagic alignment / patch-vermagic.\n");
-		munmap(map, st.st_size);
-		return 1;
-	}
-}
-
-static int module_strip_file(const char *in_file, const char *out_file) {
-	int in_fd = open(in_file, O_RDONLY | O_CLOEXEC);
-	struct stat st;
-	uint8_t *buf;
-	struct elf_ctx ctx;
-	int stripped;
-	int out_fd;
-	const char *dest;
-
-	if (in_fd < 0 || fstat(in_fd, &st) < 0 || st.st_size < sizeof(Elf64_Ehdr)) {
-		bb_perror_msg("cannot open module '%s'", in_file);
-		if (in_fd >= 0) close(in_fd);
-		return 1;
-	}
-
-	buf = xmalloc(st.st_size);
-	if (full_read(in_fd, buf, st.st_size) != st.st_size) {
-		bb_perror_msg("failed to read '%s'", in_file);
-		close(in_fd);
-		free(buf);
-		return 1;
-	}
-	close(in_fd);
-
-	if (!elf_init_ctx(&ctx, buf, st.st_size)) {
-		bb_error_msg("'%s' is not a valid 64-bit ELF kernel module", in_file);
-		free(buf);
-		return 1;
-	}
-
-	stripped = strip_module_sections(&ctx);
-	fprintf(stderr, "[+] Neutralized %d unneeded/debug section(s)\n", stripped);
-
-	dest = (out_file && out_file[0]) ? out_file : in_file;
-	out_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-	if (out_fd < 0) {
-		bb_perror_msg("cannot write '%s'", dest);
-		free(buf);
-		return 1;
-	}
-	full_write(out_fd, buf, st.st_size);
-	close(out_fd);
-	free(buf);
-	fprintf(stderr, "[✓] SUCCESS: Module '%s' stripped.\n", dest);
-	return 0;
-}
-
-static int module_patch_file(const char *in_file, const char *out_file, const char *custom_vermagic,
-                            const char *boot_path, bool do_strip) {
-	int in_fd = open(in_file, O_RDONLY | O_CLOEXEC);
-	struct stat st;
-	uint8_t *buf;
-	struct elf_ctx ctx;
-	char target_magic[256] = {0};
-	char old_magic[256] = {0};
-	int out_fd;
-	int stripped;
-	const char *dest;
-
-	if (in_fd < 0 || fstat(in_fd, &st) < 0 || st.st_size < sizeof(Elf64_Ehdr)) {
-		bb_perror_msg("cannot open module '%s'", in_file);
-		if (in_fd >= 0) close(in_fd);
-		return 1;
-	}
-
-	buf = xmalloc(st.st_size + 16384);
-	if (full_read(in_fd, buf, st.st_size) != st.st_size) {
-		bb_perror_msg("failed to read '%s'", in_file);
-		close(in_fd);
-		free(buf);
-		return 1;
-	}
-	close(in_fd);
-
-	if (!elf_init_ctx(&ctx, buf, st.st_size)) {
-		bb_error_msg("'%s' is not a valid 64-bit ELF kernel module", in_file);
-		free(buf);
-		return 1;
-	}
-
-	if (custom_vermagic && custom_vermagic[0] != '\0') {
-		strncpy(target_magic, custom_vermagic, sizeof(target_magic) - 1);
-	} else if (boot_path) {
-		if (!extract_vermagic_from_path(boot_path, target_magic, sizeof(target_magic))) {
-			bb_error_msg("could not extract vermagic from boot/kernel '%s'", boot_path);
-			free(buf);
-			return 1;
-		}
-		fprintf(stderr, "[+] Autodetected vermagic from %s: \"%s\"\n", boot_path, target_magic);
-	} else {
-		if (!detect_running_vermagic(target_magic, sizeof(target_magic))) {
-			bb_error_msg("cannot determine target vermagic");
-			free(buf);
-			return 1;
-		}
-	}
-
-	if (elf_get_modinfo_entry(&ctx, "vermagic", old_magic, sizeof(old_magic))) {
-		fprintf(stderr, "[*] Original vermagic : \"%s\" (len=%zu)\n", old_magic, strlen(old_magic));
-	}
-	fprintf(stderr, "[*] Target vermagic   : \"%s\" (len=%zu)\n", target_magic, strlen(target_magic));
-
-	if (do_strip) {
-		stripped = strip_module_sections(&ctx);
-		fprintf(stderr, "[+] Neutralized / stripped %d unneeded/debug section(s)\n", stripped);
-	}
-
-	patch_vermagic_buf(&ctx, target_magic);
-	patch_module_relocations_and_cfi(&ctx);
-
-	dest = (out_file && out_file[0]) ? out_file : in_file;
-	out_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-	if (out_fd < 0) {
-		bb_perror_msg("cannot write '%s'", dest);
-		free(buf);
-		return 1;
-	}
-	full_write(out_fd, buf, st.st_size);
-	close(out_fd);
-	free(buf);
-
-	fprintf(stderr, "[✓] SUCCESS: Module '%s' vermagic dynamically patched to \"%s\"!\n", dest, target_magic);
-	return 0;
-}
-
-static int module_load_file(const char *file, const char *args) {
-	int fd = open(file, O_RDONLY | O_CLOEXEC);
-	struct stat st;
-	uint8_t *buf;
-	struct elf_ctx ctx;
-	char target_magic[256];
-	long ret;
-	char msg[512];
-
-	if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < sizeof(Elf64_Ehdr)) {
-		bb_perror_msg("cannot open module '%s'", file);
-		if (fd >= 0) close(fd);
-		return 1;
-	}
-
-	buf = xmalloc(st.st_size + 16384);
-	if (full_read(fd, buf, st.st_size) != st.st_size) {
-		bb_perror_msg("failed to read '%s'", file);
-		close(fd);
-		free(buf);
-		return 1;
-	}
-	close(fd);
-
-	detect_running_vermagic(target_magic, sizeof(target_magic));
-	if (elf_init_ctx(&ctx, buf, st.st_size)) {
-		patch_vermagic_buf(&ctx, target_magic);
-		patch_module_relocations_and_cfi(&ctx);
-	}
-
-	fprintf(stderr, "[+] Calling SYS_init_module(size=%zu, args=\"%s\")...\n", (size_t)st.st_size, args ? args : "");
-	ret = syscall(SYS_init_module, buf, st.st_size, args ? args : "");
-	if (ret == 0) {
-		fprintf(stderr, "[✓] SUCCESS: Module '%s' loaded into kernel!\n", file);
-		snprintf(msg, sizeof(msg), "<6>magiskboot: Module '%s' loaded successfully with vermagic '%s'\n", file, target_magic);
-		log_kmsg_msg(msg);
-		free(buf);
-		return 0;
-	}
-
-	if (errno == EEXIST) {
-		fprintf(stderr, "[!] Module already resident in kernel.\n");
-		free(buf);
-		return 0;
-	}
-
-	if (errno == ENOKEY || errno == EKEYREJECTED) {
-		fprintf(stderr, "[-] ERROR: Kernel module signature enforcement is ACTIVE (CONFIG_MODULE_SIG_FORCE=y).\n");
-		fprintf(stderr, "[-] Run 'magiskboot de-enforce <boot.img>' to neutralize kernel signature enforcement.\n");
-	} else {
-		bb_perror_msg("init_module failed");
-	}
-	free(buf);
-	return 1;
-}
-
-static int module_finit_file(const char *file, const char *args) {
-	int fd = open(file, O_RDONLY | O_CLOEXEC);
-	long ret;
-	char msg[256];
-
-	if (fd < 0) {
-		bb_perror_msg("cannot open module '%s'", file);
-		return 1;
-	}
-
-	fprintf(stderr, "[+] Calling SYS_finit_module(fd=%d, args=\"%s\")...\n", fd, args ? args : "");
-	ret = syscall(SYS_finit_module, fd, args ? args : "", 0);
-	close(fd);
-
-	if (ret == 0) {
-		fprintf(stderr, "[✓] SUCCESS: Module '%s' loaded via SYS_finit_module!\n", file);
-		snprintf(msg, sizeof(msg), "<6>magiskboot: Module '%s' loaded via sys_finit_module\n", file);
-		log_kmsg_msg(msg);
-		return 0;
-	}
-
-	if (errno == EEXIST) {
-		fprintf(stderr, "[!] Module already resident in kernel.\n");
-		return 0;
-	}
-
-	fprintf(stderr, "[!] sys_finit_module returned %ld (errno=%d). Falling back to in-memory vermagic alignment...\n",
-	        ret, errno);
-	return module_load_file(file, args);
-}
-
-static int module_unload_name(const char *name) {
-	const char *n = (name && name[0]) ? name : "kroot";
-	long ret;
-	char msg[256];
-
-	fprintf(stderr, "[+] Unloading module '%s'...\n", n);
-	ret = syscall(SYS_delete_module, n, O_NONBLOCK);
-	if (ret != 0 && strcmp(n, "kroot") == 0) {
-		ret = syscall(SYS_delete_module, "compat_modern_kernel", O_NONBLOCK);
-	}
-
-	if (ret == 0) {
-		fprintf(stderr, "[✓] SUCCESS: Module '%s' unloaded.\n", n);
-		snprintf(msg, sizeof(msg), "<6>magiskboot: Module '%s' unloaded\n", n);
-		log_kmsg_msg(msg);
-		return 0;
-	}
-
-	bb_perror_msg("delete_module failed");
-	return 1;
-}
-
-static int magiskboot_patch_vermagic_op(int argc, char **argv) {
-	const char *filepath = NULL;
-	char target_magic[256] = {0};
-	const char *boot_img_path = NULL;
-	const char *outfile = NULL;
-	bool mode_strip = false;
-	bool mode_info = false;
-	bool mode_audit = false;
-	int i;
-
-	for (i = 2; i < argc; i++) {
-		if (strcmp(argv[i], "--cfi") == 0 || strcmp(argv[i], "--non-cfi") == 0) {
-			/* handled portably */
-		} else if (strcmp(argv[i], "--boot") == 0 && i + 1 < argc) {
-			boot_img_path = argv[++i];
-		} else if (strcmp(argv[i], "--info") == 0 || strcmp(argv[i], "-i") == 0) {
-			mode_info = true;
-		} else if (strcmp(argv[i], "--audit") == 0 || strcmp(argv[i], "-a") == 0) {
-			mode_audit = true;
-		} else if (strcmp(argv[i], "--strip") == 0 || strcmp(argv[i], "-s") == 0) {
-			mode_strip = true;
-		} else if (argv[i][0] != '-') {
-			if (!filepath) {
-				filepath = argv[i];
-			} else if (!boot_img_path && target_magic[0] == '\0' && !strstr(argv[i], ".ko")) {
-				strncpy(target_magic, argv[i], sizeof(target_magic) - 1);
-			} else if (!outfile) {
-				outfile = argv[i];
-			}
-		}
-	}
-
-	if (!filepath) {
-		bb_error_msg("usage: magiskboot patch-vermagic <module.ko> [target_vermagic] [out.ko] [options]");
-		return 1;
-	}
-
-	if (mode_info) return module_info_file(filepath);
-	if (mode_audit) {
-		int fd = open(filepath, O_RDONLY | O_CLOEXEC);
-		struct stat st;
-		uint8_t *map;
-		struct elf_ctx ctx;
-		int res;
-		if (fd < 0 || fstat(fd, &st) < 0) { bb_perror_msg("cannot open '%s'", filepath); if (fd >= 0) close(fd); return 1; }
-		map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-		close(fd);
-		if (map == MAP_FAILED) return 1;
-		if (!elf_init_ctx(&ctx, map, st.st_size)) { munmap(map, st.st_size); return 1; }
-		res = audit_module_symbols(&ctx, NULL);
-		munmap(map, st.st_size);
-		return res;
-	}
-	if (mode_strip && target_magic[0] == '\0' && !boot_img_path) {
-		return module_strip_file(filepath, outfile);
-	}
-
-	return module_patch_file(filepath, outfile, (target_magic[0] != '\0') ? target_magic : NULL, boot_img_path, mode_strip);
-}
-
-static int magiskboot_module_op(int argc, char **argv) {
-	const char *action;
-	const char *file = NULL;
-	const char *arg1 = NULL;
-	const char *arg2 = NULL;
-	int idx = 2;
-
-	if (argc < 3) {
-		bb_show_usage();
-	}
-
-	action = argv[idx++];
-	if (idx < argc) file = argv[idx++];
-	if (idx < argc) arg1 = argv[idx++];
-	if (idx < argc) arg2 = argv[idx++];
-
-	if (strcmp(action, "info") == 0) {
-		if (!file) bb_show_usage();
-		return module_info_file(file);
-	}
-	if (strcmp(action, "check") == 0) {
-		if (!file) bb_show_usage();
-		return module_check_file(file);
-	}
-	if (strcmp(action, "audit") == 0) {
-		int fd;
-		struct stat st;
-		uint8_t *map;
-		struct elf_ctx ctx;
-		int res;
-		if (!file) bb_show_usage();
-		fd = open(file, O_RDONLY | O_CLOEXEC);
-		if (fd < 0 || fstat(fd, &st) < 0) { bb_perror_msg("cannot open '%s'", file); if (fd >= 0) close(fd); return 1; }
-		map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-		close(fd);
-		if (map == MAP_FAILED) return 1;
-		if (!elf_init_ctx(&ctx, map, st.st_size)) { munmap(map, st.st_size); return 1; }
-		res = audit_module_symbols(&ctx, arg1);
-		munmap(map, st.st_size);
-		return res;
-	}
-	if (strcmp(action, "strip") == 0) {
-		if (!file) bb_show_usage();
-		return module_strip_file(file, arg1);
-	}
-	if (strcmp(action, "patch") == 0 || strcmp(action, "patch-vermagic") == 0) {
-		if (!file) bb_show_usage();
-		return module_patch_file(file, arg2, arg1, NULL, false);
-	}
-	if (strcmp(action, "load") == 0) {
-		if (!file) file = "/data/adb/modules/kcompat/compat_modern_kernel.ko";
-		return module_load_file(file, arg1 ? arg1 : "");
-	}
-	if (strcmp(action, "finit") == 0) {
-		if (!file) file = "/data/adb/modules/kcompat/compat_modern_kernel.ko";
-		return module_finit_file(file, arg1 ? arg1 : "");
-	}
-	if (strcmp(action, "unload") == 0) {
-		return module_unload_name(file ? file : "kroot");
-	}
-
-	bb_error_msg("unknown module action '%s' (supported: info, check, audit, strip, patch, load, finit, unload)", action);
-	return 1;
 }
 
 /* =========================================================================
@@ -6368,58 +5876,6 @@ int magiskboot_main(int argc, char **argv) {
 	if (strcmp(cmd, "patch-cfi") == 0) {
 		if (argc < 3) bb_show_usage();
 		return magiskboot_kernel_op(argv[2], "cfi", argc, argv);
-	}
-
-	if (strcmp(cmd, "module") == 0 || strcmp(cmd, "mod") == 0) {
-		if (argc < 3) bb_show_usage();
-		return magiskboot_module_op(argc, argv);
-	}
-
-	if (strcmp(cmd, "patch-vermagic") == 0 || strcmp(cmd, "vermagic") == 0) {
-		if (argc < 3) bb_show_usage();
-		return magiskboot_patch_vermagic_op(argc, argv);
-	}
-
-	if (strcmp(cmd, "mod-info") == 0) {
-		if (argc < 3) bb_show_usage();
-		return module_info_file(argv[2]);
-	}
-
-	if (strcmp(cmd, "mod-check") == 0) {
-		if (argc < 3) bb_show_usage();
-		return module_check_file(argv[2]);
-	}
-
-	if (strcmp(cmd, "mod-audit") == 0) {
-		int fd;
-		struct stat st;
-		uint8_t *map;
-		struct elf_ctx ctx;
-		int res;
-		if (argc < 3) bb_show_usage();
-		fd = open(argv[2], O_RDONLY | O_CLOEXEC);
-		if (fd < 0 || fstat(fd, &st) < 0) { bb_perror_msg("cannot open '%s'", argv[2]); if (fd >= 0) close(fd); return 1; }
-		map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-		close(fd);
-		if (map == MAP_FAILED) return 1;
-		if (!elf_init_ctx(&ctx, map, st.st_size)) { munmap(map, st.st_size); return 1; }
-		res = audit_module_symbols(&ctx, (argc >= 4) ? argv[3] : NULL);
-		munmap(map, st.st_size);
-		return res;
-	}
-
-	if (strcmp(cmd, "mod-strip") == 0) {
-		if (argc < 3) bb_show_usage();
-		return module_strip_file(argv[2], (argc >= 4) ? argv[3] : NULL);
-	}
-
-	if (strcmp(cmd, "mod-load") == 0) {
-		if (argc < 3) bb_show_usage();
-		return module_load_file(argv[2], (argc >= 4) ? argv[3] : "");
-	}
-
-	if (strcmp(cmd, "mod-unload") == 0) {
-		return module_unload_name((argc >= 3) ? argv[2] : "kroot");
 	}
 
 	if (strcmp(cmd, "dist") == 0 || strcmp(cmd, "anykernel") == 0 ||
