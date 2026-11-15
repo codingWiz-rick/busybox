@@ -6112,137 +6112,6 @@ static uint32_t zip_calc_crc32(const void *buf, size_t len) {
 	return crc32_block_endian0(0xffffffff, buf, len, global_crc32_table) ^ 0xffffffff;
 }
 
-static bool zip_compress_deflate(const void *in_buf, size_t in_sz, void **out_buf, size_t *out_sz, uint32_t *out_crc) {
-	char tmp_in[PATH_MAX], tmp_out[PATH_MAX];
-	int ifd, ofd, status;
-	pid_t pid;
-	struct stat st;
-	uint8_t *gz_map;
-	size_t gz_sz, hdr_len, payload_len;
-	uint8_t flg;
-	uint32_t crc;
-	void *def_buf;
-
-	if (in_sz < 64) return false;
-
-	snprintf(tmp_in, sizeof(tmp_in), "/tmp/mb_zin_%d_%d.tmp", (int)getpid(), (int)rand());
-	snprintf(tmp_out, sizeof(tmp_out), "/tmp/mb_zout_%d_%d.gz", (int)getpid(), (int)rand());
-
-	ifd = open(tmp_in, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-	if (ifd < 0) return false;
-	if (full_write(ifd, in_buf, in_sz) != in_sz) {
-		close(ifd);
-		unlink(tmp_in);
-		return false;
-	}
-	close(ifd);
-
-	ofd = open(tmp_out, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-	if (ofd < 0) {
-		unlink(tmp_in);
-		return false;
-	}
-
-	pid = fork();
-	if (pid == 0) {
-		int applet;
-		char *args[4];
-		dup2(ofd, STDOUT_FILENO);
-		close(ofd);
-		args[0] = (char *)"gzip";
-		args[1] = (char *)"-9c";
-		args[2] = tmp_in;
-		args[3] = NULL;
-		applet = find_applet_by_name("gzip");
-		if (applet >= 0) {
-			run_applet_no_and_exit(applet, "gzip", args);
-		}
-		BB_EXECVP("gzip", args);
-		_exit(127);
-	}
-	close(ofd);
-
-	if (pid < 0) {
-		unlink(tmp_in);
-		unlink(tmp_out);
-		return false;
-	}
-	waitpid(pid, &status, 0);
-	unlink(tmp_in);
-	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-		unlink(tmp_out);
-		return false;
-	}
-
-	ofd = open(tmp_out, O_RDONLY | O_CLOEXEC);
-	if (ofd < 0 || fstat(ofd, &st) < 0 || st.st_size < 18) {
-		if (ofd >= 0) close(ofd);
-		unlink(tmp_out);
-		return false;
-	}
-
-	gz_sz = st.st_size;
-	gz_map = xmalloc(gz_sz);
-	if (full_read(ofd, gz_map, gz_sz) != gz_sz) {
-		close(ofd);
-		free(gz_map);
-		unlink(tmp_out);
-		return false;
-	}
-	close(ofd);
-	unlink(tmp_out);
-
-	if (gz_map[0] != 0x1f || gz_map[1] != 0x8b || gz_map[2] != 0x08) {
-		free(gz_map);
-		return false;
-	}
-
-	hdr_len = 10;
-	flg = gz_map[3];
-	if (flg & 0x04) {
-		uint16_t xlen;
-		if (hdr_len + 2 > gz_sz) { free(gz_map); return false; }
-		xlen = (uint16_t)gz_map[hdr_len] | ((uint16_t)gz_map[hdr_len + 1] << 8);
-		hdr_len += 2 + xlen;
-	}
-	if (flg & 0x08) {
-		while (hdr_len < gz_sz && gz_map[hdr_len] != '\0') hdr_len++;
-		hdr_len++;
-	}
-	if (flg & 0x10) {
-		while (hdr_len < gz_sz && gz_map[hdr_len] != '\0') hdr_len++;
-		hdr_len++;
-	}
-	if (flg & 0x02) {
-		hdr_len += 2;
-	}
-
-	if (hdr_len + 8 >= gz_sz) {
-		free(gz_map);
-		return false;
-	}
-
-	payload_len = gz_sz - hdr_len - 8;
-	if (payload_len >= in_sz) {
-		free(gz_map);
-		return false;
-	}
-
-	crc = (uint32_t)gz_map[gz_sz - 8] |
-	      ((uint32_t)gz_map[gz_sz - 7] << 8) |
-	      ((uint32_t)gz_map[gz_sz - 6] << 16) |
-	      ((uint32_t)gz_map[gz_sz - 5] << 24);
-
-	def_buf = xmalloc(payload_len);
-	memcpy(def_buf, gz_map + hdr_len, payload_len);
-	free(gz_map);
-
-	*out_buf = def_buf;
-	*out_sz = payload_len;
-	*out_crc = crc;
-	return true;
-}
-
 static bool zip_writer_init(struct zip_writer *zw, const char *out_path) {
 	if (!zw || !out_path) return false;
 	memset(zw, 0, sizeof(*zw));
@@ -6261,60 +6130,32 @@ static bool zip_writer_init(struct zip_writer *zw, const char *out_path) {
 static bool zip_writer_add_mem(struct zip_writer *zw, const char *zip_name, const void *data, size_t data_len, mode_t mode) {
 	struct zip_local_hdr lhdr;
 	size_t name_len;
-	uint16_t method = 0;
-	void *comp_buf = NULL;
-	size_t comp_sz = data_len;
 	uint32_t crc;
-	bool can_deflate = true;
-	const char *ext;
 
 	if (!zw || !zw->fp || !zip_name) return false;
 
 	name_len = strlen(zip_name);
-	ext = strrchr(zip_name, '.');
-	if (ext && (strcasecmp(ext, ".apk") == 0 ||
-	            strcasecmp(ext, ".zip") == 0 ||
-	            strcasecmp(ext, ".gz") == 0 ||
-	            strcasecmp(ext, ".xz") == 0 ||
-	            strcasecmp(ext, ".bz2") == 0 ||
-	            strcasecmp(ext, ".lz4") == 0)) {
-		can_deflate = false;
-	}
-
-	if (data_len == 0 || (name_len > 0 && zip_name[name_len - 1] == '/')) {
-		can_deflate = false;
-	}
-
-	if (can_deflate && zip_compress_deflate(data, data_len, &comp_buf, &comp_sz, &crc)) {
-		method = 8;
-	} else {
-		method = 0;
-		comp_sz = data_len;
-		comp_buf = (void *)data;
-		crc = zip_calc_crc32(data, data_len);
-	}
+	crc = zip_calc_crc32(data, data_len);
 
 	memset(&lhdr, 0, sizeof(lhdr));
 	lhdr.signature = SWAP_LE32(ZIP_LOCAL_HDR_MAGIC);
 	lhdr.version_needed = SWAP_LE16(20);
 	lhdr.flags = 0;
-	lhdr.compression = SWAP_LE16(method);
+	lhdr.compression = 0; /* Method 0: ZIP_STORED (pure in-memory, zero fork/temp-file overhead) */
 	lhdr.mod_time = 0;
 	lhdr.mod_date = SWAP_LE16(0x5421);
 	lhdr.crc32 = SWAP_LE32(crc);
-	lhdr.comp_size = SWAP_LE32((uint32_t)comp_sz);
+	lhdr.comp_size = SWAP_LE32((uint32_t)data_len);
 	lhdr.uncomp_size = SWAP_LE32((uint32_t)data_len);
 	lhdr.filename_len = SWAP_LE16((uint16_t)name_len);
 	lhdr.extra_len = 0;
 
 	if (fwrite(&lhdr, 1, sizeof(lhdr), zw->fp) != sizeof(lhdr) ||
 	    fwrite(zip_name, 1, name_len, zw->fp) != name_len) {
-		if (method == 8 && comp_buf) free(comp_buf);
 		return false;
 	}
 
-	if (comp_sz > 0 && fwrite(comp_buf, 1, comp_sz, zw->fp) != comp_sz) {
-		if (method == 8 && comp_buf) free(comp_buf);
+	if (data_len > 0 && fwrite(data, 1, data_len, zw->fp) != data_len) {
 		return false;
 	}
 
@@ -6325,16 +6166,14 @@ static bool zip_writer_add_mem(struct zip_writer *zw, const char *zip_name, cons
 
 	zw->entries[zw->num_entries].name = xstrdup(zip_name);
 	zw->entries[zw->num_entries].crc32 = crc;
-	zw->entries[zw->num_entries].comp_size = (uint32_t)comp_sz;
+	zw->entries[zw->num_entries].comp_size = (uint32_t)data_len;
 	zw->entries[zw->num_entries].uncomp_size = (uint32_t)data_len;
 	zw->entries[zw->num_entries].local_hdr_offset = zw->current_offset;
-	zw->entries[zw->num_entries].comp_method = method;
+	zw->entries[zw->num_entries].comp_method = 0;
 	zw->entries[zw->num_entries].external_attr = ((uint32_t)mode) << 16;
 	zw->num_entries++;
 
-	zw->current_offset += (uint32_t)(sizeof(lhdr) + name_len + comp_sz);
-
-	if (method == 8 && comp_buf) free(comp_buf);
+	zw->current_offset += (uint32_t)(sizeof(lhdr) + name_len + data_len);
 	return true;
 }
 
