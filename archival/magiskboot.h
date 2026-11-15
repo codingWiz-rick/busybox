@@ -477,4 +477,91 @@ struct elf_ctx {
 	const char *shstrtab;
 };
 
+/*
+ * ZIP Archive & Flashable Package Generator
+ */
+#define ZIP_LOCAL_HDR_MAGIC    0x04034b50U /* "PK\x03\x04" */
+#define ZIP_CENTRAL_DIR_MAGIC  0x02014b50U /* "PK\x01\x02" */
+#define ZIP_EOCD_MAGIC         0x06054b50U /* "PK\x05\x06" */
+
+struct zip_local_hdr {
+	uint32_t signature;
+	uint16_t version_needed;
+	uint16_t flags;
+	uint16_t compression;
+	uint16_t mod_time;
+	uint16_t mod_date;
+	uint32_t crc32;
+	uint32_t comp_size;
+	uint32_t uncomp_size;
+	uint16_t filename_len;
+	uint16_t extra_len;
+} __attribute__((packed));
+
+struct zip_central_dir_hdr {
+	uint32_t signature;
+	uint16_t version_made_by;
+	uint16_t version_needed;
+	uint16_t flags;
+	uint16_t compression;
+	uint16_t mod_time;
+	uint16_t mod_date;
+	uint32_t crc32;
+	uint32_t comp_size;
+	uint32_t uncomp_size;
+	uint16_t filename_len;
+	uint16_t extra_len;
+	uint16_t comment_len;
+	uint16_t disk_num_start;
+	uint16_t internal_attr;
+	uint32_t external_attr;
+	uint32_t local_hdr_offset;
+} __attribute__((packed));
+
+struct zip_eocd_record {
+	uint32_t signature;
+	uint16_t disk_num;
+	uint16_t cd_disk_num;
+	uint16_t total_entries_disk;
+	uint16_t total_entries;
+	uint32_t cd_size;
+	uint32_t cd_offset;
+	uint16_t comment_len;
+} __attribute__((packed));
+
+struct zip_entry_info {
+	char *name;
+	uint32_t crc32;
+	uint32_t comp_size;
+	uint32_t uncomp_size;
+	uint32_t local_hdr_offset;
+	uint16_t comp_method;
+	uint32_t external_attr;
+};
+
+struct zip_writer {
+	FILE *fp;
+	size_t num_entries;
+	size_t capacity;
+	struct zip_entry_info *entries;
+	uint32_t current_offset;
+};
+
+struct dist_package_options {
+	const char *out_zip;
+	const char *kernel_path;
+	const char *dtb_path;
+	const char *dtbo_path;
+	const char *app_path;
+	const char *overlay_dir;
+	const char *magiskboot_bin;
+	const char *banner;
+	const char *device_check;
+	const char *update_binary_script;
+	bool target_init_boot;
+	bool target_vendor_boot;
+	size_t num_modules;
+	char **modules;
+};
+
 #endif /* MAGISKBOOT_H */

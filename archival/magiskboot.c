@@ -39,6 +39,8 @@
 //usage:     "\n	dtb <file> [test|print|patch] Device tree blob inspector and verity patcher"
 //usage:     "\n	module <act> <mod.ko> [...]   Kernel module toolkit (info, check, audit, strip, patch, load, finit, unload)"
 //usage:     "\n	patch-vermagic <mod.ko> [opts] Patch module vermagic, altinstructions, and CFI stubs"
+//usage:     "\n	dist [opts...] <out.zip>      Create universal Magisk/AnyKernel recovery flashable ZIP"
+//usage:     "\n	zip <file.zip> <act> [...]    ZIP archive toolkit (create, list, extract)"
 //usage:     "\n	decompress <in> [out]         Decompress kernel/ramdisk image"
 //usage:     "\n	cleanup                       Clean up unpacked temporary files"
 
@@ -4377,6 +4379,999 @@ static int magiskboot_module_op(int argc, char **argv) {
 }
 
 /* =========================================================================
+ * 12. Universal Recovery Flashable ZIP Packaging & ZIP Archive Engine
+ * ========================================================================= */
+
+static uint32_t zip_calc_crc32(const void *buf, size_t len) {
+	if (!global_crc32_table) {
+		global_crc32_new_table_le();
+	}
+	return crc32_block_endian0(0xffffffff, buf, len, global_crc32_table) ^ 0xffffffff;
+}
+
+static bool zip_compress_deflate(const void *in_buf, size_t in_sz, void **out_buf, size_t *out_sz, uint32_t *out_crc) {
+	char tmp_in[PATH_MAX], tmp_out[PATH_MAX];
+	int ifd, ofd, status;
+	pid_t pid;
+	struct stat st;
+	uint8_t *gz_map;
+	size_t gz_sz, hdr_len, payload_len;
+	uint8_t flg;
+	uint32_t crc;
+	void *def_buf;
+
+	if (in_sz < 64) return false;
+
+	snprintf(tmp_in, sizeof(tmp_in), "/tmp/mb_zin_%d_%d.tmp", (int)getpid(), (int)rand());
+	snprintf(tmp_out, sizeof(tmp_out), "/tmp/mb_zout_%d_%d.gz", (int)getpid(), (int)rand());
+
+	ifd = open(tmp_in, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (ifd < 0) return false;
+	if (full_write(ifd, in_buf, in_sz) != in_sz) {
+		close(ifd);
+		unlink(tmp_in);
+		return false;
+	}
+	close(ifd);
+
+	ofd = open(tmp_out, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (ofd < 0) {
+		unlink(tmp_in);
+		return false;
+	}
+
+	pid = fork();
+	if (pid == 0) {
+		dup2(ofd, STDOUT_FILENO);
+		close(ofd);
+		execlp("gzip", "gzip", "-9c", tmp_in, (char *)NULL);
+		_exit(127);
+	}
+	close(ofd);
+
+	if (pid < 0) {
+		unlink(tmp_in);
+		unlink(tmp_out);
+		return false;
+	}
+	waitpid(pid, &status, 0);
+	unlink(tmp_in);
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		unlink(tmp_out);
+		return false;
+	}
+
+	ofd = open(tmp_out, O_RDONLY | O_CLOEXEC);
+	if (ofd < 0 || fstat(ofd, &st) < 0 || st.st_size < 18) {
+		if (ofd >= 0) close(ofd);
+		unlink(tmp_out);
+		return false;
+	}
+
+	gz_sz = st.st_size;
+	gz_map = xmalloc(gz_sz);
+	if (full_read(ofd, gz_map, gz_sz) != gz_sz) {
+		close(ofd);
+		free(gz_map);
+		unlink(tmp_out);
+		return false;
+	}
+	close(ofd);
+	unlink(tmp_out);
+
+	if (gz_map[0] != 0x1f || gz_map[1] != 0x8b || gz_map[2] != 0x08) {
+		free(gz_map);
+		return false;
+	}
+
+	hdr_len = 10;
+	flg = gz_map[3];
+	if (flg & 0x04) {
+		uint16_t xlen;
+		if (hdr_len + 2 > gz_sz) { free(gz_map); return false; }
+		xlen = (uint16_t)gz_map[hdr_len] | ((uint16_t)gz_map[hdr_len + 1] << 8);
+		hdr_len += 2 + xlen;
+	}
+	if (flg & 0x08) {
+		while (hdr_len < gz_sz && gz_map[hdr_len] != '\0') hdr_len++;
+		hdr_len++;
+	}
+	if (flg & 0x10) {
+		while (hdr_len < gz_sz && gz_map[hdr_len] != '\0') hdr_len++;
+		hdr_len++;
+	}
+	if (flg & 0x02) {
+		hdr_len += 2;
+	}
+
+	if (hdr_len + 8 >= gz_sz) {
+		free(gz_map);
+		return false;
+	}
+
+	payload_len = gz_sz - hdr_len - 8;
+	if (payload_len >= in_sz) {
+		free(gz_map);
+		return false;
+	}
+
+	crc = (uint32_t)gz_map[gz_sz - 8] |
+	      ((uint32_t)gz_map[gz_sz - 7] << 8) |
+	      ((uint32_t)gz_map[gz_sz - 6] << 16) |
+	      ((uint32_t)gz_map[gz_sz - 5] << 24);
+
+	def_buf = xmalloc(payload_len);
+	memcpy(def_buf, gz_map + hdr_len, payload_len);
+	free(gz_map);
+
+	*out_buf = def_buf;
+	*out_sz = payload_len;
+	*out_crc = crc;
+	return true;
+}
+
+static bool zip_writer_init(struct zip_writer *zw, const char *out_path) {
+	if (!zw || !out_path) return false;
+	memset(zw, 0, sizeof(*zw));
+	zw->fp = fopen(out_path, "wb");
+	if (!zw->fp) {
+		bb_perror_msg("cannot create '%s'", out_path);
+		return false;
+	}
+	zw->capacity = 64;
+	zw->entries = xzalloc(zw->capacity * sizeof(struct zip_entry_info));
+	zw->num_entries = 0;
+	zw->current_offset = 0;
+	return true;
+}
+
+static bool zip_writer_add_mem(struct zip_writer *zw, const char *zip_name, const void *data, size_t data_len, mode_t mode) {
+	struct zip_local_hdr lhdr;
+	size_t name_len;
+	uint16_t method = 0;
+	void *comp_buf = NULL;
+	size_t comp_sz = data_len;
+	uint32_t crc;
+	bool can_deflate = true;
+	const char *ext;
+
+	if (!zw || !zw->fp || !zip_name) return false;
+
+	name_len = strlen(zip_name);
+	ext = strrchr(zip_name, '.');
+	if (ext && (strcasecmp(ext, ".apk") == 0 ||
+	            strcasecmp(ext, ".zip") == 0 ||
+	            strcasecmp(ext, ".gz") == 0 ||
+	            strcasecmp(ext, ".xz") == 0 ||
+	            strcasecmp(ext, ".bz2") == 0 ||
+	            strcasecmp(ext, ".lz4") == 0)) {
+		can_deflate = false;
+	}
+
+	if (data_len == 0 || (name_len > 0 && zip_name[name_len - 1] == '/')) {
+		can_deflate = false;
+	}
+
+	if (can_deflate && zip_compress_deflate(data, data_len, &comp_buf, &comp_sz, &crc)) {
+		method = 8;
+	} else {
+		method = 0;
+		comp_sz = data_len;
+		comp_buf = (void *)data;
+		crc = zip_calc_crc32(data, data_len);
+	}
+
+	memset(&lhdr, 0, sizeof(lhdr));
+	lhdr.signature = SWAP_LE32(ZIP_LOCAL_HDR_MAGIC);
+	lhdr.version_needed = SWAP_LE16(20);
+	lhdr.flags = 0;
+	lhdr.compression = SWAP_LE16(method);
+	lhdr.mod_time = 0;
+	lhdr.mod_date = SWAP_LE16(0x5421);
+	lhdr.crc32 = SWAP_LE32(crc);
+	lhdr.comp_size = SWAP_LE32((uint32_t)comp_sz);
+	lhdr.uncomp_size = SWAP_LE32((uint32_t)data_len);
+	lhdr.filename_len = SWAP_LE16((uint16_t)name_len);
+	lhdr.extra_len = 0;
+
+	if (fwrite(&lhdr, 1, sizeof(lhdr), zw->fp) != sizeof(lhdr) ||
+	    fwrite(zip_name, 1, name_len, zw->fp) != name_len) {
+		if (method == 8 && comp_buf) free(comp_buf);
+		return false;
+	}
+
+	if (comp_sz > 0 && fwrite(comp_buf, 1, comp_sz, zw->fp) != comp_sz) {
+		if (method == 8 && comp_buf) free(comp_buf);
+		return false;
+	}
+
+	if (zw->num_entries >= zw->capacity) {
+		zw->capacity *= 2;
+		zw->entries = xrealloc(zw->entries, zw->capacity * sizeof(struct zip_entry_info));
+	}
+
+	zw->entries[zw->num_entries].name = xstrdup(zip_name);
+	zw->entries[zw->num_entries].crc32 = crc;
+	zw->entries[zw->num_entries].comp_size = (uint32_t)comp_sz;
+	zw->entries[zw->num_entries].uncomp_size = (uint32_t)data_len;
+	zw->entries[zw->num_entries].local_hdr_offset = zw->current_offset;
+	zw->entries[zw->num_entries].comp_method = method;
+	zw->entries[zw->num_entries].external_attr = ((uint32_t)mode) << 16;
+	zw->num_entries++;
+
+	zw->current_offset += (uint32_t)(sizeof(lhdr) + name_len + comp_sz);
+
+	if (method == 8 && comp_buf) free(comp_buf);
+	return true;
+}
+
+static bool zip_writer_add_file(struct zip_writer *zw, const char *zip_name, const char *disk_path, mode_t mode_override) {
+	int fd;
+	struct stat st;
+	uint8_t *buf;
+	mode_t m;
+	bool res;
+
+	fd = open(disk_path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &st) < 0) {
+		bb_perror_msg("cannot open '%s'", disk_path);
+		if (fd >= 0) close(fd);
+		return false;
+	}
+
+	m = (mode_override != 0) ? mode_override : st.st_mode;
+
+	buf = NULL;
+	if (st.st_size > 0) {
+		buf = xmalloc(st.st_size);
+		if (full_read(fd, buf, st.st_size) != st.st_size) {
+			bb_perror_msg("failed to read '%s'", disk_path);
+			close(fd);
+			free(buf);
+			return false;
+		}
+	}
+	close(fd);
+
+	res = zip_writer_add_mem(zw, zip_name, buf ? (const void *)buf : "", st.st_size, m);
+	if (buf) free(buf);
+	return res;
+}
+
+static bool zip_writer_add_dir_recursive(struct zip_writer *zw, const char *zip_prefix, const char *disk_dir) {
+	DIR *dir;
+	struct dirent *de;
+	char sub_disk[PATH_MAX];
+	char sub_zip[PATH_MAX];
+	struct stat st;
+	char dir_zip_entry[PATH_MAX + 1];
+	mode_t m;
+
+	dir = opendir(disk_dir);
+	if (!dir) return false;
+
+	while ((de = readdir(dir)) != NULL) {
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+
+		snprintf(sub_disk, sizeof(sub_disk), "%s/%s", disk_dir, de->d_name);
+		if (zip_prefix && zip_prefix[0] != '\0') {
+			snprintf(sub_zip, sizeof(sub_zip), "%s/%s", zip_prefix, de->d_name);
+		} else {
+			snprintf(sub_zip, sizeof(sub_zip), "%s", de->d_name);
+		}
+
+		if (stat(sub_disk, &st) != 0) continue;
+
+		if (S_ISDIR(st.st_mode)) {
+			snprintf(dir_zip_entry, sizeof(dir_zip_entry), "%s/", sub_zip);
+			zip_writer_add_mem(zw, dir_zip_entry, "", 0, S_IFDIR | 0755);
+			zip_writer_add_dir_recursive(zw, sub_zip, sub_disk);
+		} else if (S_ISREG(st.st_mode)) {
+			m = (st.st_mode & 0111) ? (S_IFREG | 0755) : (S_IFREG | 0644);
+			zip_writer_add_file(zw, sub_zip, sub_disk, m);
+		}
+	}
+	closedir(dir);
+	return true;
+}
+
+static bool zip_writer_finish(struct zip_writer *zw) {
+	uint32_t cd_offset;
+	uint32_t cd_size = 0;
+	size_t i;
+	struct zip_eocd_record eocd;
+
+	if (!zw || !zw->fp) return false;
+
+	cd_offset = zw->current_offset;
+
+	for (i = 0; i < zw->num_entries; i++) {
+		struct zip_entry_info *e = &zw->entries[i];
+		struct zip_central_dir_hdr cd;
+		size_t nlen = strlen(e->name);
+
+		memset(&cd, 0, sizeof(cd));
+		cd.signature = SWAP_LE32(ZIP_CENTRAL_DIR_MAGIC);
+		cd.version_made_by = SWAP_LE16(0x031e); /* UNIX 3.0 */
+		cd.version_needed = SWAP_LE16(20);
+		cd.flags = 0;
+		cd.compression = SWAP_LE16(e->comp_method);
+		cd.mod_time = 0;
+		cd.mod_date = SWAP_LE16(0x5421);
+		cd.crc32 = SWAP_LE32(e->crc32);
+		cd.comp_size = SWAP_LE32(e->comp_size);
+		cd.uncomp_size = SWAP_LE32(e->uncomp_size);
+		cd.filename_len = SWAP_LE16((uint16_t)nlen);
+		cd.extra_len = 0;
+		cd.comment_len = 0;
+		cd.disk_num_start = 0;
+		cd.internal_attr = 0;
+		cd.external_attr = SWAP_LE32(e->external_attr);
+		cd.local_hdr_offset = SWAP_LE32(e->local_hdr_offset);
+
+		if (fwrite(&cd, 1, sizeof(cd), zw->fp) != sizeof(cd) ||
+		    fwrite(e->name, 1, nlen, zw->fp) != nlen) {
+			fclose(zw->fp);
+			return false;
+		}
+
+		cd_size += (uint32_t)(sizeof(cd) + nlen);
+		free(e->name);
+	}
+
+	memset(&eocd, 0, sizeof(eocd));
+	eocd.signature = SWAP_LE32(ZIP_EOCD_MAGIC);
+	eocd.disk_num = 0;
+	eocd.cd_disk_num = 0;
+	eocd.total_entries_disk = SWAP_LE16((uint16_t)zw->num_entries);
+	eocd.total_entries = SWAP_LE16((uint16_t)zw->num_entries);
+	eocd.cd_size = SWAP_LE32(cd_size);
+	eocd.cd_offset = SWAP_LE32(cd_offset);
+	eocd.comment_len = 0;
+
+	if (fwrite(&eocd, 1, sizeof(eocd), zw->fp) != sizeof(eocd)) {
+		fclose(zw->fp);
+		return false;
+	}
+
+	fclose(zw->fp);
+	zw->fp = NULL;
+	free(zw->entries);
+	zw->entries = NULL;
+	return true;
+}
+
+static char *resolve_magiskboot_binary(const char *custom) {
+	if (custom && access(custom, R_OK) == 0) {
+		return xstrdup(custom);
+	}
+	if (access("/home/rick/open-source/busybox/busybox", R_OK) == 0) {
+		return xstrdup("/home/rick/open-source/busybox/busybox");
+	}
+	if (access("/proc/self/exe", R_OK) == 0) {
+		return xstrdup("/proc/self/exe");
+	}
+	if (access("/home/rick/open-source/magiskboot/magiskboot-aarch64", R_OK) == 0) {
+		return xstrdup("/home/rick/open-source/magiskboot/magiskboot-aarch64");
+	}
+	if (access("/home/rick/open-source/magiskboot/build/aarch64/magiskboot-aarch64", R_OK) == 0) {
+		return xstrdup("/home/rick/open-source/magiskboot/build/aarch64/magiskboot-aarch64");
+	}
+	if (access("/home/rick/open-source/magiskboot/build/aarch64/magiskboot", R_OK) == 0) {
+		return xstrdup("/home/rick/open-source/magiskboot/build/aarch64/magiskboot");
+	}
+	return NULL;
+}
+
+static char *generate_universal_update_binary(const char *banner, const char *dev_check, bool has_init_boot) {
+	char dev_block[1024];
+	char *script;
+	const char *banner_text = (banner && banner[0]) ? banner : "Universal Kernel & Root Engine";
+
+	dev_block[0] = '\0';
+	if (dev_check && dev_check[0]) {
+		snprintf(dev_block, sizeof(dev_block),
+			"\n# Target Device Guardrail Check\n"
+			"CURRENT_DEV=$(getprop ro.product.device 2>/dev/null)\n"
+			"[ -z \"$CURRENT_DEV\" ] && CURRENT_DEV=$(getprop ro.build.product 2>/dev/null)\n"
+			"[ -z \"$CURRENT_DEV\" ] && CURRENT_DEV=$(getprop ro.product.model 2>/dev/null)\n"
+			"ui_print \"- Target device detected: $CURRENT_DEV\"\n"
+			"DEV_MATCH=0\n"
+			"for d in $(echo \"%s\" | tr ',' ' '); do\n"
+			"  if [ \"$CURRENT_DEV\" = \"$d\" ]; then DEV_MATCH=1; break; fi\n"
+			"done\n"
+			"if [ $DEV_MATCH -eq 0 ]; then\n"
+			"  ui_print \"! Error: Unsupported device '$CURRENT_DEV'!\"\n"
+			"  cd /; rm -rf \"$TMPDIR\"; exit 1\n"
+			"fi\n",
+			dev_check);
+	}
+
+	script = xasprintf(
+		"#!/sbin/sh\n"
+		"# SPDX-License-Identifier: GPL-2.0-or-later\n"
+		"# Universal MagiskBoot Recovery Flashable Installer\n\n"
+		"OUTFD=$2\n"
+		"ZIPFILE=\"$3\"\n\n"
+		"ui_print() {\n"
+		"  echo \"ui_print $1\" >> /proc/self/fd/$OUTFD\n"
+		"  echo \"ui_print\" >> /proc/self/fd/$OUTFD\n"
+		"}\n\n"
+		"ui_print \"********************************************************\"\n"
+		"ui_print \"* %-52s *\"\n"
+		"ui_print \"*            Universal Recovery Live-Patcher           *\"\n"
+		"ui_print \"********************************************************\"\n\n"
+		"TMPDIR=\"/tmp/installer_$$\"\n"
+		"mkdir -p \"$TMPDIR\"\n"
+		"cd \"$TMPDIR\"\n\n"
+		"ui_print \"- Extracting installer payload...\"\n"
+		"unzip -o \"$ZIPFILE\" >/dev/null 2>&1\n\n"
+		"MB=\"$TMPDIR/tools/magiskboot\"\n"
+		"if [ ! -f \"$MB\" ]; then\n"
+		"  ui_print \"! Error: Embedded magiskboot missing!\"\n"
+		"  cd /; rm -rf \"$TMPDIR\"; exit 1\n"
+		"fi\n"
+		"chmod 755 \"$MB\"\n"
+		"%s\n"
+		"find_part() {\n"
+		"  local p=\"$1\"\n"
+		"  for d in /dev/block/bootdevice/by-name /dev/block/by-name /dev/block/platform/*/by-name /dev/block/mapper; do\n"
+		"    if [ -e \"$d/$p\" ]; then echo \"$d/$p\"; return 0; fi\n"
+		"  done\n"
+		"  return 1\n"
+		"}\n\n"
+		"HAS_INIT_BOOT=%d\n"
+		"if [ \"$HAS_INIT_BOOT\" = \"0\" ]; then\n"
+		"  if find_part \"init_boot\" >/dev/null 2>&1 || find_part \"init_boot_a\" >/dev/null 2>&1; then HAS_INIT_BOOT=1; fi\n"
+		"fi\n"
+		"RD_PART=\"boot\"\n"
+		"if [ \"$HAS_INIT_BOOT\" = \"1\" ]; then\n"
+		"  RD_PART=\"init_boot\"\n"
+		"  ui_print \"- GKI 2.0 multi-partition device detected: ramdisk in init_boot\"\n"
+		"fi\n\n"
+		"MODULES=\"\"\n"
+		"[ -d \"$TMPDIR/modules\" ] && MODULES=\"$TMPDIR/modules\"\n\n"
+		"KERNEL=\"\"\n"
+		"if [ -f \"$TMPDIR/kernel\" ]; then KERNEL=\"$TMPDIR/kernel\";\n"
+		"elif [ -f \"$TMPDIR/Image\" ]; then KERNEL=\"$TMPDIR/Image\";\n"
+		"elif [ -f \"$TMPDIR/Image.gz\" ]; then KERNEL=\"$TMPDIR/Image.gz\"; fi\n\n"
+		"ui_print \"- Live patching active hardware partitions via magiskboot...\"\n"
+		"RET=0\n\n"
+		"if [ -n \"$KERNEL\" ]; then\n"
+		"  ui_print \"- Replacing kernel image...\"\n"
+		"  CMD=\"kernel boot patch --kernel $KERNEL\"\n"
+		"  [ -f \"$TMPDIR/dtb\" ] && CMD=\"$CMD --dtb $TMPDIR/dtb\"\n"
+		"  [ -f \"$TMPDIR/dtbo.img\" ] && CMD=\"$CMD --dtbo $TMPDIR/dtbo.img\"\n"
+		"  eval \"\\\"$MB\\\" $CMD\"\n"
+		"  RET=$?\n"
+		"fi\n\n"
+		"if [ -n \"$MODULES\" ]; then\n"
+		"  for ko in \"$MODULES\"/*.ko; do\n"
+		"    if [ -f \"$ko\" ]; then\n"
+		"      ui_print \"- Injecting module $(basename \"$ko\") into $RD_PART ramdisk...\"\n"
+		"      \"$MB\" add-module --live -p \"$RD_PART\" --install \"$ko\"\n"
+		"      RET=$?\n"
+		"      if [ $RET -ne 0 ]; then ui_print \"! Failed to inject module $(basename \"$ko\")\"; break; fi\n"
+		"    fi\n"
+		"  done\n"
+		"fi\n\n"
+		"APK_PATH=\"\"\n"
+		"if [ -d \"$TMPDIR/app\" ]; then\n"
+		"  for a in \"$TMPDIR/app\"/*.apk; do if [ -f \"$a\" ]; then APK_PATH=\"$a\"; break; fi; done\n"
+		"fi\n"
+		"if [ $RET -eq 0 ] && [ -n \"$APK_PATH\" ]; then\n"
+		"  if [ \"$(getprop sys.boot_completed 2>/dev/null)\" = \"1\" ] && which pm >/dev/null 2>&1; then\n"
+		"    ui_print \"- Live Android: installing manager APK via pm...\"\n"
+		"    pm install -g -r \"$APK_PATH\" >/dev/null 2>&1\n"
+		"  else\n"
+		"    [ ! -d /data/system ] && mount /data >/dev/null 2>&1\n"
+		"    if [ -d /data ]; then\n"
+		"      mkdir -p /data/system/kroot\n"
+		"      cp -f \"$APK_PATH\" /data/system/kroot/kroot.apk\n"
+		"      chmod 644 /data/system/kroot/kroot.apk 2>/dev/null\n"
+		"      ui_print \"- Staged manager APK to /data/system/kroot\"\n"
+		"    fi\n"
+		"  fi\n"
+		"fi\n\n"
+		"cd /; rm -rf \"$TMPDIR\"\n"
+		"if [ $RET -eq 0 ]; then\n"
+		"  ui_print \"********************************************************\"\n"
+		"  ui_print \"* Flash complete! Reboot to activate.                  *\"\n"
+		"  ui_print \"********************************************************\"\n"
+		"  exit 0\n"
+		"else\n"
+		"  ui_print \"! Installation failed with code $RET\"\n"
+		"  exit $RET\n"
+		"fi\n",
+		banner_text,
+		dev_block,
+		has_init_boot ? 1 : 0
+	);
+
+	return script;
+}
+
+static int package_dist_zip(struct dist_package_options *opts) {
+	struct zip_writer zw;
+	char *update_bin_script;
+	char *mb_bin;
+	size_t i;
+	struct stat st;
+
+	if (!opts || !opts->out_zip) {
+		bb_error_msg("missing output zip file");
+		return 1;
+	}
+
+	fprintf(stderr, "======================================================================\n");
+	fprintf(stderr, "  Packaging Universal Recovery Flashable ZIP: %s\n", opts->out_zip);
+	fprintf(stderr, "======================================================================\n");
+
+	if (!zip_writer_init(&zw, opts->out_zip)) {
+		return 1;
+	}
+
+	/* 1. META-INF/com/google/android/updater-script (#MAGISK) */
+	zip_writer_add_mem(&zw, "META-INF/com/google/android/updater-script", "#MAGISK\n", 8, S_IFREG | 0644);
+
+	/* 2. META-INF/com/google/android/update-binary */
+	if (opts->update_binary_script && access(opts->update_binary_script, R_OK) == 0) {
+		zip_writer_add_file(&zw, "META-INF/com/google/android/update-binary", opts->update_binary_script, S_IFREG | 0755);
+		fprintf(stderr, "[+] Bundled custom update-binary from '%s'\n", opts->update_binary_script);
+	} else {
+		update_bin_script = generate_universal_update_binary(opts->banner, opts->device_check, opts->target_init_boot);
+		zip_writer_add_mem(&zw, "META-INF/com/google/android/update-binary", update_bin_script, strlen(update_bin_script), S_IFREG | 0755);
+		free(update_bin_script);
+		fprintf(stderr, "[+] Bundled universal recovery live-patcher update-binary\n");
+	}
+
+	/* 3. tools/magiskboot */
+	mb_bin = resolve_magiskboot_binary(opts->magiskboot_bin);
+	if (mb_bin && access(mb_bin, R_OK) == 0) {
+		zip_writer_add_file(&zw, "tools/magiskboot", mb_bin, S_IFREG | 0755);
+		fprintf(stderr, "[+] Bundled tools/magiskboot from '%s'\n", mb_bin);
+		free(mb_bin);
+	} else {
+		fprintf(stderr, "[!] Warning: No compiled target magiskboot found to embed into tools/magiskboot\n");
+	}
+
+	/* 4. Modules into modules/ (*.ko) */
+	for (i = 0; i < opts->num_modules; i++) {
+		const char *mpath = opts->modules[i];
+		if (stat(mpath, &st) == 0) {
+			if (S_ISDIR(st.st_mode)) {
+				DIR *mdir = opendir(mpath);
+				if (mdir) {
+					struct dirent *de;
+					while ((de = readdir(mdir)) != NULL) {
+						if (strstr(de->d_name, ".ko")) {
+							char full_m[PATH_MAX];
+							char zip_m[PATH_MAX];
+							snprintf(full_m, sizeof(full_m), "%s/%s", mpath, de->d_name);
+							snprintf(zip_m, sizeof(zip_m), "modules/%s", de->d_name);
+							zip_writer_add_file(&zw, zip_m, full_m, S_IFREG | 0644);
+							fprintf(stderr, "[+] Bundled module: %s\n", zip_m);
+						}
+					}
+					closedir(mdir);
+				}
+			} else if (S_ISREG(st.st_mode)) {
+				const char *bname = bb_basename(mpath);
+				char zip_m[PATH_MAX];
+				snprintf(zip_m, sizeof(zip_m), "modules/%s", bname);
+				zip_writer_add_file(&zw, zip_m, mpath, S_IFREG | 0644);
+				fprintf(stderr, "[+] Bundled module: %s\n", zip_m);
+			}
+		}
+	}
+
+	/* 5. Kernel image */
+	if (opts->kernel_path && access(opts->kernel_path, R_OK) == 0) {
+		zip_writer_add_file(&zw, "kernel", opts->kernel_path, S_IFREG | 0644);
+		fprintf(stderr, "[+] Bundled kernel payload: '%s'\n", opts->kernel_path);
+	}
+
+	/* 6. DTB */
+	if (opts->dtb_path && access(opts->dtb_path, R_OK) == 0) {
+		zip_writer_add_file(&zw, "dtb", opts->dtb_path, S_IFREG | 0644);
+		fprintf(stderr, "[+] Bundled DTB payload: '%s'\n", opts->dtb_path);
+	}
+
+	/* 7. DTBO */
+	if (opts->dtbo_path && access(opts->dtbo_path, R_OK) == 0) {
+		zip_writer_add_file(&zw, "dtbo.img", opts->dtbo_path, S_IFREG | 0644);
+		fprintf(stderr, "[+] Bundled DTBO payload: '%s'\n", opts->dtbo_path);
+	}
+
+	/* 8. Manager APK */
+	if (opts->app_path && access(opts->app_path, R_OK) == 0) {
+		const char *bname = bb_basename(opts->app_path);
+		char zip_app[PATH_MAX];
+		snprintf(zip_app, sizeof(zip_app), "app/%s", bname);
+		zip_writer_add_file(&zw, zip_app, opts->app_path, S_IFREG | 0644);
+		fprintf(stderr, "[+] Bundled manager APK: %s\n", zip_app);
+	}
+
+	/* 9. overlay.d/ */
+	if (opts->overlay_dir && stat(opts->overlay_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+		zip_writer_add_dir_recursive(&zw, "overlay.d", opts->overlay_dir);
+		fprintf(stderr, "[+] Bundled overlay tree from '%s'\n", opts->overlay_dir);
+	}
+
+	if (!zip_writer_finish(&zw)) {
+		bb_error_msg("failed to finalize zip archive");
+		return 1;
+	}
+
+	if (stat(opts->out_zip, &st) == 0) {
+		fprintf(stderr, "[✓] SUCCESS: Universal recovery flashable ZIP generated: '%s' (%zu bytes)\n",
+		        opts->out_zip, (size_t)st.st_size);
+	}
+	fprintf(stderr, "======================================================================\n");
+	return 0;
+}
+
+static int zip_list_file(const char *zip_path) {
+	int fd;
+	struct stat st;
+	uint8_t *map;
+	size_t search_len, i;
+	uint32_t eocd_pos = 0;
+	bool found_eocd = false;
+	struct zip_eocd_record *eocd;
+	uint32_t cd_offset, cd_size;
+	uint16_t total_entries;
+	size_t pos, count;
+
+	fd = open(zip_path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < sizeof(struct zip_eocd_record)) {
+		bb_perror_msg("cannot open '%s'", zip_path);
+		if (fd >= 0) close(fd);
+		return 1;
+	}
+
+	map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED) return 1;
+
+	search_len = (st.st_size > 65536 + sizeof(struct zip_eocd_record)) ?
+	             (65536 + sizeof(struct zip_eocd_record)) : st.st_size;
+
+	for (i = 0; i + sizeof(struct zip_eocd_record) <= search_len; i++) {
+		size_t off = st.st_size - sizeof(struct zip_eocd_record) - i;
+		if (*(uint32_t *)(map + off) == SWAP_LE32(ZIP_EOCD_MAGIC)) {
+			eocd_pos = (uint32_t)off;
+			found_eocd = true;
+			break;
+		}
+	}
+
+	if (!found_eocd) {
+		bb_error_msg("'%s' is not a valid ZIP archive (EOCD magic not found)", zip_path);
+		munmap(map, st.st_size);
+		return 1;
+	}
+
+	eocd = (struct zip_eocd_record *)(map + eocd_pos);
+	cd_offset = SWAP_LE32(eocd->cd_offset);
+	cd_size = SWAP_LE32(eocd->cd_size);
+	total_entries = SWAP_LE16(eocd->total_entries);
+
+	printf("======================================================================\n");
+	printf("  ZIP Archive Inspection: %s\n", zip_path);
+	printf("  Total Entries: %u, Central Directory Size: %u bytes\n", total_entries, cd_size);
+	printf("======================================================================\n");
+	printf("  Mode      Method    CompSize    UncompSize  Name\n");
+	printf("  --------  --------  ----------  ----------  ------------------------\n");
+
+	pos = cd_offset;
+	count = 0;
+	while (pos + sizeof(struct zip_central_dir_hdr) <= st.st_size && count < total_entries) {
+		struct zip_central_dir_hdr *cd = (struct zip_central_dir_hdr *)(map + pos);
+		uint16_t nlen, xlen, clen, comp_m;
+		uint32_t comp_sz, uncomp_sz, ext_attr;
+		char name_buf[PATH_MAX];
+
+		if (SWAP_LE32(cd->signature) != ZIP_CENTRAL_DIR_MAGIC) break;
+
+		nlen = SWAP_LE16(cd->filename_len);
+		xlen = SWAP_LE16(cd->extra_len);
+		clen = SWAP_LE16(cd->comment_len);
+		comp_m = SWAP_LE16(cd->compression);
+		comp_sz = SWAP_LE32(cd->comp_size);
+		uncomp_sz = SWAP_LE32(cd->uncomp_size);
+		ext_attr = SWAP_LE32(cd->external_attr);
+
+		if (pos + sizeof(*cd) + nlen > st.st_size) break;
+		if (nlen >= sizeof(name_buf)) nlen = sizeof(name_buf) - 1;
+		memcpy(name_buf, map + pos + sizeof(*cd), nlen);
+		name_buf[nlen] = '\0';
+
+		printf("  %06o    %-8s  %10u  %10u  %s\n",
+		       (ext_attr >> 16) & 07777,
+		       (comp_m == 8) ? "Deflate" : (comp_m == 0 ? "Stored" : "Other"),
+		       comp_sz, uncomp_sz, name_buf);
+
+		pos += sizeof(*cd) + SWAP_LE16(cd->filename_len) + xlen + clen;
+		count++;
+	}
+
+	printf("======================================================================\n");
+	munmap(map, st.st_size);
+	return 0;
+}
+
+static int zip_extract_file(const char *zip_path, const char *target_entry, const char *dest_dir) {
+	int fd;
+	struct stat st;
+	uint8_t *map;
+	size_t search_len, i;
+	uint32_t eocd_pos = 0;
+	bool found_eocd = false;
+	struct zip_eocd_record *eocd;
+	uint32_t cd_offset;
+	uint16_t total_entries;
+	size_t pos, count;
+	int extracted = 0;
+	const char *dst_root = (dest_dir && dest_dir[0]) ? dest_dir : ".";
+
+	fd = open(zip_path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < sizeof(struct zip_eocd_record)) {
+		bb_perror_msg("cannot open '%s'", zip_path);
+		if (fd >= 0) close(fd);
+		return 1;
+	}
+
+	map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED) return 1;
+
+	search_len = (st.st_size > 65536 + sizeof(struct zip_eocd_record)) ?
+	             (65536 + sizeof(struct zip_eocd_record)) : st.st_size;
+
+	for (i = 0; i + sizeof(struct zip_eocd_record) <= search_len; i++) {
+		size_t off = st.st_size - sizeof(struct zip_eocd_record) - i;
+		if (*(uint32_t *)(map + off) == SWAP_LE32(ZIP_EOCD_MAGIC)) {
+			eocd_pos = (uint32_t)off;
+			found_eocd = true;
+			break;
+		}
+	}
+
+	if (!found_eocd) {
+		bb_error_msg("'%s' is not a valid ZIP archive", zip_path);
+		munmap(map, st.st_size);
+		return 1;
+	}
+
+	eocd = (struct zip_eocd_record *)(map + eocd_pos);
+	cd_offset = SWAP_LE32(eocd->cd_offset);
+	total_entries = SWAP_LE16(eocd->total_entries);
+
+	pos = cd_offset;
+	count = 0;
+	while (pos + sizeof(struct zip_central_dir_hdr) <= st.st_size && count < total_entries) {
+		struct zip_central_dir_hdr *cd = (struct zip_central_dir_hdr *)(map + pos);
+		uint16_t nlen, xlen, clen, comp_m;
+		uint32_t comp_sz, uncomp_sz, loc_off, ext_attr, payload_off;
+		char name_buf[PATH_MAX];
+		struct zip_local_hdr *lhdr;
+		char dest_path[PATH_MAX * 2];
+		mode_t mode;
+		char *dname;
+		int out_fd;
+
+		if (SWAP_LE32(cd->signature) != ZIP_CENTRAL_DIR_MAGIC) break;
+
+		nlen = SWAP_LE16(cd->filename_len);
+		xlen = SWAP_LE16(cd->extra_len);
+		clen = SWAP_LE16(cd->comment_len);
+		comp_m = SWAP_LE16(cd->compression);
+		comp_sz = SWAP_LE32(cd->comp_size);
+		uncomp_sz = SWAP_LE32(cd->uncomp_size);
+		loc_off = SWAP_LE32(cd->local_hdr_offset);
+		ext_attr = SWAP_LE32(cd->external_attr);
+
+		if (pos + sizeof(*cd) + nlen > st.st_size) break;
+		if (nlen >= sizeof(name_buf)) nlen = sizeof(name_buf) - 1;
+		memcpy(name_buf, map + pos + sizeof(*cd), nlen);
+		name_buf[nlen] = '\0';
+
+		if (target_entry && target_entry[0] != '\0' && strcmp(target_entry, name_buf) != 0) {
+			pos += sizeof(*cd) + SWAP_LE16(cd->filename_len) + xlen + clen;
+			count++;
+			continue;
+		}
+
+		if (loc_off + sizeof(struct zip_local_hdr) > st.st_size) break;
+		lhdr = (struct zip_local_hdr *)(map + loc_off);
+		payload_off = loc_off + sizeof(struct zip_local_hdr) +
+		              SWAP_LE16(lhdr->filename_len) + SWAP_LE16(lhdr->extra_len);
+		if (payload_off + comp_sz > st.st_size) break;
+
+		snprintf(dest_path, sizeof(dest_path), "%s/%s", dst_root, name_buf);
+		mode = (ext_attr >> 16) & 07777;
+
+		if (name_buf[nlen - 1] == '/') {
+			bb_make_directory(dest_path, mode ? mode : 0755, FILEUTILS_RECUR);
+		} else {
+			dname = xstrdup(dest_path);
+			bb_make_directory(dirname(dname), 0755, FILEUTILS_RECUR);
+			free(dname);
+
+			if (comp_m == 0) {
+				out_fd = open(dest_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode ? mode : 0644);
+				if (out_fd >= 0) {
+					if (uncomp_sz > 0) full_write(out_fd, map + payload_off, uncomp_sz);
+					close(out_fd);
+					if (mode) chmod(dest_path, mode);
+					extracted++;
+					printf("[+] Extracted: %s (%u bytes)\n", name_buf, uncomp_sz);
+				}
+			} else if (comp_m == 8) {
+				uint8_t *gz_tmp = xmalloc(comp_sz + 18);
+				gz_tmp[0] = 0x1f; gz_tmp[1] = 0x8b; gz_tmp[2] = 0x08; gz_tmp[3] = 0;
+				memset(gz_tmp + 4, 0, 6);
+				memcpy(gz_tmp + 10, map + payload_off, comp_sz);
+				*(uint32_t *)(gz_tmp + 10 + comp_sz) = SWAP_LE32(cd->crc32);
+				*(uint32_t *)(gz_tmp + 10 + comp_sz + 4) = SWAP_LE32(uncomp_sz);
+
+				out_fd = open(dest_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode ? mode : 0644);
+				if (out_fd >= 0) {
+					bb_decompress_data(BOOT_FMT_GZIP, gz_tmp, comp_sz + 18, out_fd);
+					close(out_fd);
+					if (mode) chmod(dest_path, mode);
+					extracted++;
+					printf("[+] Extracted (deflated): %s (%u bytes)\n", name_buf, uncomp_sz);
+				}
+				free(gz_tmp);
+			}
+		}
+
+		pos += sizeof(*cd) + SWAP_LE16(cd->filename_len) + xlen + clen;
+		count++;
+	}
+
+	munmap(map, st.st_size);
+	printf("[✓] SUCCESS: Extracted %d file(s) from '%s' into '%s'\n", extracted, zip_path, dst_root);
+	return 0;
+}
+
+static int zip_create_file(const char *out_zip, int num_files, char **files) {
+	struct zip_writer zw;
+	int i;
+	struct stat st;
+	const char *f, *bname;
+	char dir_entry[PATH_MAX];
+	mode_t m;
+
+	if (!out_zip || num_files <= 0) {
+		bb_error_msg("usage: magiskboot zip <out.zip> create <file1|dir1> [file2...]");
+		return 1;
+	}
+
+	if (!zip_writer_init(&zw, out_zip)) return 1;
+
+	for (i = 0; i < num_files; i++) {
+		f = files[i];
+		if (stat(f, &st) != 0) {
+			bb_perror_msg("cannot stat '%s'", f);
+			continue;
+		}
+		bname = bb_basename(f);
+		if (S_ISDIR(st.st_mode)) {
+			snprintf(dir_entry, sizeof(dir_entry), "%s/", bname);
+			zip_writer_add_mem(&zw, dir_entry, "", 0, S_IFDIR | 0755);
+			zip_writer_add_dir_recursive(&zw, bname, f);
+		} else if (S_ISREG(st.st_mode)) {
+			m = (st.st_mode & 0111) ? (S_IFREG | 0755) : (S_IFREG | 0644);
+			zip_writer_add_file(&zw, bname, f, m);
+			printf("[+] Added file '%s' -> '%s'\n", f, bname);
+		}
+	}
+
+	if (!zip_writer_finish(&zw)) return 1;
+	printf("[✓] SUCCESS: Created '%s'\n", out_zip);
+	return 0;
+}
+
+static int magiskboot_dist_op(int argc, char **argv) {
+	struct dist_package_options opts;
+	int i;
+	size_t mod_cap = 16;
+	int ret;
+
+	memset(&opts, 0, sizeof(opts));
+	opts.modules = xzalloc(mod_cap * sizeof(char *));
+
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "-m") == 0 || strcmp(argv[i], "--module") == 0 || strcmp(argv[i], "--modules") == 0) {
+			if (++i < argc) {
+				if (opts.num_modules >= mod_cap) {
+					mod_cap *= 2;
+					opts.modules = xrealloc(opts.modules, mod_cap * sizeof(char *));
+				}
+				opts.modules[opts.num_modules++] = argv[i];
+			}
+		} else if (strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--kernel") == 0) {
+			if (++i < argc) opts.kernel_path = argv[i];
+		} else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--dtb") == 0) {
+			if (++i < argc) opts.dtb_path = argv[i];
+		} else if (strcmp(argv[i], "--dtbo") == 0) {
+			if (++i < argc) opts.dtbo_path = argv[i];
+		} else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--app") == 0) {
+			if (++i < argc) opts.app_path = argv[i];
+		} else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--overlay") == 0) {
+			if (++i < argc) opts.overlay_dir = argv[i];
+		} else if (strcmp(argv[i], "--magiskboot") == 0) {
+			if (++i < argc) opts.magiskboot_bin = argv[i];
+		} else if (strcmp(argv[i], "--banner") == 0) {
+			if (++i < argc) opts.banner = argv[i];
+		} else if (strcmp(argv[i], "--device") == 0 || strcmp(argv[i], "--device-check") == 0) {
+			if (++i < argc) opts.device_check = argv[i];
+		} else if (strcmp(argv[i], "--init-boot") == 0) {
+			opts.target_init_boot = true;
+		} else if (strcmp(argv[i], "--update-binary") == 0) {
+			if (++i < argc) opts.update_binary_script = argv[i];
+		} else if (argv[i][0] != '-') {
+			opts.out_zip = argv[i];
+		}
+	}
+
+	if (!opts.out_zip) {
+		bb_error_msg("usage: magiskboot dist [options...] <output.zip>\n"
+		             "  -m, --module <ko|dir>   Bundle kernel module(s)\n"
+		             "  -k, --kernel <image>    Bundle kernel image\n"
+		             "  -d, --dtb <dtb>         Bundle DTB image\n"
+		             "  --dtbo <dtbo>           Bundle DTBO image\n"
+		             "  -a, --app <apk>         Bundle Manager APK\n"
+		             "  -o, --overlay <dir>     Bundle overlay.d/ directory\n"
+		             "  --magiskboot <bin>      Embed specific target magiskboot\n"
+		             "  --banner <text>         Custom recovery installer banner\n"
+		             "  --device <dev1,dev2>    Device check guardrails\n"
+		             "  --init-boot             Target init_boot partition (GKI 2.0)\n"
+		             "  --update-binary <sh>    Custom update-binary script");
+		free(opts.modules);
+		return 1;
+	}
+
+	ret = package_dist_zip(&opts);
+	free(opts.modules);
+	return ret;
+}
+
+static int magiskboot_zip_op(int argc, char **argv) {
+	const char *zip_file;
+	const char *action;
+	const char *entry;
+	const char *dest;
+
+	if (argc < 4) {
+		bb_error_msg("usage: magiskboot zip <file.zip> <create|list|extract> [args...]");
+		return 1;
+	}
+
+	zip_file = argv[2];
+	action = argv[3];
+
+	if (strcmp(action, "create") == 0) {
+		return zip_create_file(zip_file, argc - 4, argv + 4);
+	}
+	if (strcmp(action, "list") == 0 || strcmp(action, "ls") == 0) {
+		return zip_list_file(zip_file);
+	}
+	if (strcmp(action, "extract") == 0 || strcmp(action, "x") == 0) {
+		entry = (argc >= 5 && argv[4][0] != '\0') ? argv[4] : NULL;
+		dest = (argc >= 6 && argv[5][0] != '\0') ? argv[5] : ".";
+		return zip_extract_file(zip_file, entry, dest);
+	}
+
+	bb_error_msg("unknown zip action '%s' (supported: create, list, extract)", action);
+	return 1;
+}
+
+/* =========================================================================
  * 6. BusyBox Applet Entrypoint
  * ========================================================================= */
 
@@ -4569,6 +5564,15 @@ int magiskboot_main(int argc, char **argv) {
 
 	if (strcmp(cmd, "mod-unload") == 0) {
 		return module_unload_name((argc >= 3) ? argv[2] : "kroot");
+	}
+
+	if (strcmp(cmd, "dist") == 0 || strcmp(cmd, "anykernel") == 0 ||
+	    strcmp(cmd, "package-kernel") == 0 || strcmp(cmd, "package-zip") == 0) {
+		return magiskboot_dist_op(argc, argv);
+	}
+
+	if (strcmp(cmd, "zip") == 0) {
+		return magiskboot_zip_op(argc, argv);
 	}
 
 	if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
