@@ -41,6 +41,9 @@
 //usage:     "\n	patch-vermagic <mod.ko> [opts] Patch module vermagic, altinstructions, and CFI stubs"
 //usage:     "\n	dist [opts...] <out.zip>      Create universal Magisk/AnyKernel recovery flashable ZIP"
 //usage:     "\n	zip <file.zip> <act> [...]    ZIP archive toolkit (create, list, extract)"
+//usage:     "\n	fstab <file> <print|patch...> In-place fstab configuration tool"
+//usage:     "\n	cmdline <file> <print|patch|add|rm...> Kernel cmdline tool"
+//usage:     "\n	vbmeta <file> [status|disable|restore] VBMeta AVB 2.0 flags inspector and verity disabler"
 //usage:     "\n	decompress <in> [out]         Decompress kernel/ramdisk image"
 //usage:     "\n	cleanup                       Clean up unpacked temporary files"
 
@@ -83,6 +86,7 @@ static uint8_t boot_check_fmt(const void *buf, size_t len) {
 	if (len >= 8 && memcmp(b, "\x44\x48\x54\x42\x01\x00\x00\x00", 8) == 0) return BOOT_FMT_DHTB;
 	if (len >= 20 && memcmp(b, "-SIGNED-BY-SIGNBLOB-", 20) == 0) return BOOT_FMT_BLOB;
 	if (len >= 4 && memcmp(b, "\x18\x28\x6f\x01", 4) == 0) return BOOT_FMT_ZIMAGE;
+	if (len >= 4 && *(const uint32_t *)b == SWAP_LE32(0x58881688)) return BOOT_FMT_MTK;
 
 	/* LZMA header check */
 	if (len >= 13 && b[0] == 0x5d) {
@@ -117,6 +121,7 @@ static const char *boot_fmt2name(uint8_t fmt) {
 	case BOOT_FMT_LZOP:        return "lzop";
 	case BOOT_FMT_DTB:         return "dtb";
 	case BOOT_FMT_ZIMAGE:      return "zimage";
+	case BOOT_FMT_MTK:         return "mtk";
 	default:                   return "raw";
 	}
 }
@@ -698,6 +703,13 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 			int dtb_off;
 			img->kernel = hdr_ptr + off;
 			img->k_fmt = boot_check_fmt(img->kernel, img->kernel_size);
+			if (img->k_fmt == BOOT_FMT_MTK && img->kernel_size > sizeof(struct mtk_hdr)) {
+				img->flags |= BOOT_FLAG_MTK_KERNEL;
+				img->kernel = (const uint8_t *)img->kernel + sizeof(struct mtk_hdr);
+				img->kernel_size -= sizeof(struct mtk_hdr);
+				img->k_fmt = boot_check_fmt(img->kernel, img->kernel_size);
+				fprintf(stderr, "%-*s [MTK-KERNEL]\n", PADDING, "MTK_HEADER");
+			}
 			fprintf(stderr, "%-*s [%s]\n", PADDING, "KERNEL_FMT", boot_fmt2name(img->k_fmt));
 			off += align_to(img->kernel_size, page_sz);
 
@@ -715,6 +727,13 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 	if (img->ramdisk_size > 0 && hdr_ptr + off + img->ramdisk_size <= end) {
 		img->ramdisk = hdr_ptr + off;
 		img->r_fmt = boot_check_fmt(img->ramdisk, img->ramdisk_size);
+		if (img->r_fmt == BOOT_FMT_MTK && img->ramdisk_size > sizeof(struct mtk_hdr)) {
+			img->flags |= BOOT_FLAG_MTK_RAMDISK;
+			img->ramdisk = (const uint8_t *)img->ramdisk + sizeof(struct mtk_hdr);
+			img->ramdisk_size -= sizeof(struct mtk_hdr);
+			img->r_fmt = boot_check_fmt(img->ramdisk, img->ramdisk_size);
+			fprintf(stderr, "%-*s [MTK-RAMDISK]\n", PADDING, "MTK_HEADER");
+		}
 		fprintf(stderr, "%-*s [%s]\n", PADDING, "RAMDISK_FMT", boot_fmt2name(img->r_fmt));
 		off += align_to(img->ramdisk_size, page_sz);
 	}
@@ -1082,7 +1101,30 @@ static int magiskboot_repack(const char *src_img, const char *out_img, bool skip
 	lseek(out_fd, hdr_pad, SEEK_SET);
 
 	if (!dyn_hdr_is_vendor(&boot.hdr)) {
-		copy_file_section(out_fd, KERNEL_FILE, page_sz, &kernel_sz);
+		if (boot.flags & BOOT_FLAG_MTK_KERNEL) {
+			struct stat kst;
+			if (stat(KERNEL_FILE, &kst) == 0) {
+				struct mtk_hdr mtk;
+				uint32_t kraw_sz = 0;
+				size_t rem;
+				memset(&mtk, 0, sizeof(mtk));
+				mtk.magic = SWAP_LE32(0x58881688);
+				mtk.size = SWAP_LE32((uint32_t)kst.st_size);
+				strncpy(mtk.name, "KERNEL", sizeof(mtk.name) - 1);
+				full_write(out_fd, &mtk, sizeof(mtk));
+				copy_file_section(out_fd, KERNEL_FILE, 0, &kraw_sz);
+				kernel_sz = kraw_sz + sizeof(mtk);
+				rem = kernel_sz % page_sz;
+				if (rem > 0) {
+					static const uint8_t zeros[4096] = {0};
+					full_write(out_fd, zeros, page_sz - rem);
+				}
+			} else {
+				copy_file_section(out_fd, KERNEL_FILE, page_sz, &kernel_sz);
+			}
+		} else {
+			copy_file_section(out_fd, KERNEL_FILE, page_sz, &kernel_sz);
+		}
 		if (access(KER_DTB_FILE, R_OK) == 0) {
 			uint32_t dtb_part = 0;
 			size_t rem;
@@ -1100,7 +1142,30 @@ static int magiskboot_repack(const char *src_img, const char *out_img, bool skip
 
 	/* Select ramdisk file (with auto-compression if needed) */
 	ramdisk_path = prepare_ramdisk_for_repack(&boot, skip_comp, tmp_ramdisk, sizeof(tmp_ramdisk));
-	copy_file_section(out_fd, ramdisk_path, page_sz, &ramdisk_sz);
+	if (boot.flags & BOOT_FLAG_MTK_RAMDISK) {
+		struct stat rst;
+		if (stat(ramdisk_path, &rst) == 0) {
+			struct mtk_hdr mtk;
+			uint32_t rraw_sz = 0;
+			size_t rem;
+			memset(&mtk, 0, sizeof(mtk));
+			mtk.magic = SWAP_LE32(0x58881688);
+			mtk.size = SWAP_LE32((uint32_t)rst.st_size);
+			strncpy(mtk.name, "ROOTFS", sizeof(mtk.name) - 1);
+			full_write(out_fd, &mtk, sizeof(mtk));
+			copy_file_section(out_fd, ramdisk_path, 0, &rraw_sz);
+			ramdisk_sz = rraw_sz + sizeof(mtk);
+			rem = ramdisk_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		} else {
+			copy_file_section(out_fd, ramdisk_path, page_sz, &ramdisk_sz);
+		}
+	} else {
+		copy_file_section(out_fd, ramdisk_path, page_sz, &ramdisk_sz);
+	}
 	*dyn_hdr_ramdisk_size(&boot.hdr) = ramdisk_sz;
 	if (tmp_ramdisk[0] != '\0') {
 		unlink(tmp_ramdisk);
@@ -4764,8 +4829,14 @@ static char *resolve_magiskboot_binary(const char *custom) {
 	return NULL;
 }
 
-static char *generate_universal_update_binary(const char *banner, const char *dev_check, bool has_init_boot) {
+static char *generate_universal_update_binary(const char *banner, const char *dev_check,
+                                              const char *supported_versions, const char *supported_patchlevels,
+                                              bool has_init_boot, bool has_vendor_boot,
+                                              bool has_vendor_dlkm, bool has_system_dlkm,
+                                              bool patch_vbmeta) {
 	char dev_block[1024];
+	char ver_block[1024];
+	char level_block[1024];
 	char *script;
 	const char *banner_text = (banner && banner[0]) ? banner : "Universal Kernel & Root Engine";
 
@@ -4788,10 +4859,44 @@ static char *generate_universal_update_binary(const char *banner, const char *de
 			dev_check);
 	}
 
+	ver_block[0] = '\0';
+	if (supported_versions && supported_versions[0]) {
+		snprintf(ver_block, sizeof(ver_block),
+			"\n# Android OS Version Compatibility Gate\n"
+			"CURRENT_VER=$(getprop ro.build.version.release 2>/dev/null)\n"
+			"[ -z \"$CURRENT_VER\" ] && CURRENT_VER=$(getprop ro.build.version.sdk 2>/dev/null)\n"
+			"ui_print \"- Android version detected: $CURRENT_VER\"\n"
+			"VER_MATCH=0\n"
+			"for v in $(echo \"%s\" | tr ',' ' '); do\n"
+			"  if [ \"$CURRENT_VER\" = \"$v\" ]; then VER_MATCH=1; break; fi\n"
+			"done\n"
+			"if [ $VER_MATCH -eq 0 ]; then\n"
+			"  ui_print \"! Error: Unsupported Android version '$CURRENT_VER'! (Supported: %s)\"\n"
+			"  cd /; rm -rf \"$TMPDIR\"; exit 1\n"
+			"fi\n",
+			supported_versions, supported_versions);
+	}
+
+	level_block[0] = '\0';
+	if (supported_patchlevels && supported_patchlevels[0]) {
+		snprintf(level_block, sizeof(level_block),
+			"\n# Security Patch Level Compatibility Gate\n"
+			"CURRENT_SPL=$(getprop ro.build.version.security_patch 2>/dev/null)\n"
+			"ui_print \"- Security patch level detected: $CURRENT_SPL\"\n"
+			"SPL_MATCH=0\n"
+			"for l in $(echo \"%s\" | tr ',' ' '); do\n"
+			"  if [ \"$CURRENT_SPL\" = \"$l\" ]; then SPL_MATCH=1; break; fi\n"
+			"done\n"
+			"if [ $SPL_MATCH -eq 0 ]; then\n"
+			"  ui_print \"! Warning: Security patch level '$CURRENT_SPL' differs from target (%s)\"\n"
+			"fi\n",
+			supported_patchlevels, supported_patchlevels);
+	}
+
 	script = xasprintf(
 		"#!/sbin/sh\n"
 		"# SPDX-License-Identifier: GPL-2.0-or-later\n"
-		"# Universal MagiskBoot Recovery Flashable Installer\n\n"
+		"# Universal MagiskBoot & AnyKernel3 Recovery Flashable Installer\n\n"
 		"OUTFD=$2\n"
 		"ZIPFILE=\"$3\"\n\n"
 		"ui_print() {\n"
@@ -4813,22 +4918,232 @@ static char *generate_universal_update_binary(const char *banner, const char *de
 		"  cd /; rm -rf \"$TMPDIR\"; exit 1\n"
 		"fi\n"
 		"chmod 755 \"$MB\"\n"
-		"%s\n"
+		"%s%s%s\n"
+		"find_slot() {\n"
+		"  local slot=$(getprop ro.boot.slot_suffix 2>/dev/null)\n"
+		"  [ -z \"$slot\" ] && slot=$(grep -o 'androidboot.slot_suffix=[^ ]*' /proc/cmdline 2>/dev/null | cut -d= -f2)\n"
+		"  [ -z \"$slot\" ] && slot=$(getprop ro.boot.slot 2>/dev/null)\n"
+		"  [ -n \"$slot\" ] && [ \"${slot#_}\" = \"$slot\" ] && slot=\"_$slot\"\n"
+		"  [ \"$slot\" = \"normal\" ] && slot=\"\"\n"
+		"  # Virtual A/B OTA Background Snapshot Target Inversion\n"
+		"  if [ -d /postinstall/tmp ] && [ -n \"$slot\" ]; then\n"
+		"    case \"$slot\" in\n"
+		"      _a) slot=\"_b\";;\n"
+		"      _b) slot=\"_a\";;\n"
+		"    esac\n"
+		"  fi\n"
+		"  [ -n \"$slot\" ] && echo \"$slot\"\n"
+		"}\n\n"
 		"find_part() {\n"
 		"  local p=\"$1\"\n"
-		"  for d in /dev/block/bootdevice/by-name /dev/block/by-name /dev/block/platform/*/by-name /dev/block/mapper; do\n"
+		"  local slot=$(find_slot)\n"
+		"  for d in /dev/block/bootdevice/by-name /dev/block/by-name /dev/block/platform/*/by-name /dev/block/platform/*/*/by-name /dev/block/mapper; do\n"
+		"    if [ -e \"$d/$p$slot\" ]; then echo \"$d/$p$slot\"; return 0; fi\n"
 		"    if [ -e \"$d/$p\" ]; then echo \"$d/$p\"; return 0; fi\n"
 		"  done\n"
 		"  return 1\n"
 		"}\n\n"
+		"# Full AnyKernel3 Ramdisk & Configuration Modification DSL\n"
+		"backup_file() { [ ! -f \"$1~\" ] && cp -fp \"$1\" \"$1~\"; }\n"
+		"restore_file() { [ -f \"$1~\" ] && cp -fp \"$1~\" \"$1\"; rm -f \"$1~\"; }\n\n"
+		"replace_string() {\n"
+		"  local f=\"$1\"; local s=\"$2\"; local orig=\"$3\"; local repl=\"$4\"\n"
+		"  [ -z \"$orig\" ] && orig=\"$s\"; [ -z \"$repl\" ] && repl=\"$3\"\n"
+		"  if [ -f \"$f\" ] && ! grep -q \"$s\" \"$f\" 2>/dev/null; then\n"
+		"    sed -i \"s|$orig|$repl|g\" \"$f\" 2>/dev/null\n"
+		"  fi\n"
+		"}\n\n"
+		"replace_section() {\n"
+		"  local f=\"$1\"; local b=\"$2\"; local e=\"$3\"; local r=\"$4\"\n"
+		"  local begin=$(grep -n -m1 \"$b\" \"$f\" 2>/dev/null | cut -d: -f1)\n"
+		"  if [ -n \"$begin\" ]; then\n"
+		"    [ -z \"$e\" ] && e='^[[:space:]]*$'\n"
+		"    local last=$(wc -l < \"$f\" 2>/dev/null)\n"
+		"    for end in $(grep -n \"$e\" \"$f\" 2>/dev/null | cut -d: -f1) $last; do\n"
+		"      if [ \"$end\" -gt \"$begin\" ]; then\n"
+		"        sed -i \"${begin},${end}d\" \"$f\" 2>/dev/null\n"
+		"        [ \"$end\" -eq \"$last\" ] && echo \"\" >> \"$f\"\n"
+		"        sed -i \"${begin}s|^|${r}\\n|\" \"$f\" 2>/dev/null\n"
+		"        break\n"
+		"      fi\n"
+		"    done\n"
+		"  fi\n"
+		"}\n\n"
+		"remove_section() {\n"
+		"  local f=\"$1\"; local b=\"$2\"; local e=\"$3\"\n"
+		"  local begin=$(grep -n -m1 \"$b\" \"$f\" 2>/dev/null | cut -d: -f1)\n"
+		"  if [ -n \"$begin\" ]; then\n"
+		"    [ -z \"$e\" ] && e='^[[:space:]]*$'\n"
+		"    local last=$(wc -l < \"$f\" 2>/dev/null)\n"
+		"    for end in $(grep -n \"$e\" \"$f\" 2>/dev/null | cut -d: -f1) $last; do\n"
+		"      if [ \"$end\" -gt \"$begin\" ]; then\n"
+		"        sed -i \"${begin},${end}d\" \"$f\" 2>/dev/null\n"
+		"        break\n"
+		"      fi\n"
+		"    done\n"
+		"  fi\n"
+		"}\n\n"
+		"insert_line() {\n"
+		"  local f=\"$1\"; local s=\"$2\"; local loc=\"$3\"; local m=\"$4\"; local l=\"$5\"\n"
+		"  if [ -f \"$f\" ] && ! grep -q \"$s\" \"$f\" 2>/dev/null; then\n"
+		"    local off=1; [ \"$loc\" = \"before\" ] && off=0\n"
+		"    local lnum=$(( $(grep -n -m1 \"$m\" \"$f\" 2>/dev/null | cut -d: -f1) + off ))\n"
+		"    if [ \"$(wc -l < \"$f\")\" -lt \"$lnum\" ]; then\n"
+		"      echo \"$l\" >> \"$f\"\n"
+		"    else\n"
+		"      sed -i \"${lnum}s|^|${l}\\n|\" \"$f\" 2>/dev/null\n"
+		"    fi\n"
+		"  fi\n"
+		"}\n\n"
+		"replace_line() {\n"
+		"  local f=\"$1\"; local m=\"$2\"; local r=\"$3\"; local sc=\"$4\"\n"
+		"  if [ -f \"$f\" ] && grep -q \"$m\" \"$f\" 2>/dev/null; then\n"
+		"    local lines=$(grep -n \"$m\" \"$f\" 2>/dev/null | cut -d: -f1 | sort -nr)\n"
+		"    [ \"$sc\" != \"global\" ] && lines=$(echo \"$lines\" | tail -n1)\n"
+		"    for line in $lines; do\n"
+		"      sed -i \"${line}s|.*|${r}|\" \"$f\" 2>/dev/null\n"
+		"    done\n"
+		"  fi\n"
+		"}\n\n"
+		"remove_line() {\n"
+		"  local f=\"$1\"; local m=\"$2\"; local sc=\"$3\"\n"
+		"  if [ -f \"$f\" ] && grep -q \"$m\" \"$f\" 2>/dev/null; then\n"
+		"    local lines=$(grep -n \"$m\" \"$f\" 2>/dev/null | cut -d: -f1 | sort -nr)\n"
+		"    [ \"$sc\" != \"global\" ] && lines=$(echo \"$lines\" | tail -n1)\n"
+		"    for line in $lines; do\n"
+		"      sed -i \"${line}d\" \"$f\" 2>/dev/null\n"
+		"    done\n"
+		"  fi\n"
+		"}\n\n"
+		"insert_file() {\n"
+		"  local f=\"$1\"; local s=\"$2\"; local loc=\"$3\"; local m=\"$4\"; local p=\"$5\"\n"
+		"  if [ -f \"$f\" ] && [ -f \"$p\" ] && ! grep -q \"$s\" \"$f\" 2>/dev/null; then\n"
+		"    local off=1; [ \"$loc\" = \"before\" ] && off=0\n"
+		"    local lnum=$(( $(grep -n -m1 \"$m\" \"$f\" 2>/dev/null | cut -d: -f1) + off ))\n"
+		"    sed -i \"${lnum}s|^|\\n|\" \"$f\" 2>/dev/null\n"
+		"    sed -i \"$((lnum - 1))r $p\" \"$f\" 2>/dev/null\n"
+		"  fi\n"
+		"}\n\n"
+		"prepend_file() {\n"
+		"  local f=\"$1\"; local s=\"$2\"; local p=\"$3\"\n"
+		"  if [ -f \"$f\" ] && [ -f \"$p\" ] && ! grep -q \"$s\" \"$f\" 2>/dev/null; then\n"
+		"    local tmp=\"$TMPDIR/prep_$$\"\n"
+		"    cat \"$p\" \"$f\" > \"$tmp\" && mv -f \"$tmp\" \"$f\"\n"
+		"  fi\n"
+		"}\n\n"
+		"append_file() {\n"
+		"  local f=\"$1\"; local s=\"$2\"; local p=\"$3\"\n"
+		"  if [ -f \"$f\" ] && [ -f \"$p\" ] && ! grep -q \"$s\" \"$f\" 2>/dev/null; then\n"
+		"    echo \"\" >> \"$f\"\n"
+		"    cat \"$p\" >> \"$f\"\n"
+		"    echo \"\" >> \"$f\"\n"
+		"  fi\n"
+		"}\n\n"
+		"replace_file() {\n"
+		"  if [ -f \"$3\" ]; then\n"
+		"    cp -pf \"$3\" \"$1\" && chmod \"$2\" \"$1\" 2>/dev/null\n"
+		"  fi\n"
+		"}\n\n"
+		"patch_prop() {\n"
+		"  local f=\"$1\"; local k=\"$2\"; local v=\"$3\"\n"
+		"  [ -f \"$f\" ] || return 1\n"
+		"  if ! grep -q \"^$k=\" \"$f\" 2>/dev/null; then\n"
+		"    echo \"$k=$v\" >> \"$f\"\n"
+		"  else\n"
+		"    local line=$(grep -n -m1 \"^$k=\" \"$f\" 2>/dev/null | cut -d: -f1)\n"
+		"    sed -i \"${line}s|.*|${k}=${v}|\" \"$f\" 2>/dev/null\n"
+		"  fi\n"
+		"}\n\n"
+		"patch_ueventd() {\n"
+		"  local f=\"$1\"; local d=\"$2\"; local p=\"$3\"; local u=\"$4\"; shift 4; local g=\"$*\"\n"
+		"  [ -f \"$f\" ] || return 1\n"
+		"  local line=$(grep -n -m1 \"$d\" \"$f\" 2>/dev/null | cut -d: -f1)\n"
+		"  local entry=\"$d   $p   $u   $g\"\n"
+		"  if [ -n \"$line\" ]; then\n"
+		"    sed -i \"${line}s|.*|${entry}|\" \"$f\" 2>/dev/null\n"
+		"  else\n"
+		"    echo \"$entry\" >> \"$f\"\n"
+		"  fi\n"
+		"}\n\n"
+		"patch_fstab() {\n"
+		"  local f=\"$1\"; local mnt=\"$2\"; local old=\"$3\"; local new=\"$4\"\n"
+		"  if [ -f \"$f\" ]; then\n"
+		"    \"$MB\" fstab \"$f\" patch \"$mnt\" \"$old\" \"$new\" 2>/dev/null || sed -i \"s|$old|$new|g\" \"$f\" 2>/dev/null\n"
+		"  fi\n"
+		"}\n\n"
+		"patch_cmdline() {\n"
+		"  local f=\"$1\"; local key=\"$2\"; local val=\"$3\"\n"
+		"  if [ -f \"$f\" ]; then\n"
+		"    \"$MB\" cmdline \"$f\" patch \"$key\" \"$val\" 2>/dev/null\n"
+		"  fi\n"
+		"}\n\n"
+		"# Dynamic Partition & Super Volume Flash Engine\n"
+		"flash_generic() {\n"
+		"  local p=\"$1\"\n"
+		"  local img=\"\"\n"
+		"  for f in \"$TMPDIR/$p\" \"$TMPDIR/$p.img\"; do\n"
+		"    if [ -f \"$f\" ]; then img=\"$f\"; break; fi\n"
+		"  done\n"
+		"  [ -z \"$img\" ] && return 0\n"
+		"  local part=$(find_part \"$p\")\n"
+		"  if [ -z \"$part\" ]; then\n"
+		"    ui_print \"! Notice: Partition $p not found on device, skipping\"\n"
+		"    return 0\n"
+		"  fi\n"
+		"  ui_print \"- Flashing $p -> $part...\"\n"
+		"  blockdev --setrw \"$part\" 2>/dev/null\n"
+		"  if [ -d /postinstall/tmp ] && which snapshotupdater_static >/dev/null 2>&1; then\n"
+		"    local imgsz=$(wc -c < \"$img\")\n"
+		"    snapshotupdater_static update \"$p\" \"$imgsz\" 2>/dev/null || true\n"
+		"  fi\n"
+		"  case \"$part\" in\n"
+		"    /dev/block/mapper/*)\n"
+		"      if which lptools_static >/dev/null 2>&1; then\n"
+		"        local imgsz=$(wc -c < \"$img\")\n"
+		"        lptools_static resize \"$p$(find_slot)\" \"$imgsz\" 2>/dev/null || true\n"
+		"      fi\n"
+		"      ;;\n"
+		"  esac\n"
+		"  dd if=\"$img\" of=\"$part\" bs=1048576 2>/dev/null || cat \"$img\" > \"$part\"\n"
+		"  local ret=$?\n"
+		"  if [ $ret -eq 0 ]; then\n"
+		"    ui_print \"- Successfully flashed $p\"\n"
+		"  else\n"
+		"    ui_print \"! Error flashing $p (code $ret)\"\n"
+		"  fi\n"
+		"  return $ret\n"
+		"}\n\n"
+		"# AVB 2.0 VBMeta dm-verity Neutralization Engine\n"
+		"patch_vbmeta_device() {\n"
+		"  for vbname in vbmeta vbmeta_system vbmeta_vendor; do\n"
+		"    local vb=$(find_part \"$vbname\")\n"
+		"    if [ -n \"$vb\" ]; then\n"
+		"      ui_print \"- Neutralizing dm-verity on $vb ($vbname)...\"\n"
+		"      blockdev --setrw \"$vb\" 2>/dev/null\n"
+		"      \"$MB\" vbmeta \"$vb\" disable 2>/dev/null || true\n"
+		"    fi\n"
+		"  done\n"
+		"}\n\n"
+		"PATCH_VBMETA=%d\n"
+		"if [ \"$PATCH_VBMETA\" = \"1\" ]; then\n"
+		"  patch_vbmeta_device\n"
+		"fi\n\n"
 		"HAS_INIT_BOOT=%d\n"
 		"if [ \"$HAS_INIT_BOOT\" = \"0\" ]; then\n"
-		"  if find_part \"init_boot\" >/dev/null 2>&1 || find_part \"init_boot_a\" >/dev/null 2>&1; then HAS_INIT_BOOT=1; fi\n"
+		"  if find_part \"init_boot\" >/dev/null 2>&1; then HAS_INIT_BOOT=1; fi\n"
 		"fi\n"
 		"RD_PART=\"boot\"\n"
 		"if [ \"$HAS_INIT_BOOT\" = \"1\" ]; then\n"
 		"  RD_PART=\"init_boot\"\n"
 		"  ui_print \"- GKI 2.0 multi-partition device detected: ramdisk in init_boot\"\n"
+		"fi\n\n"
+		"HAS_VENDOR_BOOT=%d\n"
+		"if [ -f \"$TMPDIR/vendor_boot.img\" ] || [ \"$HAS_VENDOR_BOOT\" = \"1\" ]; then\n"
+		"  VNDR_PART=$(find_part \"vendor_boot\")\n"
+		"  if [ -n \"$VNDR_PART\" ] && [ -f \"$TMPDIR/vendor_boot.img\" ]; then\n"
+		"    ui_print \"- Flashing vendor_boot image to $VNDR_PART...\"\n"
+		"    dd if=\"$TMPDIR/vendor_boot.img\" of=\"$VNDR_PART\" bs=1048576 2>/dev/null || cat \"$TMPDIR/vendor_boot.img\" > \"$VNDR_PART\"\n"
+		"  fi\n"
 		"fi\n\n"
 		"MODULES=\"\"\n"
 		"[ -d \"$TMPDIR/modules\" ] && MODULES=\"$TMPDIR/modules\"\n\n"
@@ -4855,6 +5170,18 @@ static char *generate_universal_update_binary(const char *banner, const char *de
 		"      if [ $RET -ne 0 ]; then ui_print \"! Failed to inject module $(basename \"$ko\")\"; break; fi\n"
 		"    fi\n"
 		"  done\n"
+		"fi\n\n"
+		"# Flash Dynamic / Logical Partitions (vendor_dlkm, system_dlkm, dtbo)\n"
+		"HAS_VENDOR_DLKM=%d\n"
+		"if [ \"$HAS_VENDOR_DLKM\" = \"1\" ] || [ -f \"$TMPDIR/vendor_dlkm.img\" ]; then\n"
+		"  flash_generic \"vendor_dlkm\"\n"
+		"fi\n\n"
+		"HAS_SYSTEM_DLKM=%d\n"
+		"if [ \"$HAS_SYSTEM_DLKM\" = \"1\" ] || [ -f \"$TMPDIR/system_dlkm.img\" ]; then\n"
+		"  flash_generic \"system_dlkm\"\n"
+		"fi\n\n"
+		"if [ -f \"$TMPDIR/dtbo.img\" ]; then\n"
+		"  flash_generic \"dtbo\"\n"
 		"fi\n\n"
 		"APK_PATH=\"\"\n"
 		"if [ -d \"$TMPDIR/app\" ]; then\n"
@@ -4886,7 +5213,13 @@ static char *generate_universal_update_binary(const char *banner, const char *de
 		"fi\n",
 		banner_text,
 		dev_block,
-		has_init_boot ? 1 : 0
+		ver_block,
+		level_block,
+		patch_vbmeta ? 1 : 0,
+		has_init_boot ? 1 : 0,
+		has_vendor_boot ? 1 : 0,
+		has_vendor_dlkm ? 1 : 0,
+		has_system_dlkm ? 1 : 0
 	);
 
 	return script;
@@ -4920,7 +5253,17 @@ static int package_dist_zip(struct dist_package_options *opts) {
 		zip_writer_add_file(&zw, "META-INF/com/google/android/update-binary", opts->update_binary_script, S_IFREG | 0755);
 		fprintf(stderr, "[+] Bundled custom update-binary from '%s'\n", opts->update_binary_script);
 	} else {
-		update_bin_script = generate_universal_update_binary(opts->banner, opts->device_check, opts->target_init_boot);
+		update_bin_script = generate_universal_update_binary(
+			opts->banner,
+			opts->device_check,
+			opts->supported_versions,
+			opts->supported_patchlevels,
+			opts->target_init_boot,
+			(opts->vendor_boot_path != NULL),
+			(opts->vendor_dlkm_path != NULL),
+			(opts->system_dlkm_path != NULL),
+			opts->patch_vbmeta
+		);
 		zip_writer_add_mem(&zw, "META-INF/com/google/android/update-binary", update_bin_script, strlen(update_bin_script), S_IFREG | 0755);
 		free(update_bin_script);
 		fprintf(stderr, "[+] Bundled universal recovery live-patcher update-binary\n");
@@ -4982,6 +5325,24 @@ static int package_dist_zip(struct dist_package_options *opts) {
 	if (opts->dtbo_path && access(opts->dtbo_path, R_OK) == 0) {
 		zip_writer_add_file(&zw, "dtbo.img", opts->dtbo_path, S_IFREG | 0644);
 		fprintf(stderr, "[+] Bundled DTBO payload: '%s'\n", opts->dtbo_path);
+	}
+
+	/* 7b. Vendor Boot */
+	if (opts->vendor_boot_path && access(opts->vendor_boot_path, R_OK) == 0) {
+		zip_writer_add_file(&zw, "vendor_boot.img", opts->vendor_boot_path, S_IFREG | 0644);
+		fprintf(stderr, "[+] Bundled vendor_boot payload: '%s'\n", opts->vendor_boot_path);
+	}
+
+	/* 7c. Vendor DLKM */
+	if (opts->vendor_dlkm_path && access(opts->vendor_dlkm_path, R_OK) == 0) {
+		zip_writer_add_file(&zw, "vendor_dlkm.img", opts->vendor_dlkm_path, S_IFREG | 0644);
+		fprintf(stderr, "[+] Bundled vendor_dlkm payload: '%s'\n", opts->vendor_dlkm_path);
+	}
+
+	/* 7d. System DLKM */
+	if (opts->system_dlkm_path && access(opts->system_dlkm_path, R_OK) == 0) {
+		zip_writer_add_file(&zw, "system_dlkm.img", opts->system_dlkm_path, S_IFREG | 0644);
+		fprintf(stderr, "[+] Bundled system_dlkm payload: '%s'\n", opts->system_dlkm_path);
 	}
 
 	/* 8. Manager APK */
@@ -5310,6 +5671,18 @@ static int magiskboot_dist_op(int argc, char **argv) {
 			if (++i < argc) opts.banner = argv[i];
 		} else if (strcmp(argv[i], "--device") == 0 || strcmp(argv[i], "--device-check") == 0) {
 			if (++i < argc) opts.device_check = argv[i];
+		} else if (strcmp(argv[i], "--android-version") == 0 || strcmp(argv[i], "--version-check") == 0) {
+			if (++i < argc) opts.supported_versions = argv[i];
+		} else if (strcmp(argv[i], "--patch-level") == 0 || strcmp(argv[i], "--level-check") == 0) {
+			if (++i < argc) opts.supported_patchlevels = argv[i];
+		} else if (strcmp(argv[i], "--vendor-boot") == 0) {
+			if (++i < argc) opts.vendor_boot_path = argv[i];
+		} else if (strcmp(argv[i], "--vendor-dlkm") == 0) {
+			if (++i < argc) opts.vendor_dlkm_path = argv[i];
+		} else if (strcmp(argv[i], "--system-dlkm") == 0) {
+			if (++i < argc) opts.system_dlkm_path = argv[i];
+		} else if (strcmp(argv[i], "--vbmeta-patch") == 0 || strcmp(argv[i], "--patch-vbmeta") == 0) {
+			opts.patch_vbmeta = true;
 		} else if (strcmp(argv[i], "--init-boot") == 0) {
 			opts.target_init_boot = true;
 		} else if (strcmp(argv[i], "--update-binary") == 0) {
@@ -5327,9 +5700,15 @@ static int magiskboot_dist_op(int argc, char **argv) {
 		             "  --dtbo <dtbo>           Bundle DTBO image\n"
 		             "  -a, --app <apk>         Bundle Manager APK\n"
 		             "  -o, --overlay <dir>     Bundle overlay.d/ directory\n"
+		             "  --vendor-boot <image>   Bundle vendor_boot image\n"
+		             "  --vendor-dlkm <img|dir> Bundle vendor_dlkm payload\n"
+		             "  --system-dlkm <img|dir> Bundle system_dlkm payload\n"
+		             "  --vbmeta-patch          Neutralize AVB/dm-verity on top-level vbmeta\n"
 		             "  --magiskboot <bin>      Embed specific target magiskboot\n"
 		             "  --banner <text>         Custom recovery installer banner\n"
 		             "  --device <dev1,dev2>    Device check guardrails\n"
+		             "  --android-version <ver> Supported Android version(s)\n"
+		             "  --patch-level <date>    Supported security patch level\n"
 		             "  --init-boot             Target init_boot partition (GKI 2.0)\n"
 		             "  --update-binary <sh>    Custom update-binary script");
 		free(opts.modules);
@@ -5369,6 +5748,483 @@ static int magiskboot_zip_op(int argc, char **argv) {
 
 	bb_error_msg("unknown zip action '%s' (supported: create, list, extract)", action);
 	return 1;
+}
+
+/* =========================================================================
+ * 13. Android FSTAB & Kernel Command-Line Toolkit
+ * ========================================================================= */
+
+static int fstab_print(const char *file) {
+	FILE *fp;
+	char line[1024];
+
+	fp = fopen(file, "r");
+	if (!fp) {
+		bb_perror_msg("cannot open '%s'", file);
+		return 1;
+	}
+	printf("======================================================================\n");
+	printf("  Android FSTAB Inspector: %s\n", file);
+	printf("======================================================================\n");
+	printf("  %-30s %-16s %-8s %s\n", "Block Device", "Mount Point", "Type", "Flags & Options");
+	printf("  %-30s %-16s %-8s %s\n", "------------------------------", "----------------", "--------", "--------------------");
+	while (fgets(line, sizeof(line), fp)) {
+		char *p = line;
+		char *dev, *mnt, *type, *opts, *flags;
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p == '#' || *p == '\0' || *p == '\n') continue;
+		dev = strtok_r(p, " \t\r\n", &p);
+		mnt = strtok_r(NULL, " \t\r\n", &p);
+		type = strtok_r(NULL, " \t\r\n", &p);
+		opts = strtok_r(NULL, " \t\r\n", &p);
+		flags = strtok_r(NULL, " \t\r\n", &p);
+		if (dev && mnt) {
+			printf("  %-30s %-16s %-8s %s %s\n", dev, mnt, type ? type : "", opts ? opts : "", flags ? flags : "");
+		}
+	}
+	fclose(fp);
+	return 0;
+}
+
+static int fstab_patch(const char *file, const char *target_mnt, const char *old_opt, const char *new_opt) {
+	FILE *fp;
+	char line[4096];
+	char out_path[PATH_MAX];
+	FILE *out_fp;
+	int count = 0;
+
+	fp = fopen(file, "r");
+	if (!fp) {
+		bb_perror_msg("cannot open '%s'", file);
+		return 1;
+	}
+	snprintf(out_path, sizeof(out_path), "%s.tmp.%d", file, (int)getpid());
+	out_fp = fopen(out_path, "w");
+	if (!out_fp) {
+		fclose(fp);
+		bb_perror_msg("cannot create '%s'", out_path);
+		return 1;
+	}
+
+	while (fgets(line, sizeof(line), fp)) {
+		char orig_line[4096];
+		char *p = line;
+		char *dev, *mnt;
+		strcpy(orig_line, line);
+
+		while (*p == ' ' || *p == '\t') p++;
+		if (*p == '#' || *p == '\0' || *p == '\n') {
+			fputs(orig_line, out_fp);
+			continue;
+		}
+
+		dev = strtok_r(p, " \t\r\n", &p);
+		mnt = strtok_r(NULL, " \t\r\n", &p);
+
+		if (dev && mnt && strcmp(mnt, target_mnt) == 0 && old_opt && old_opt[0]) {
+			char *pos = strstr(orig_line, old_opt);
+			if (pos) {
+				size_t prefix_len = pos - orig_line;
+				size_t old_len = strlen(old_opt);
+				fwrite(orig_line, 1, prefix_len, out_fp);
+				if (new_opt && new_opt[0] && strcmp(new_opt, "-") != 0 && strcmp(new_opt, "none") != 0) {
+					fputs(new_opt, out_fp);
+				}
+				fputs(pos + old_len, out_fp);
+				count++;
+				printf("[+] Patched %s on '%s': '%s' -> '%s'\n", target_mnt, file, old_opt, new_opt ? new_opt : "");
+				continue;
+			}
+		}
+		fputs(orig_line, out_fp);
+	}
+	fclose(fp);
+	fclose(out_fp);
+
+	if (count > 0) {
+		rename(out_path, file);
+		printf("[✓] SUCCESS: Modified %d entry in '%s'\n", count, file);
+		return 0;
+	} else {
+		unlink(out_path);
+		printf("[-] Notice: Target '%s' with option '%s' not found in '%s'\n", target_mnt, old_opt, file);
+		return 0;
+	}
+}
+
+static int magiskboot_fstab_op(int argc, char **argv) {
+	const char *file;
+	const char *action;
+
+	if (argc < 4) {
+		bb_error_msg("usage: magiskboot fstab <file> <print|patch <mountpoint> <old_opt> [new_opt]>");
+		return 1;
+	}
+
+	file = argv[2];
+	action = argv[3];
+
+	if (strcmp(action, "print") == 0 || strcmp(action, "show") == 0) {
+		return fstab_print(file);
+	}
+	if (strcmp(action, "patch") == 0) {
+		if (argc < 6) {
+			bb_error_msg("usage: magiskboot fstab <file> patch <mountpoint> <old_opt> [new_opt]");
+			return 1;
+		}
+		return fstab_patch(file, argv[4], argv[5], (argc >= 7) ? argv[6] : "");
+	}
+
+	bb_error_msg("unknown fstab action '%s'", action);
+	return 1;
+}
+
+static int cmdline_print(const char *file) {
+	int fd;
+	struct stat st;
+	char *buf;
+	char *tok, *saveptr;
+
+	fd = open(file, O_RDONLY | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &st) < 0) {
+		bb_perror_msg("cannot open '%s'", file);
+		if (fd >= 0) close(fd);
+		return 1;
+	}
+	buf = xmalloc(st.st_size + 1);
+	if (full_read(fd, buf, st.st_size) != st.st_size) {
+		close(fd); free(buf); return 1;
+	}
+	close(fd);
+	buf[st.st_size] = '\0';
+	while (st.st_size > 0 && (buf[st.st_size - 1] == '\n' || buf[st.st_size - 1] == '\r')) {
+		buf[--st.st_size] = '\0';
+	}
+	printf("======================================================================\n");
+	printf("  Kernel Command Line Inspector: %s\n", file);
+	printf("======================================================================\n");
+	tok = strtok_r(buf, " \t\r\n", &saveptr);
+	while (tok) {
+		printf("  • %s\n", tok);
+		tok = strtok_r(NULL, " \t\r\n", &saveptr);
+	}
+	printf("======================================================================\n");
+	free(buf);
+	return 0;
+}
+
+static int cmdline_modify(const char *file, const char *action, const char *key, const char *val) {
+	int fd;
+	struct stat st;
+	char *buf;
+	char **tokens;
+	size_t cap = 128, count = 0;
+	char *tok, *saveptr;
+	bool modified = false;
+	size_t i;
+	FILE *ofp;
+	bool first;
+
+	fd = open(file, O_RDONLY | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &st) < 0) {
+		bb_perror_msg("cannot open '%s'", file);
+		if (fd >= 0) close(fd);
+		return 1;
+	}
+	buf = xmalloc(st.st_size + 1);
+	if (full_read(fd, buf, st.st_size) != st.st_size) {
+		close(fd); free(buf); return 1;
+	}
+	close(fd);
+	buf[st.st_size] = '\0';
+
+	tokens = xmalloc(cap * sizeof(char *));
+	tok = strtok_r(buf, " \t\r\n", &saveptr);
+	while (tok) {
+		if (count >= cap) {
+			cap *= 2;
+			tokens = xrealloc(tokens, cap * sizeof(char *));
+		}
+		tokens[count++] = xstrdup(tok);
+		tok = strtok_r(NULL, " \t\r\n", &saveptr);
+	}
+	free(buf);
+
+	if (strcmp(action, "add") == 0) {
+		bool found = false;
+		for (i = 0; i < count; i++) {
+			if (strcmp(tokens[i], key) == 0) { found = true; break; }
+		}
+		if (!found) {
+			if (count >= cap) { cap += 16; tokens = xrealloc(tokens, cap * sizeof(char *)); }
+			tokens[count++] = xstrdup(key);
+			modified = true;
+			printf("[+] Appended cmdline option: '%s'\n", key);
+		}
+	} else if (strcmp(action, "rm") == 0 || strcmp(action, "del") == 0) {
+		size_t klen = strlen(key);
+		for (i = 0; i < count; i++) {
+			if (strcmp(tokens[i], key) == 0 || (strncmp(tokens[i], key, klen) == 0 && tokens[i][klen] == '=')) {
+				free(tokens[i]);
+				tokens[i] = NULL;
+				modified = true;
+				printf("[+] Removed cmdline parameter: '%s'\n", key);
+			}
+		}
+	} else if (strcmp(action, "patch") == 0 || strcmp(action, "set") == 0) {
+		size_t klen = strlen(key);
+		bool found = false;
+		for (i = 0; i < count; i++) {
+			if (strcmp(tokens[i], key) == 0 || (strncmp(tokens[i], key, klen) == 0 && tokens[i][klen] == '=')) {
+				free(tokens[i]);
+				tokens[i] = xasprintf("%s=%s", key, val ? val : "");
+				found = true;
+				modified = true;
+				printf("[+] Patched cmdline parameter: '%s=%s'\n", key, val ? val : "");
+			}
+		}
+		if (!found && val) {
+			if (count >= cap) { cap += 16; tokens = xrealloc(tokens, cap * sizeof(char *)); }
+			tokens[count++] = xasprintf("%s=%s", key, val);
+			modified = true;
+			printf("[+] Added new cmdline parameter: '%s=%s'\n", key, val);
+		}
+	}
+
+	if (!modified) {
+		printf("[-] Notice: cmdline not modified\n");
+		for (i = 0; i < count; i++) if (tokens[i]) free(tokens[i]);
+		free(tokens);
+		return 0;
+	}
+
+	ofp = fopen(file, "w");
+	if (!ofp) {
+		bb_perror_msg("cannot write '%s'", file);
+		for (i = 0; i < count; i++) if (tokens[i]) free(tokens[i]);
+		free(tokens);
+		return 1;
+	}
+
+	first = true;
+	for (i = 0; i < count; i++) {
+		if (tokens[i]) {
+			if (!first) fputc(' ', ofp);
+			fputs(tokens[i], ofp);
+			first = false;
+			free(tokens[i]);
+		}
+	}
+	fputc('\n', ofp);
+	fclose(ofp);
+	free(tokens);
+	printf("[✓] SUCCESS: Updated kernel command line '%s'\n", file);
+	return 0;
+}
+
+static int magiskboot_cmdline_op(int argc, char **argv) {
+	const char *file;
+	const char *action;
+
+	if (argc < 4) {
+		bb_error_msg("usage: magiskboot cmdline <file> <print|patch <key> <val>|add <opt>|rm <key>>");
+		return 1;
+	}
+
+	file = argv[2];
+	action = argv[3];
+
+	if (strcmp(action, "print") == 0 || strcmp(action, "show") == 0) {
+		return cmdline_print(file);
+	}
+	if (strcmp(action, "patch") == 0 || strcmp(action, "set") == 0) {
+		if (argc < 5) {
+			bb_error_msg("usage: magiskboot cmdline <file> patch <key> [val]");
+			return 1;
+		}
+		return cmdline_modify(file, action, argv[4], (argc >= 6) ? argv[5] : "");
+	}
+	if (strcmp(action, "add") == 0) {
+		if (argc < 5) {
+			bb_error_msg("usage: magiskboot cmdline <file> add <option>");
+			return 1;
+		}
+		return cmdline_modify(file, action, argv[4], NULL);
+	}
+	if (strcmp(action, "rm") == 0 || strcmp(action, "del") == 0) {
+		if (argc < 5) {
+			bb_error_msg("usage: magiskboot cmdline <file> rm <key>");
+			return 1;
+		}
+		return cmdline_modify(file, action, argv[4], NULL);
+	}
+
+	bb_error_msg("unknown cmdline action '%s'", action);
+	return 1;
+}
+
+/* =========================================================================
+ * 14. AVB 2.0 VBMeta Inspector & dm-verity Neutralizer
+ * ========================================================================= */
+
+static int magiskboot_vbmeta_op(int argc, char **argv) {
+	const char *target;
+	const char *action = "status";
+	int fd;
+	struct stat st;
+	uint8_t *map;
+	size_t map_sz;
+	off_t vbmeta_off = 0;
+	bool found = false;
+	struct avb_vbmeta_image_header *hdr;
+	uint32_t flags;
+
+	if (argc < 3) {
+		bb_error_msg("usage: magiskboot vbmeta <image|block_device> [status|disable|restore]");
+		return 1;
+	}
+
+	target = argv[2];
+	if (argc >= 4) action = argv[3];
+
+	fd = open(target, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		if (strcmp(action, "status") == 0 || strcmp(action, "print") == 0) {
+			fd = open(target, O_RDONLY | O_CLOEXEC);
+		}
+		if (fd < 0) {
+			bb_perror_msg("cannot open '%s'", target);
+			return 1;
+		}
+	}
+
+	if (fstat(fd, &st) < 0) {
+		bb_perror_msg("cannot stat '%s'", target);
+		close(fd);
+		return 1;
+	}
+
+	map_sz = (size_t)st.st_size;
+	if (map_sz == 0) {
+		off_t blk_sz = lseek(fd, 0, SEEK_END);
+		if (blk_sz > 0) map_sz = (size_t)blk_sz;
+		lseek(fd, 0, SEEK_SET);
+	}
+
+	if (map_sz < sizeof(struct avb_vbmeta_image_header)) {
+		bb_error_msg("'%s' is too small for AVB VBMeta structure", target);
+		close(fd);
+		return 1;
+	}
+
+	if (map_sz > 16 * 1024 * 1024) map_sz = 16 * 1024 * 1024;
+
+	map = mmap(NULL, map_sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (map == MAP_FAILED) {
+		map = mmap(NULL, map_sz, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+		if (map == MAP_FAILED) {
+			bb_perror_msg("failed to mmap '%s'", target);
+			close(fd);
+			return 1;
+		}
+	}
+
+	if (memcmp(map, AVB_MAGIC, AVB_MAGIC_LEN) == 0) {
+		vbmeta_off = 0;
+		found = true;
+	}
+
+	if (!found && map_sz >= sizeof(struct avb_footer)) {
+		struct avb_footer *footer = (struct avb_footer *)(map + map_sz - sizeof(struct avb_footer));
+		if (memcmp(footer->magic, AVB_FOOTER_MAGIC, AVB_FOOTER_MAGIC_LEN) == 0) {
+			uint64_t voff = __builtin_bswap64(footer->vbmeta_offset);
+			if (voff + sizeof(struct avb_vbmeta_image_header) <= map_sz &&
+			    memcmp(map + voff, AVB_MAGIC, AVB_MAGIC_LEN) == 0) {
+				vbmeta_off = (off_t)voff;
+				found = true;
+			}
+		}
+	}
+
+	if (!found) {
+		size_t scan_limit = (map_sz > 1048576) ? 1048576 : map_sz;
+		size_t i;
+		for (i = 0; i + sizeof(struct avb_vbmeta_image_header) <= scan_limit; i += 64) {
+			if (memcmp(map + i, AVB_MAGIC, AVB_MAGIC_LEN) == 0) {
+				vbmeta_off = (off_t)i;
+				found = true;
+				break;
+			}
+		}
+	}
+
+	if (!found) {
+		bb_error_msg("no valid AVB 2.0 VBMeta header ('AVB0') found in '%s'", target);
+		munmap(map, map_sz);
+		close(fd);
+		return 1;
+	}
+
+	hdr = (struct avb_vbmeta_image_header *)(map + vbmeta_off);
+	flags = __builtin_bswap32(hdr->flags);
+
+	if (strcmp(action, "status") == 0 || strcmp(action, "print") == 0 || strcmp(action, "show") == 0) {
+		printf("======================================================================\n");
+		printf("  AVB 2.0 VBMeta Inspector: %s (Offset 0x%lx)\n", target, (unsigned long)vbmeta_off);
+		printf("======================================================================\n");
+		printf("  Magic:                  %.4s\n", hdr->magic);
+		printf("  Libavb Version:         %u.%u\n",
+		       __builtin_bswap32(hdr->required_libavb_version_major),
+		       __builtin_bswap32(hdr->required_libavb_version_minor));
+		printf("  Release String:         %.64s\n", hdr->release_string);
+		printf("  Rollback Index:         %llu\n", (unsigned long long)__builtin_bswap64(hdr->rollback_index));
+		printf("  Flags:                  0x%08x\n", flags);
+		printf("  dm-verity (Hashtree):   %s\n",
+		       (flags & AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED) ? "DISABLED [✓]" : "ENABLED [! VERIFIED]");
+		printf("  Verification (AVB):     %s\n",
+		       (flags & AVB_VBMETA_IMAGE_FLAGS_VERIFICATION_DISABLED) ? "DISABLED [✓]" : "ENABLED [! ENFORCED]");
+		printf("======================================================================\n");
+		munmap(map, map_sz);
+		close(fd);
+		return 0;
+	}
+
+	if (strcmp(action, "disable") == 0 || strcmp(action, "disable-verity") == 0 ||
+	    strcmp(action, "disable-verification") == 0 || strcmp(action, "patch") == 0) {
+		uint32_t new_flags = flags | AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED | AVB_VBMETA_IMAGE_FLAGS_VERIFICATION_DISABLED;
+		if (flags != new_flags) {
+			hdr->flags = __builtin_bswap32(new_flags);
+			msync(map, map_sz, MS_SYNC);
+			lseek(fd, vbmeta_off, SEEK_SET);
+			full_write(fd, hdr, sizeof(*hdr));
+			printf("[✓] SUCCESS: Neutralized AVB dm-verity & verification on '%s' (flags: 0x%08x -> 0x%08x)\n",
+			       target, flags, new_flags);
+		} else {
+			printf("[-] Notice: AVB dm-verity and verification already disabled on '%s' (flags: 0x%08x)\n",
+			       target, flags);
+		}
+	} else if (strcmp(action, "restore") == 0 || strcmp(action, "enable") == 0) {
+		uint32_t new_flags = flags & ~(AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED | AVB_VBMETA_IMAGE_FLAGS_VERIFICATION_DISABLED);
+		if (flags != new_flags) {
+			hdr->flags = __builtin_bswap32(new_flags);
+			msync(map, map_sz, MS_SYNC);
+			lseek(fd, vbmeta_off, SEEK_SET);
+			full_write(fd, hdr, sizeof(*hdr));
+			printf("[✓] SUCCESS: Restored AVB verification enforcement on '%s' (flags: 0x%08x -> 0x%08x)\n",
+			       target, flags, new_flags);
+		} else {
+			printf("[-] Notice: AVB verification already enabled on '%s' (flags: 0x%08x)\n", target, flags);
+		}
+	} else {
+		bb_error_msg("unknown vbmeta action '%s' (supported: status, disable, restore)", action);
+		munmap(map, map_sz);
+		close(fd);
+		return 1;
+	}
+
+	munmap(map, map_sz);
+	close(fd);
+	return 0;
 }
 
 /* =========================================================================
@@ -5573,6 +6429,18 @@ int magiskboot_main(int argc, char **argv) {
 
 	if (strcmp(cmd, "zip") == 0) {
 		return magiskboot_zip_op(argc, argv);
+	}
+
+	if (strcmp(cmd, "fstab") == 0) {
+		return magiskboot_fstab_op(argc, argv);
+	}
+
+	if (strcmp(cmd, "cmdline") == 0) {
+		return magiskboot_cmdline_op(argc, argv);
+	}
+
+	if (strcmp(cmd, "vbmeta") == 0) {
+		return magiskboot_vbmeta_op(argc, argv);
 	}
 
 	if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {

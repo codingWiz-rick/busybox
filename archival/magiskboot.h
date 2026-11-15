@@ -85,6 +85,7 @@ typedef enum {
     BOOT_FMT_LZOP,
     BOOT_FMT_DTB,
     BOOT_FMT_ZIMAGE,
+    BOOT_FMT_MTK,
 } boot_format_t;
 
 /*
@@ -260,6 +261,9 @@ struct blob_hdr {
 #define AVB_RELEASE_STRING_SIZE     64
 #define AVB_SHA256_DIGEST_SIZE      32
 #define AVB_DESCRIPTOR_TAG_HASH     2
+
+#define AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED       (1U << 0)
+#define AVB_VBMETA_IMAGE_FLAGS_VERIFICATION_DISABLED   (1U << 1)
 
 struct avb_footer {
     uint8_t magic[AVB_FOOTER_MAGIC_LEN];
@@ -557,9 +561,15 @@ struct dist_package_options {
 	const char *magiskboot_bin;
 	const char *banner;
 	const char *device_check;
+	const char *supported_versions;
+	const char *supported_patchlevels;
+	const char *vendor_boot_path;
+	const char *vendor_dlkm_path;
+	const char *system_dlkm_path;
 	const char *update_binary_script;
 	bool target_init_boot;
 	bool target_vendor_boot;
+	bool patch_vbmeta;
 	size_t num_modules;
 	char **modules;
 };
