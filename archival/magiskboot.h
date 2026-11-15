@@ -428,4 +428,53 @@ struct arm64_image_header {
 	uint32_t res5;
 };
 
+/*
+ * Kernel Module & ELF Structure Manipulation
+ */
+#include <elf.h>
+
+#define ARM64_RET_OPCODE         0xd65f03c0U
+
+#ifndef SYS_init_module
+# if defined(__aarch64__)
+#  define SYS_init_module 105
+# elif defined(__x86_64__)
+#  define SYS_init_module 175
+# else
+#  define SYS_init_module 105
+# endif
+#endif
+
+#ifndef SYS_delete_module
+# if defined(__aarch64__)
+#  define SYS_delete_module 106
+# elif defined(__x86_64__)
+#  define SYS_delete_module 176
+# else
+#  define SYS_delete_module 106
+# endif
+#endif
+
+#ifndef SYS_finit_module
+# if defined(__aarch64__)
+#  define SYS_finit_module 273
+# elif defined(__x86_64__)
+#  define SYS_finit_module 313
+# else
+#  define SYS_finit_module 273
+# endif
+#endif
+
+struct elf_ctx {
+	uint8_t *buf;
+	size_t size;
+	bool is_64;
+	bool is_le;
+	uint16_t machine;
+	Elf64_Ehdr *ehdr64;
+	Elf64_Shdr *shdrs64;
+	size_t shnum;
+	const char *shstrtab;
+};
+
 #endif /* MAGISKBOOT_H */

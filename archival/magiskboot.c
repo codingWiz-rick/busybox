@@ -37,6 +37,8 @@
 //usage:     "\n	patch-sigenforce <img|rec> [out] Neutralize kernel module signature enforcement (CONFIG_MODULE_SIG_FORCE)"
 //usage:     "\n	patch-cfi <img|rec> [out]     Neutralize Clang Control Flow Integrity (KCFI & Forward-Edge CFI)"
 //usage:     "\n	dtb <file> [test|print|patch] Device tree blob inspector and verity patcher"
+//usage:     "\n	module <act> <mod.ko> [...]   Kernel module toolkit (info, check, audit, strip, patch, load, finit, unload)"
+//usage:     "\n	patch-vermagic <mod.ko> [opts] Patch module vermagic, altinstructions, and CFI stubs"
 //usage:     "\n	decompress <in> [out]         Decompress kernel/ramdisk image"
 //usage:     "\n	cleanup                       Clean up unpacked temporary files"
 
@@ -46,6 +48,8 @@
 
 #include <sys/mman.h>
 #include <sys/sendfile.h>
+#include <sys/utsname.h>
+#include <sys/syscall.h>
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic ignored "-Waddress-of-packed-member"
@@ -3376,6 +3380,1003 @@ static int magiskboot_kernel_op(const char *image, const char *action, int argc,
 }
 
 /* =========================================================================
+ * 11. Direct ELF Kernel Module Manipulation & Lifecycle Engine
+ * ========================================================================= */
+
+static bool elf_init_ctx(struct elf_ctx *ctx, uint8_t *buf, size_t size) {
+	Elf64_Shdr *str_sh;
+	if (!ctx || !buf || size < sizeof(Elf64_Ehdr)) return false;
+	memset(ctx, 0, sizeof(*ctx));
+	ctx->buf = buf;
+	ctx->size = size;
+
+	if (memcmp(buf, ELFMAG, SELFMAG) != 0) return false;
+
+	if (buf[EI_CLASS] == ELFCLASS64) {
+		ctx->is_64 = true;
+	} else {
+		return false;
+	}
+
+	ctx->is_le = (buf[EI_DATA] == ELFDATA2LSB);
+	ctx->ehdr64 = (Elf64_Ehdr *)buf;
+	ctx->machine = ctx->ehdr64->e_machine;
+
+	if (ctx->ehdr64->e_shoff >= size ||
+	    ctx->ehdr64->e_shoff + (size_t)ctx->ehdr64->e_shnum * sizeof(Elf64_Shdr) > size) {
+		return false;
+	}
+
+	ctx->shdrs64 = (Elf64_Shdr *)(buf + ctx->ehdr64->e_shoff);
+	ctx->shnum = ctx->ehdr64->e_shnum;
+
+	if (ctx->ehdr64->e_shstrndx >= ctx->shnum) return false;
+
+	str_sh = &ctx->shdrs64[ctx->ehdr64->e_shstrndx];
+	if (str_sh->sh_offset >= size || str_sh->sh_offset + str_sh->sh_size > size) {
+		return false;
+	}
+
+	ctx->shstrtab = (const char *)(buf + str_sh->sh_offset);
+	return true;
+}
+
+static Elf64_Shdr *elf_find_shdr(struct elf_ctx *ctx, const char *name, size_t *out_idx) {
+	size_t i;
+	if (!ctx || !ctx->shdrs64 || !ctx->shstrtab || !name) return NULL;
+	for (i = 0; i < ctx->shnum; i++) {
+		const char *sec_name = ctx->shstrtab + ctx->shdrs64[i].sh_name;
+		if (strcmp(sec_name, name) == 0) {
+			if (out_idx) *out_idx = i;
+			return &ctx->shdrs64[i];
+		}
+	}
+	return NULL;
+}
+
+static bool elf_get_build_id(struct elf_ctx *ctx, char *out_hex, size_t max_len) {
+	Elf64_Shdr *shdr;
+	const uint8_t *note_buf;
+	size_t offset = 0;
+
+	if (!ctx || !out_hex || max_len < 3) return false;
+	out_hex[0] = '\0';
+
+	shdr = elf_find_shdr(ctx, ".note.gnu.build-id", NULL);
+	if (!shdr || shdr->sh_type != SHT_NOTE || shdr->sh_offset + shdr->sh_size > ctx->size)
+		return false;
+
+	note_buf = ctx->buf + shdr->sh_offset;
+	while (offset + 12 <= shdr->sh_size) {
+		uint32_t namesz = *(const uint32_t *)(note_buf + offset);
+		uint32_t descsz = *(const uint32_t *)(note_buf + offset + 4);
+		uint32_t type   = *(const uint32_t *)(note_buf + offset + 8);
+		size_t name_aligned = (namesz + 3) & ~3U;
+		size_t desc_aligned = (descsz + 3) & ~3U;
+		offset += 12;
+
+		if (offset + name_aligned + descsz > shdr->sh_size) break;
+		if (type == 3 && namesz == 4 && memcmp(note_buf + offset, "GNU", 3) == 0) {
+			const uint8_t *desc = note_buf + offset + name_aligned;
+			size_t hex_len = 0;
+			size_t b;
+			for (b = 0; b < descsz && hex_len + 3 <= max_len; b++) {
+				hex_len += snprintf(out_hex + hex_len, max_len - hex_len, "%02x", desc[b]);
+			}
+			out_hex[hex_len] = '\0';
+			return true;
+		}
+		offset += name_aligned + desc_aligned;
+	}
+	return false;
+}
+
+static void elf_list_modinfo(struct elf_ctx *ctx) {
+	Elf64_Shdr *shdr = elf_find_shdr(ctx, ".modinfo", NULL);
+	const char *buf;
+	size_t len, pos = 0;
+	int count = 0;
+
+	if (!shdr || shdr->sh_offset + shdr->sh_size > ctx->size) {
+		printf("  <none>\n");
+		return;
+	}
+
+	buf = (const char *)(ctx->buf + shdr->sh_offset);
+	len = shdr->sh_size;
+
+	while (pos < len) {
+		const char *entry = buf + pos;
+		size_t elen = strnlen(entry, len - pos);
+		if (elen > 0) {
+			const char *eq = strchr(entry, '=');
+			if (eq) {
+				char key[128];
+				size_t klen = (size_t)(eq - entry);
+				if (klen >= sizeof(key)) klen = sizeof(key) - 1;
+				memcpy(key, entry, klen);
+				key[klen] = '\0';
+				printf("  %-20s = %s\n", key, eq + 1);
+			} else {
+				printf("  %-20s\n", entry);
+			}
+			count++;
+		}
+		pos += elen + 1;
+	}
+	if (count == 0) printf("  <none>\n");
+}
+
+static bool elf_get_modinfo_entry(struct elf_ctx *ctx, const char *key, char *out_val, size_t max_len) {
+	Elf64_Shdr *shdr = elf_find_shdr(ctx, ".modinfo", NULL);
+	const char *buf;
+	size_t len, pos = 0;
+	size_t klen;
+
+	if (!shdr || !key || !out_val || max_len == 0 || shdr->sh_offset + shdr->sh_size > ctx->size)
+		return false;
+
+	buf = (const char *)(ctx->buf + shdr->sh_offset);
+	len = shdr->sh_size;
+	klen = strlen(key);
+
+	while (pos < len) {
+		const char *entry = buf + pos;
+		size_t elen = strnlen(entry, len - pos);
+		if (elen > klen && strncmp(entry, key, klen) == 0 && entry[klen] == '=') {
+			strncpy(out_val, entry + klen + 1, max_len - 1);
+			out_val[max_len - 1] = '\0';
+			return true;
+		}
+		pos += elen + 1;
+	}
+	return false;
+}
+
+static bool detect_running_vermagic(char *out_magic, size_t max_len) {
+	struct utsname uts;
+	bool has_smp = false, has_preempt = false;
+	bool has_mod_unload = true, has_modversions = false;
+	FILE *vf, *kf;
+	char line[512];
+
+	if (!out_magic || max_len < 16) return false;
+	if (uname(&uts) != 0) return false;
+
+	/* 1. Check /proc/version */
+	vf = fopen("/proc/version", "r");
+	if (vf) {
+		if (fgets(line, sizeof(line), vf)) {
+			has_smp = (strstr(line, "SMP") != NULL);
+			has_preempt = (strstr(line, "PREEMPT") != NULL);
+		}
+		fclose(vf);
+	}
+
+	/* 2. Check /proc/kallsyms for modversions */
+	kf = fopen("/proc/kallsyms", "r");
+	if (kf) {
+		while (fgets(line, sizeof(line), kf)) {
+			if (strstr(line, "module_layout") != NULL) {
+				has_modversions = true;
+				break;
+			}
+		}
+		fclose(kf);
+	}
+
+	snprintf(out_magic, max_len, "%s%s%s%s%s aarch64",
+	         uts.release,
+	         has_smp ? " SMP" : "",
+	         has_preempt ? " preempt" : "",
+	         has_mod_unload ? " mod_unload" : "",
+	         has_modversions ? " modversions" : "");
+	return true;
+}
+
+static bool extract_vermagic_from_kernel_buf(const uint8_t *buf, size_t size, char *out_magic, size_t max_len) {
+	const char *needle = "aarch64";
+	size_t nlen = 7;
+	size_t i;
+
+	if (!buf || size < 64 || !out_magic || max_len < 16) return false;
+
+	for (i = 0; i + nlen <= size; i++) {
+		if (memcmp(buf + i, needle, nlen) == 0) {
+			size_t start = i;
+			size_t end = i + nlen;
+			while (start > 0 && buf[start - 1] >= 0x20 && buf[start - 1] <= 0x7E) {
+				start--;
+			}
+			if (end - start >= 20) {
+				const char *cand = (const char *)(buf + start);
+				size_t clen = end - start;
+				if (cand[0] >= '2' && cand[0] <= '9' && memchr(cand, '.', clen) != NULL) {
+					if (memmem(cand, clen, " SMP ", 5) || memmem(cand, clen, " preempt ", 9) ||
+					    memmem(cand, clen, " mod_unload ", 12)) {
+						size_t cpy = (clen < max_len - 1) ? clen : (max_len - 1);
+						memcpy(out_magic, cand, cpy);
+						out_magic[cpy] = '\0';
+						return true;
+					}
+				}
+			}
+		}
+	}
+	return false;
+}
+
+static bool extract_vermagic_from_path(const char *path, char *out_magic, size_t max_len) {
+	boot_img_t boot;
+	int fd;
+	struct stat st;
+	uint8_t *map;
+	bool found = false;
+
+	if (!path || !out_magic) return false;
+
+	/* If boot image */
+	if (boot_img_parse(&boot, path)) {
+		if (boot.kernel && boot.kernel_size > 0) {
+			if (boot_fmt_compressed(boot.k_fmt)) {
+				char tmp_k[PATH_MAX];
+				int kd_fd;
+				snprintf(tmp_k, sizeof(tmp_k), "/tmp/mb_vmgk_%d.raw", (int)getpid());
+				kd_fd = open(tmp_k, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+				if (kd_fd >= 0) {
+					bb_decompress_data(boot.k_fmt, boot.kernel, boot.kernel_size, kd_fd);
+					if (fstat(kd_fd, &st) == 0 && st.st_size > 64) {
+						uint8_t *kmap = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, kd_fd, 0);
+						if (kmap != MAP_FAILED) {
+							found = extract_vermagic_from_kernel_buf(kmap, st.st_size, out_magic, max_len);
+							munmap(kmap, st.st_size);
+						}
+					}
+					close(kd_fd);
+					unlink(tmp_k);
+				}
+			} else {
+				found = extract_vermagic_from_kernel_buf(boot.kernel, boot.kernel_size, out_magic, max_len);
+			}
+		}
+		boot_img_free(&boot);
+		return found;
+	}
+
+	/* Loose kernel file */
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return false;
+	if (fstat(fd, &st) < 0 || st.st_size < 64) { close(fd); return false; }
+	map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	if (map != MAP_FAILED) {
+		uint8_t fmt = boot_check_fmt(map, st.st_size);
+		if (boot_fmt_compressed(fmt)) {
+			char tmp_k[PATH_MAX];
+			int kd_fd;
+			struct stat kst;
+			snprintf(tmp_k, sizeof(tmp_k), "/tmp/mb_vmgk_%d.raw", (int)getpid());
+			kd_fd = open(tmp_k, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+			if (kd_fd >= 0) {
+				bb_decompress_data(fmt, map, st.st_size, kd_fd);
+				if (fstat(kd_fd, &kst) == 0 && kst.st_size > 64) {
+					uint8_t *kmap = mmap(NULL, kst.st_size, PROT_READ, MAP_SHARED, kd_fd, 0);
+					if (kmap != MAP_FAILED) {
+						found = extract_vermagic_from_kernel_buf(kmap, kst.st_size, out_magic, max_len);
+						munmap(kmap, kst.st_size);
+					}
+				}
+				close(kd_fd);
+				unlink(tmp_k);
+			}
+		} else {
+			found = extract_vermagic_from_kernel_buf(map, st.st_size, out_magic, max_len);
+		}
+		munmap(map, st.st_size);
+	}
+	close(fd);
+	return found;
+}
+
+static bool patch_vermagic_buf(struct elf_ctx *ctx, const char *new_vermagic) {
+	Elf64_Shdr *shdr = elf_find_shdr(ctx, ".modinfo", NULL);
+	char *buf;
+	size_t len, pos = 0;
+	size_t new_len, old_len;
+
+	if (!shdr || !new_vermagic || shdr->sh_offset + shdr->sh_size > ctx->size)
+		return false;
+
+	buf = (char *)(ctx->buf + shdr->sh_offset);
+	len = shdr->sh_size;
+	new_len = strlen(new_vermagic);
+
+	while (pos < len) {
+		char *entry = buf + pos;
+		size_t elen = strnlen(entry, len - pos);
+		if (elen > 9 && strncmp(entry, "vermagic=", 9) == 0) {
+			old_len = elen - 9;
+			if (new_len <= old_len) {
+				memcpy(entry + 9, new_vermagic, new_len);
+				memset(entry + 9 + new_len, 0, old_len - new_len);
+				fprintf(stderr, "[+] Patched vermagic in-place: \"%s\" (padded: %zu bytes)\n", new_vermagic, old_len - new_len);
+				return true;
+			} else {
+				size_t extra = new_len - old_len;
+				if (len - (pos + elen + 1) >= extra) {
+					memmove(entry + 9 + new_len + 1, entry + 9 + old_len + 1, len - (pos + 9 + old_len + 1 + extra));
+					memcpy(entry + 9, new_vermagic, new_len);
+					entry[9 + new_len] = '\0';
+					fprintf(stderr, "[+] Patched expanded vermagic in-place: \"%s\"\n", new_vermagic);
+					return true;
+				}
+				memcpy(entry + 9, new_vermagic, old_len);
+				fprintf(stderr, "[!] Warning: Truncated vermagic to fit in-place .modinfo slot: \"%s\"\n", entry + 9);
+				return true;
+			}
+		}
+		pos += elen + 1;
+	}
+	return false;
+}
+
+static int patch_module_relocations_and_cfi(struct elf_ctx *ctx) {
+	int modified = 0;
+	Elf64_Shdr *shdr;
+	size_t i;
+
+	/* 1. Neutralize .altinstructions and .rela.altinstructions */
+	shdr = elf_find_shdr(ctx, ".altinstructions", NULL);
+	if (shdr && shdr->sh_type != SHT_NOBITS) {
+		shdr->sh_type = SHT_NOBITS;
+		shdr->sh_size = 0;
+		modified++;
+		fprintf(stderr, "[+] Neutralized .altinstructions (converted to SHT_NOBITS)\n");
+	}
+	shdr = elf_find_shdr(ctx, ".rela.altinstructions", NULL);
+	if (shdr && shdr->sh_type != SHT_NOBITS) {
+		shdr->sh_type = SHT_NOBITS;
+		shdr->sh_size = 0;
+		modified++;
+		fprintf(stderr, "[+] Neutralized .rela.altinstructions (converted to SHT_NOBITS)\n");
+	}
+
+	/* 2. Sanitize .gnu.linkonce.this_module */
+	shdr = elf_find_shdr(ctx, ".gnu.linkonce.this_module", NULL);
+	if (shdr && shdr->sh_size > 80 && shdr->sh_offset + shdr->sh_size <= ctx->size) {
+		size_t zero_bytes = shdr->sh_size - 80;
+		memset(ctx->buf + shdr->sh_offset + 80, 0, zero_bytes);
+		modified++;
+		fprintf(stderr, "[+] Sanitized .gnu.linkonce.this_module: preserved 80-byte header, zeroed %zu trailing bytes\n", zero_bytes);
+	}
+
+	/* 3. Neutralize synthesized Cross-DSO __cfi_check stub */
+	shdr = elf_find_shdr(ctx, ".symtab", NULL);
+	if (shdr && shdr->sh_type == SHT_SYMTAB && shdr->sh_offset + shdr->sh_size <= ctx->size) {
+		Elf64_Shdr *strtab_sh = &ctx->shdrs64[shdr->sh_link];
+		if (shdr->sh_link < ctx->shnum && strtab_sh->sh_offset + strtab_sh->sh_size <= ctx->size) {
+			const char *strtab = (const char *)(ctx->buf + strtab_sh->sh_offset);
+			Elf64_Sym *syms = (Elf64_Sym *)(ctx->buf + shdr->sh_offset);
+			size_t nsyms = shdr->sh_size / sizeof(Elf64_Sym);
+			for (i = 0; i < nsyms; i++) {
+				if (syms[i].st_name && strcmp(strtab + syms[i].st_name, "__cfi_check") == 0) {
+					if (syms[i].st_shndx < ctx->shnum) {
+						Elf64_Shdr *t_sh = &ctx->shdrs64[syms[i].st_shndx];
+						if (t_sh->sh_offset + syms[i].st_value + 4 <= ctx->size) {
+							uint32_t *p_insn = (uint32_t *)(ctx->buf + t_sh->sh_offset + syms[i].st_value);
+							if (*p_insn != ARM64_RET_OPCODE) {
+								*p_insn = ARM64_RET_OPCODE;
+								modified++;
+								fprintf(stderr, "[+] Neutralized synthesized __cfi_check stub -> RET (0x%08X)\n", ARM64_RET_OPCODE);
+							}
+						}
+					}
+					break;
+				}
+			}
+		}
+	}
+
+	return modified;
+}
+
+static int strip_module_sections(struct elf_ctx *ctx) {
+	int stripped = 0;
+	size_t i;
+	for (i = 1; i < ctx->shnum; i++) {
+		const char *name = ctx->shstrtab + ctx->shdrs64[i].sh_name;
+		bool do_strip = false;
+		if (strncmp(name, ".debug_", 7) == 0 ||
+		    strcmp(name, ".comment") == 0 ||
+		    strcmp(name, ".note.GNU-stack") == 0) {
+			do_strip = true;
+		}
+		if (do_strip && ctx->shdrs64[i].sh_type != SHT_NOBITS && ctx->shdrs64[i].sh_size > 0) {
+			ctx->shdrs64[i].sh_type = SHT_NOBITS;
+			ctx->shdrs64[i].sh_size = 0;
+			stripped++;
+		}
+	}
+	return stripped;
+}
+
+static int audit_module_symbols(struct elf_ctx *ctx, const char *kallsyms_file) {
+	Elf64_Shdr *shdr = elf_find_shdr(ctx, ".symtab", NULL);
+	const char *strtab;
+	Elf64_Sym *syms;
+	size_t nsyms, i, idx;
+	size_t total_undef = 0, missing_strong = 0, missing_weak = 0, resolved_cnt = 0;
+	FILE *kf;
+	char line[512];
+	char **undef_names = NULL;
+	bool *is_weak_arr = NULL;
+	bool *is_res_arr = NULL;
+
+	if (!shdr || shdr->sh_type != SHT_SYMTAB || shdr->sh_offset + shdr->sh_size > ctx->size) {
+		fprintf(stderr, "[-] No symbol table found in module\n");
+		return 1;
+	}
+
+	strtab = (const char *)(ctx->buf + ctx->shdrs64[shdr->sh_link].sh_offset);
+	syms = (Elf64_Sym *)(ctx->buf + shdr->sh_offset);
+	nsyms = shdr->sh_size / sizeof(Elf64_Sym);
+
+	for (i = 1; i < nsyms; i++) {
+		if (syms[i].st_shndx == SHN_UNDEF && syms[i].st_name) {
+			const char *sname = strtab + syms[i].st_name;
+			if (sname[0] && ELF64_ST_BIND(syms[i].st_info) != STB_LOCAL) {
+				total_undef++;
+			}
+		}
+	}
+
+	if (total_undef == 0) {
+		printf("[+] Pre-flight audit: Zero unresolved external dependencies (self-contained module).\n");
+		return 0;
+	}
+
+	undef_names = xzalloc(total_undef * sizeof(char *));
+	is_weak_arr = xzalloc(total_undef * sizeof(bool));
+	is_res_arr = xzalloc(total_undef * sizeof(bool));
+
+	idx = 0;
+	for (i = 1; i < nsyms; i++) {
+		if (syms[i].st_shndx == SHN_UNDEF && syms[i].st_name) {
+			const char *sname = strtab + syms[i].st_name;
+			if (sname[0] && ELF64_ST_BIND(syms[i].st_info) != STB_LOCAL) {
+				undef_names[idx] = xstrdup(sname);
+				is_weak_arr[idx] = (ELF64_ST_BIND(syms[i].st_info) == STB_WEAK);
+				is_res_arr[idx] = false;
+				idx++;
+			}
+		}
+	}
+
+	printf("[*] Pre-flight audit: Checking %zu external symbol(s) against %s...\n",
+	       total_undef, kallsyms_file ? kallsyms_file : "/proc/kallsyms");
+
+	kf = fopen(kallsyms_file ? kallsyms_file : "/proc/kallsyms", "r");
+	if (!kf) {
+		fprintf(stderr, "[!] Warning: Cannot open %s for live verification.\n", kallsyms_file ? kallsyms_file : "/proc/kallsyms");
+		for (i = 0; i < total_undef; i++) {
+			printf("  [%s] %s\n", is_weak_arr[i] ? "WEAK" : "GLOBAL", undef_names[i]);
+			free(undef_names[i]);
+		}
+		free(undef_names);
+		free(is_weak_arr);
+		free(is_res_arr);
+		return 0;
+	}
+
+	while (fgets(line, sizeof(line), kf)) {
+		char *p = strrchr(line, ' ');
+		size_t slen;
+		if (!p) p = strrchr(line, '\t');
+		if (!p) continue;
+		p++;
+		slen = strlen(p);
+		while (slen > 0 && (p[slen - 1] == '\n' || p[slen - 1] == '\r')) p[--slen] = '\0';
+
+		for (i = 0; i < total_undef; i++) {
+			if (!is_res_arr[i] && strcmp(undef_names[i], p) == 0) {
+				is_res_arr[i] = true;
+			}
+		}
+	}
+	fclose(kf);
+
+	for (i = 0; i < total_undef; i++) {
+		if (is_res_arr[i]) {
+			resolved_cnt++;
+		} else if (is_weak_arr[i]) {
+			missing_weak++;
+			printf("[?] Unresolved WEAK symbol  : %s\n", undef_names[i]);
+		} else {
+			missing_strong++;
+			fprintf(stderr, "[-] UNRESOLVED GLOBAL symbol: %s\n", undef_names[i]);
+		}
+		free(undef_names[i]);
+	}
+	free(undef_names);
+	free(is_weak_arr);
+	free(is_res_arr);
+
+	printf("[*] Audit Summary: %zu resolved, %zu missing strong, %zu missing weak\n",
+	       resolved_cnt, missing_strong, missing_weak);
+	if (missing_strong > 0) {
+		fprintf(stderr, "[-] PRE-FLIGHT AUDIT FAILED: %zu required kernel symbol(s) missing!\n", missing_strong);
+		return 2;
+	}
+
+	printf("[+] PRE-FLIGHT AUDIT PASSED: All required external kernel symbols resolved.\n");
+	return 0;
+}
+
+static void log_kmsg_msg(const char *msg) {
+	int fd = open("/dev/kmsg", O_WRONLY | O_NOCTTY | O_CLOEXEC);
+	if (fd >= 0) {
+		full_write(fd, msg, strlen(msg));
+		close(fd);
+	}
+}
+
+static int module_info_file(const char *file) {
+	int fd = open(file, O_RDONLY | O_CLOEXEC);
+	struct stat st;
+	uint8_t *map;
+	struct elf_ctx ctx;
+	char build_id[128];
+
+	if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < sizeof(Elf64_Ehdr)) {
+		bb_perror_msg("cannot open module file '%s'", file);
+		if (fd >= 0) close(fd);
+		return 1;
+	}
+
+	map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED) {
+		bb_perror_msg("failed to mmap '%s'", file);
+		return 1;
+	}
+
+	if (!elf_init_ctx(&ctx, map, st.st_size)) {
+		bb_error_msg("'%s' is not a valid 64-bit ELF kernel module", file);
+		munmap(map, st.st_size);
+		return 1;
+	}
+
+	printf("======================================================================\n");
+	printf("  Kernel Module Inspection: %s\n", file);
+	printf("======================================================================\n");
+	printf("[*] Architecture    : %s (0x%04x)\n",
+	       (ctx.machine == EM_AARCH64) ? "AArch64 (ARM64)" : (ctx.machine == EM_X86_64 ? "x86_64" : "Other"),
+	       ctx.machine);
+	printf("[*] ELF Class       : %s\n", ctx.is_64 ? "64-bit" : "32-bit");
+	printf("[*] Data Encoding   : %s\n", ctx.is_le ? "2's complement, little endian" : "big endian");
+	printf("[*] Section Count   : %u\n", (unsigned int)ctx.shnum);
+
+	if (elf_get_build_id(&ctx, build_id, sizeof(build_id))) {
+		printf("[*] GNU Build-ID    : %s\n", build_id);
+	} else {
+		printf("[*] GNU Build-ID    : <none / stripped>\n");
+	}
+
+	printf("\n[*] Module Info (.modinfo):\n");
+	elf_list_modinfo(&ctx);
+	printf("======================================================================\n");
+
+	munmap(map, st.st_size);
+	return 0;
+}
+
+static int module_check_file(const char *file) {
+	int fd = open(file, O_RDONLY | O_CLOEXEC);
+	struct stat st;
+	uint8_t *map;
+	struct elf_ctx ctx;
+	char mod_ver[256] = {0};
+	char run_ver[256] = {0};
+	bool found;
+
+	if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < sizeof(Elf64_Ehdr)) {
+		bb_perror_msg("cannot open module file '%s'", file);
+		if (fd >= 0) close(fd);
+		return 1;
+	}
+
+	map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	close(fd);
+	if (map == MAP_FAILED) {
+		bb_perror_msg("failed to mmap '%s'", file);
+		return 1;
+	}
+
+	if (!elf_init_ctx(&ctx, map, st.st_size)) {
+		bb_error_msg("'%s' is not a valid 64-bit ELF kernel module", file);
+		munmap(map, st.st_size);
+		return 1;
+	}
+
+	found = elf_get_modinfo_entry(&ctx, "vermagic", mod_ver, sizeof(mod_ver));
+	detect_running_vermagic(run_ver, sizeof(run_ver));
+
+	printf("======================================================================\n");
+	printf("  Module Path    : %s\n", file);
+	printf("  Module Vermagic: %s\n", found ? mod_ver : "(not found)");
+	printf("  Running Kernel : %s\n", run_ver);
+	printf("======================================================================\n");
+
+	if (found && strcmp(mod_ver, run_ver) == 0) {
+		printf("[✓] Status: 100%% EXACT MATCH — loads natively via insmod/modprobe.\n");
+		munmap(map, st.st_size);
+		return 0;
+	} else {
+		printf("[!] Status: MISMATCH — requires vermagic alignment / patch-vermagic.\n");
+		munmap(map, st.st_size);
+		return 1;
+	}
+}
+
+static int module_strip_file(const char *in_file, const char *out_file) {
+	int in_fd = open(in_file, O_RDONLY | O_CLOEXEC);
+	struct stat st;
+	uint8_t *buf;
+	struct elf_ctx ctx;
+	int stripped;
+	int out_fd;
+	const char *dest;
+
+	if (in_fd < 0 || fstat(in_fd, &st) < 0 || st.st_size < sizeof(Elf64_Ehdr)) {
+		bb_perror_msg("cannot open module '%s'", in_file);
+		if (in_fd >= 0) close(in_fd);
+		return 1;
+	}
+
+	buf = xmalloc(st.st_size);
+	if (full_read(in_fd, buf, st.st_size) != st.st_size) {
+		bb_perror_msg("failed to read '%s'", in_file);
+		close(in_fd);
+		free(buf);
+		return 1;
+	}
+	close(in_fd);
+
+	if (!elf_init_ctx(&ctx, buf, st.st_size)) {
+		bb_error_msg("'%s' is not a valid 64-bit ELF kernel module", in_file);
+		free(buf);
+		return 1;
+	}
+
+	stripped = strip_module_sections(&ctx);
+	fprintf(stderr, "[+] Neutralized %d unneeded/debug section(s)\n", stripped);
+
+	dest = (out_file && out_file[0]) ? out_file : in_file;
+	out_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (out_fd < 0) {
+		bb_perror_msg("cannot write '%s'", dest);
+		free(buf);
+		return 1;
+	}
+	full_write(out_fd, buf, st.st_size);
+	close(out_fd);
+	free(buf);
+	fprintf(stderr, "[✓] SUCCESS: Module '%s' stripped.\n", dest);
+	return 0;
+}
+
+static int module_patch_file(const char *in_file, const char *out_file, const char *custom_vermagic,
+                            const char *boot_path, bool do_strip) {
+	int in_fd = open(in_file, O_RDONLY | O_CLOEXEC);
+	struct stat st;
+	uint8_t *buf;
+	struct elf_ctx ctx;
+	char target_magic[256] = {0};
+	char old_magic[256] = {0};
+	int out_fd;
+	int stripped;
+	const char *dest;
+
+	if (in_fd < 0 || fstat(in_fd, &st) < 0 || st.st_size < sizeof(Elf64_Ehdr)) {
+		bb_perror_msg("cannot open module '%s'", in_file);
+		if (in_fd >= 0) close(in_fd);
+		return 1;
+	}
+
+	buf = xmalloc(st.st_size + 16384);
+	if (full_read(in_fd, buf, st.st_size) != st.st_size) {
+		bb_perror_msg("failed to read '%s'", in_file);
+		close(in_fd);
+		free(buf);
+		return 1;
+	}
+	close(in_fd);
+
+	if (!elf_init_ctx(&ctx, buf, st.st_size)) {
+		bb_error_msg("'%s' is not a valid 64-bit ELF kernel module", in_file);
+		free(buf);
+		return 1;
+	}
+
+	if (custom_vermagic && custom_vermagic[0] != '\0') {
+		strncpy(target_magic, custom_vermagic, sizeof(target_magic) - 1);
+	} else if (boot_path) {
+		if (!extract_vermagic_from_path(boot_path, target_magic, sizeof(target_magic))) {
+			bb_error_msg("could not extract vermagic from boot/kernel '%s'", boot_path);
+			free(buf);
+			return 1;
+		}
+		fprintf(stderr, "[+] Autodetected vermagic from %s: \"%s\"\n", boot_path, target_magic);
+	} else {
+		if (!detect_running_vermagic(target_magic, sizeof(target_magic))) {
+			bb_error_msg("cannot determine target vermagic");
+			free(buf);
+			return 1;
+		}
+	}
+
+	if (elf_get_modinfo_entry(&ctx, "vermagic", old_magic, sizeof(old_magic))) {
+		fprintf(stderr, "[*] Original vermagic : \"%s\" (len=%zu)\n", old_magic, strlen(old_magic));
+	}
+	fprintf(stderr, "[*] Target vermagic   : \"%s\" (len=%zu)\n", target_magic, strlen(target_magic));
+
+	if (do_strip) {
+		stripped = strip_module_sections(&ctx);
+		fprintf(stderr, "[+] Neutralized / stripped %d unneeded/debug section(s)\n", stripped);
+	}
+
+	patch_vermagic_buf(&ctx, target_magic);
+	patch_module_relocations_and_cfi(&ctx);
+
+	dest = (out_file && out_file[0]) ? out_file : in_file;
+	out_fd = open(dest, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (out_fd < 0) {
+		bb_perror_msg("cannot write '%s'", dest);
+		free(buf);
+		return 1;
+	}
+	full_write(out_fd, buf, st.st_size);
+	close(out_fd);
+	free(buf);
+
+	fprintf(stderr, "[✓] SUCCESS: Module '%s' vermagic dynamically patched to \"%s\"!\n", dest, target_magic);
+	return 0;
+}
+
+static int module_load_file(const char *file, const char *args) {
+	int fd = open(file, O_RDONLY | O_CLOEXEC);
+	struct stat st;
+	uint8_t *buf;
+	struct elf_ctx ctx;
+	char target_magic[256];
+	long ret;
+	char msg[512];
+
+	if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < sizeof(Elf64_Ehdr)) {
+		bb_perror_msg("cannot open module '%s'", file);
+		if (fd >= 0) close(fd);
+		return 1;
+	}
+
+	buf = xmalloc(st.st_size + 16384);
+	if (full_read(fd, buf, st.st_size) != st.st_size) {
+		bb_perror_msg("failed to read '%s'", file);
+		close(fd);
+		free(buf);
+		return 1;
+	}
+	close(fd);
+
+	detect_running_vermagic(target_magic, sizeof(target_magic));
+	if (elf_init_ctx(&ctx, buf, st.st_size)) {
+		patch_vermagic_buf(&ctx, target_magic);
+		patch_module_relocations_and_cfi(&ctx);
+	}
+
+	fprintf(stderr, "[+] Calling SYS_init_module(size=%zu, args=\"%s\")...\n", (size_t)st.st_size, args ? args : "");
+	ret = syscall(SYS_init_module, buf, st.st_size, args ? args : "");
+	if (ret == 0) {
+		fprintf(stderr, "[✓] SUCCESS: Module '%s' loaded into kernel!\n", file);
+		snprintf(msg, sizeof(msg), "<6>magiskboot: Module '%s' loaded successfully with vermagic '%s'\n", file, target_magic);
+		log_kmsg_msg(msg);
+		free(buf);
+		return 0;
+	}
+
+	if (errno == EEXIST) {
+		fprintf(stderr, "[!] Module already resident in kernel.\n");
+		free(buf);
+		return 0;
+	}
+
+	if (errno == ENOKEY || errno == EKEYREJECTED) {
+		fprintf(stderr, "[-] ERROR: Kernel module signature enforcement is ACTIVE (CONFIG_MODULE_SIG_FORCE=y).\n");
+		fprintf(stderr, "[-] Run 'magiskboot de-enforce <boot.img>' to neutralize kernel signature enforcement.\n");
+	} else {
+		bb_perror_msg("init_module failed");
+	}
+	free(buf);
+	return 1;
+}
+
+static int module_finit_file(const char *file, const char *args) {
+	int fd = open(file, O_RDONLY | O_CLOEXEC);
+	long ret;
+	char msg[256];
+
+	if (fd < 0) {
+		bb_perror_msg("cannot open module '%s'", file);
+		return 1;
+	}
+
+	fprintf(stderr, "[+] Calling SYS_finit_module(fd=%d, args=\"%s\")...\n", fd, args ? args : "");
+	ret = syscall(SYS_finit_module, fd, args ? args : "", 0);
+	close(fd);
+
+	if (ret == 0) {
+		fprintf(stderr, "[✓] SUCCESS: Module '%s' loaded via SYS_finit_module!\n", file);
+		snprintf(msg, sizeof(msg), "<6>magiskboot: Module '%s' loaded via sys_finit_module\n", file);
+		log_kmsg_msg(msg);
+		return 0;
+	}
+
+	if (errno == EEXIST) {
+		fprintf(stderr, "[!] Module already resident in kernel.\n");
+		return 0;
+	}
+
+	fprintf(stderr, "[!] sys_finit_module returned %ld (errno=%d). Falling back to in-memory vermagic alignment...\n",
+	        ret, errno);
+	return module_load_file(file, args);
+}
+
+static int module_unload_name(const char *name) {
+	const char *n = (name && name[0]) ? name : "kroot";
+	long ret;
+	char msg[256];
+
+	fprintf(stderr, "[+] Unloading module '%s'...\n", n);
+	ret = syscall(SYS_delete_module, n, O_NONBLOCK);
+	if (ret != 0 && strcmp(n, "kroot") == 0) {
+		ret = syscall(SYS_delete_module, "compat_modern_kernel", O_NONBLOCK);
+	}
+
+	if (ret == 0) {
+		fprintf(stderr, "[✓] SUCCESS: Module '%s' unloaded.\n", n);
+		snprintf(msg, sizeof(msg), "<6>magiskboot: Module '%s' unloaded\n", n);
+		log_kmsg_msg(msg);
+		return 0;
+	}
+
+	bb_perror_msg("delete_module failed");
+	return 1;
+}
+
+static int magiskboot_patch_vermagic_op(int argc, char **argv) {
+	const char *filepath = NULL;
+	char target_magic[256] = {0};
+	const char *boot_img_path = NULL;
+	const char *outfile = NULL;
+	bool mode_strip = false;
+	bool mode_info = false;
+	bool mode_audit = false;
+	int i;
+
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--cfi") == 0 || strcmp(argv[i], "--non-cfi") == 0) {
+			/* handled portably */
+		} else if (strcmp(argv[i], "--boot") == 0 && i + 1 < argc) {
+			boot_img_path = argv[++i];
+		} else if (strcmp(argv[i], "--info") == 0 || strcmp(argv[i], "-i") == 0) {
+			mode_info = true;
+		} else if (strcmp(argv[i], "--audit") == 0 || strcmp(argv[i], "-a") == 0) {
+			mode_audit = true;
+		} else if (strcmp(argv[i], "--strip") == 0 || strcmp(argv[i], "-s") == 0) {
+			mode_strip = true;
+		} else if (argv[i][0] != '-') {
+			if (!filepath) {
+				filepath = argv[i];
+			} else if (!boot_img_path && target_magic[0] == '\0' && !strstr(argv[i], ".ko")) {
+				strncpy(target_magic, argv[i], sizeof(target_magic) - 1);
+			} else if (!outfile) {
+				outfile = argv[i];
+			}
+		}
+	}
+
+	if (!filepath) {
+		bb_error_msg("usage: magiskboot patch-vermagic <module.ko> [target_vermagic] [out.ko] [options]");
+		return 1;
+	}
+
+	if (mode_info) return module_info_file(filepath);
+	if (mode_audit) {
+		int fd = open(filepath, O_RDONLY | O_CLOEXEC);
+		struct stat st;
+		uint8_t *map;
+		struct elf_ctx ctx;
+		int res;
+		if (fd < 0 || fstat(fd, &st) < 0) { bb_perror_msg("cannot open '%s'", filepath); if (fd >= 0) close(fd); return 1; }
+		map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+		close(fd);
+		if (map == MAP_FAILED) return 1;
+		if (!elf_init_ctx(&ctx, map, st.st_size)) { munmap(map, st.st_size); return 1; }
+		res = audit_module_symbols(&ctx, NULL);
+		munmap(map, st.st_size);
+		return res;
+	}
+	if (mode_strip && target_magic[0] == '\0' && !boot_img_path) {
+		return module_strip_file(filepath, outfile);
+	}
+
+	return module_patch_file(filepath, outfile, (target_magic[0] != '\0') ? target_magic : NULL, boot_img_path, mode_strip);
+}
+
+static int magiskboot_module_op(int argc, char **argv) {
+	const char *action;
+	const char *file = NULL;
+	const char *arg1 = NULL;
+	const char *arg2 = NULL;
+	int idx = 2;
+
+	if (argc < 3) {
+		bb_show_usage();
+	}
+
+	action = argv[idx++];
+	if (idx < argc) file = argv[idx++];
+	if (idx < argc) arg1 = argv[idx++];
+	if (idx < argc) arg2 = argv[idx++];
+
+	if (strcmp(action, "info") == 0) {
+		if (!file) bb_show_usage();
+		return module_info_file(file);
+	}
+	if (strcmp(action, "check") == 0) {
+		if (!file) bb_show_usage();
+		return module_check_file(file);
+	}
+	if (strcmp(action, "audit") == 0) {
+		int fd;
+		struct stat st;
+		uint8_t *map;
+		struct elf_ctx ctx;
+		int res;
+		if (!file) bb_show_usage();
+		fd = open(file, O_RDONLY | O_CLOEXEC);
+		if (fd < 0 || fstat(fd, &st) < 0) { bb_perror_msg("cannot open '%s'", file); if (fd >= 0) close(fd); return 1; }
+		map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+		close(fd);
+		if (map == MAP_FAILED) return 1;
+		if (!elf_init_ctx(&ctx, map, st.st_size)) { munmap(map, st.st_size); return 1; }
+		res = audit_module_symbols(&ctx, arg1);
+		munmap(map, st.st_size);
+		return res;
+	}
+	if (strcmp(action, "strip") == 0) {
+		if (!file) bb_show_usage();
+		return module_strip_file(file, arg1);
+	}
+	if (strcmp(action, "patch") == 0 || strcmp(action, "patch-vermagic") == 0) {
+		if (!file) bb_show_usage();
+		return module_patch_file(file, arg2, arg1, NULL, false);
+	}
+	if (strcmp(action, "load") == 0) {
+		if (!file) file = "/data/adb/modules/kcompat/compat_modern_kernel.ko";
+		return module_load_file(file, arg1 ? arg1 : "");
+	}
+	if (strcmp(action, "finit") == 0) {
+		if (!file) file = "/data/adb/modules/kcompat/compat_modern_kernel.ko";
+		return module_finit_file(file, arg1 ? arg1 : "");
+	}
+	if (strcmp(action, "unload") == 0) {
+		return module_unload_name(file ? file : "kroot");
+	}
+
+	bb_error_msg("unknown module action '%s' (supported: info, check, audit, strip, patch, load, finit, unload)", action);
+	return 1;
+}
+
+/* =========================================================================
  * 6. BusyBox Applet Entrypoint
  * ========================================================================= */
 
@@ -3516,6 +4517,58 @@ int magiskboot_main(int argc, char **argv) {
 	if (strcmp(cmd, "patch-cfi") == 0) {
 		if (argc < 3) bb_show_usage();
 		return magiskboot_kernel_op(argv[2], "cfi", argc, argv);
+	}
+
+	if (strcmp(cmd, "module") == 0 || strcmp(cmd, "mod") == 0) {
+		if (argc < 3) bb_show_usage();
+		return magiskboot_module_op(argc, argv);
+	}
+
+	if (strcmp(cmd, "patch-vermagic") == 0 || strcmp(cmd, "vermagic") == 0) {
+		if (argc < 3) bb_show_usage();
+		return magiskboot_patch_vermagic_op(argc, argv);
+	}
+
+	if (strcmp(cmd, "mod-info") == 0) {
+		if (argc < 3) bb_show_usage();
+		return module_info_file(argv[2]);
+	}
+
+	if (strcmp(cmd, "mod-check") == 0) {
+		if (argc < 3) bb_show_usage();
+		return module_check_file(argv[2]);
+	}
+
+	if (strcmp(cmd, "mod-audit") == 0) {
+		int fd;
+		struct stat st;
+		uint8_t *map;
+		struct elf_ctx ctx;
+		int res;
+		if (argc < 3) bb_show_usage();
+		fd = open(argv[2], O_RDONLY | O_CLOEXEC);
+		if (fd < 0 || fstat(fd, &st) < 0) { bb_perror_msg("cannot open '%s'", argv[2]); if (fd >= 0) close(fd); return 1; }
+		map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+		close(fd);
+		if (map == MAP_FAILED) return 1;
+		if (!elf_init_ctx(&ctx, map, st.st_size)) { munmap(map, st.st_size); return 1; }
+		res = audit_module_symbols(&ctx, (argc >= 4) ? argv[3] : NULL);
+		munmap(map, st.st_size);
+		return res;
+	}
+
+	if (strcmp(cmd, "mod-strip") == 0) {
+		if (argc < 3) bb_show_usage();
+		return module_strip_file(argv[2], (argc >= 4) ? argv[3] : NULL);
+	}
+
+	if (strcmp(cmd, "mod-load") == 0) {
+		if (argc < 3) bb_show_usage();
+		return module_load_file(argv[2], (argc >= 4) ? argv[3] : "");
+	}
+
+	if (strcmp(cmd, "mod-unload") == 0) {
+		return module_unload_name((argc >= 3) ? argv[2] : "kroot");
 	}
 
 	if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
