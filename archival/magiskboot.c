@@ -31,6 +31,7 @@
 //usage:     "\n	split <boot.img>              Split boot image without decompressing ramdisk"
 //usage:     "\n	hexpatch <file> <from> <to>   In-place hex string patch"
 //usage:     "\n	cpio <ramdisk.cpio> [args...] CPIO operations (test, ls, extract, add, mkdir, rm)"
+//usage:     "\n	init <boot.img> <action> [...] In-place init tool (status, extract, replace, wrap, unwrap, rm)"
 //usage:     "\n	dtb <file> [test|print|patch] Device tree blob inspector and verity patcher"
 //usage:     "\n	decompress <in> [out]         Decompress kernel/ramdisk image"
 //usage:     "\n	cleanup                       Clean up unpacked temporary files"
@@ -867,13 +868,50 @@ static ssize_t copy_file_section(int out_fd, const char *src_path, uint32_t page
 	return written;
 }
 
+static int compress_file_format(const char *src, const char *dst, uint8_t fmt) {
+	int out_tfd;
+	const char *prog = "gzip";
+	const char *arg = "-9c";
+	pid_t pid;
+
+	if (fmt == BOOT_FMT_XZ || fmt == BOOT_FMT_LZMA) {
+		prog = "xz";
+		arg = "-c";
+	} else if (fmt == BOOT_FMT_LZ4 || fmt == BOOT_FMT_LZ4_LEGACY || fmt == BOOT_FMT_LZ4_LG) {
+		prog = "lz4";
+		arg = "-c";
+	} else if (fmt == BOOT_FMT_BZIP2) {
+		prog = "bzip2";
+		arg = "-c";
+	}
+
+	out_tfd = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (out_tfd < 0) return -1;
+
+	pid = fork();
+	if (pid == 0) {
+		dup2(out_tfd, STDOUT_FILENO);
+		close(out_tfd);
+		execlp(prog, prog, arg, src, (char *)NULL);
+		_exit(127);
+	}
+	close(out_tfd);
+	if (pid > 0) {
+		int status;
+		waitpid(pid, &status, 0);
+		if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return 0;
+	}
+	unlink(dst);
+	return -1;
+}
+
 static const char *prepare_ramdisk_for_repack(boot_img_t *boot, bool skip_comp, char *tmp_buf, size_t tmp_sz) {
 	if (access("ramdisk.cpio.gz", R_OK) == 0) return "ramdisk.cpio.gz";
 	if (access("ramdisk.cpio.xz", R_OK) == 0) return "ramdisk.cpio.xz";
 	if (access("ramdisk.cpio.lz4", R_OK) == 0) return "ramdisk.cpio.lz4";
 	if (access("ramdisk.cpio.bz2", R_OK) == 0) return "ramdisk.cpio.bz2";
 
-	if (!skip_comp && boot->r_fmt == BOOT_FMT_GZIP && access(RAMDISK_FILE, R_OK) == 0) {
+	if (!skip_comp && boot_fmt_compressed(boot->r_fmt) && access(RAMDISK_FILE, R_OK) == 0) {
 		int in_fd = open(RAMDISK_FILE, O_RDONLY);
 		if (in_fd >= 0) {
 			uint8_t magic[2];
@@ -883,27 +921,9 @@ static const char *prepare_ramdisk_for_repack(boot_img_t *boot, bool skip_comp, 
 				return RAMDISK_FILE;
 			}
 		}
-		snprintf(tmp_buf, tmp_sz, "/tmp/mb_ramdisk_%d.gz", (int)getpid());
-		{
-			int out_tfd = open(tmp_buf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-			if (out_tfd >= 0) {
-				pid_t pid = fork();
-				if (pid == 0) {
-					dup2(out_tfd, STDOUT_FILENO);
-					close(out_tfd);
-					execlp("gzip", "gzip", "-9c", RAMDISK_FILE, (char *)NULL);
-					_exit(127);
-				}
-				close(out_tfd);
-				if (pid > 0) {
-					int status;
-					waitpid(pid, &status, 0);
-					if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-						return tmp_buf;
-					}
-				}
-				unlink(tmp_buf);
-			}
+		snprintf(tmp_buf, tmp_sz, "/tmp/mb_ramdisk_%d.comp", (int)getpid());
+		if (compress_file_format(RAMDISK_FILE, tmp_buf, boot->r_fmt) == 0) {
+			return tmp_buf;
 		}
 	}
 	return RAMDISK_FILE;
@@ -1889,7 +1909,7 @@ static int magiskboot_decompress(const char *infile, const char *outfile) {
 	}
 
 	if (!outfile) {
-		char *dot = strrchr(infile, '.');
+		const char *dot = strrchr(infile, '.');
 		if (dot && dot != infile) {
 			default_out = xstrndup(infile, dot - infile);
 			outfile = default_out;
@@ -1919,6 +1939,508 @@ static int magiskboot_decompress(const char *infile, const char *outfile) {
 	}
 	free(default_out);
 	return (ret == 0) ? 0 : 1;
+}
+
+/* =========================================================================
+ * 9. Direct Boot Image Init Manipulation Engine
+ * ========================================================================= */
+
+static int magiskboot_init_op(const char *image, const char *action, const char *arg, const char *outfile) {
+	boot_img_t boot;
+	char tmp_cpio[PATH_MAX];
+	int c_fd;
+	cpio_node_t *head;
+	cpio_node_t *curr;
+	bool modified = false;
+	int ret = 0;
+
+	if (!image || !action) return 1;
+
+	/* Actions unwrap, restore, rm, remove do not take an input binary; any extra arg is outfile */
+	if (strcmp(action, "unwrap") == 0 || strcmp(action, "restore") == 0 ||
+	    strcmp(action, "rm") == 0 || strcmp(action, "remove") == 0) {
+		if (!outfile && arg) {
+			outfile = arg;
+			arg = NULL;
+		}
+	}
+
+	if (!boot_img_parse(&boot, image)) return 1;
+
+	if (!boot.ramdisk || boot.ramdisk_size == 0) {
+		bb_error_msg("no ramdisk found in '%s' (is this a vendor_boot or system-as-root image?)", image);
+		boot_img_free(&boot);
+		return 1;
+	}
+
+	snprintf(tmp_cpio, sizeof(tmp_cpio), "/tmp/mb_init_%d.cpio", (int)getpid());
+	c_fd = open(tmp_cpio, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+	if (c_fd < 0) {
+		bb_perror_msg("failed to create temporary cpio file");
+		boot_img_free(&boot);
+		return 1;
+	}
+
+	if (boot_fmt_compressed(boot.r_fmt)) {
+		bb_decompress_data(boot.r_fmt, boot.ramdisk, boot.ramdisk_size, c_fd);
+	} else {
+		full_write(c_fd, boot.ramdisk, boot.ramdisk_size);
+	}
+	close(c_fd);
+
+	head = cpio_read_all(tmp_cpio);
+	unlink(tmp_cpio);
+
+	if (!head) {
+		bb_error_msg("failed to parse ramdisk CPIO archive from '%s'", image);
+		boot_img_free(&boot);
+		return 1;
+	}
+
+	if (strcmp(action, "extract") == 0 || strcmp(action, "get") == 0 || strcmp(action, "dump") == 0) {
+		cpio_node_t *init_node = NULL;
+		const char *dest;
+		int ofd;
+
+		for (curr = head; curr; curr = curr->next) {
+			if (strcmp(curr->name, "init") == 0) {
+				init_node = curr;
+				break;
+			}
+		}
+		if (!init_node) {
+			for (curr = head; curr; curr = curr->next) {
+				if (strcmp(curr->name, "init.real") == 0) {
+					init_node = curr;
+					break;
+				}
+			}
+		}
+
+		if (!init_node) {
+			bb_error_msg("no /init entry found in ramdisk of '%s'", image);
+			cpio_free_all(head);
+			boot_img_free(&boot);
+			return 1;
+		}
+
+		dest = arg ? arg : "init";
+		ofd = open(dest, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+		if (ofd < 0) {
+			bb_perror_msg("failed to create '%s'", dest);
+			cpio_free_all(head);
+			boot_img_free(&boot);
+			return 1;
+		}
+
+		if (init_node->data && init_node->filesize > 0) {
+			full_write(ofd, init_node->data, init_node->filesize);
+		}
+		close(ofd);
+		chmod(dest, 0755);
+		fprintf(stderr, "[+] Extracted '%s' from '%s' -> '%s' (%u bytes)\n",
+		        init_node->name, image, dest, init_node->filesize);
+		cpio_free_all(head);
+		boot_img_free(&boot);
+		return 0;
+	} else if (strcmp(action, "status") == 0 || strcmp(action, "info") == 0 || strcmp(action, "test") == 0) {
+		bool has_init = false;
+		bool has_real = false;
+		uint32_t init_sz = 0;
+		uint32_t real_sz = 0;
+		int count = 0;
+
+		for (curr = head; curr; curr = curr->next) {
+			count++;
+			if (strcmp(curr->name, "init") == 0) {
+				has_init = true;
+				init_sz = curr->filesize;
+			} else if (strcmp(curr->name, "init.real") == 0) {
+				has_real = true;
+				real_sz = curr->filesize;
+			}
+		}
+		printf("Image:           %s\n", image);
+		printf("Ramdisk Entries: %d\n", count);
+		printf("Ramdisk Format:  %s\n", boot_fmt2name(boot.r_fmt));
+		printf("/init:           %s (%u bytes)\n", has_init ? "PRESENT" : "MISSING", init_sz);
+		if (has_real) {
+			printf("/init.real:      PRESENT (%u bytes, wrapped PID 1 chainloader)\n", real_sz);
+		} else {
+			printf("/init.real:      ABSENT (stock init)\n");
+		}
+		cpio_free_all(head);
+		boot_img_free(&boot);
+		return 0;
+	} else if (strcmp(action, "replace") == 0 || strcmp(action, "add") == 0 || strcmp(action, "set") == 0) {
+		int in_fd;
+		struct stat st;
+		void *new_data;
+		cpio_node_t *node = NULL;
+
+		if (!arg) {
+			bb_error_msg("missing new init binary argument");
+			cpio_free_all(head);
+			boot_img_free(&boot);
+			return 1;
+		}
+
+		in_fd = open(arg, O_RDONLY);
+		if (in_fd < 0 || fstat(in_fd, &st) < 0 || st.st_size <= 0) {
+			bb_perror_msg("cannot read new init binary '%s'", arg);
+			if (in_fd >= 0) close(in_fd);
+			cpio_free_all(head);
+			boot_img_free(&boot);
+			return 1;
+		}
+		new_data = xmalloc(st.st_size);
+		if (full_read(in_fd, new_data, st.st_size) != (ssize_t)st.st_size) {
+			free(new_data);
+			close(in_fd);
+			cpio_free_all(head);
+			boot_img_free(&boot);
+			return 1;
+		}
+		close(in_fd);
+
+		for (curr = head; curr; curr = curr->next) {
+			if (strcmp(curr->name, "init") == 0) {
+				node = curr;
+				break;
+			}
+		}
+		if (node) {
+			free(node->data);
+			node->data = new_data;
+			node->filesize = (uint32_t)st.st_size;
+			node->mode = 0100755;
+		} else {
+			node = xzalloc(sizeof(*node));
+			node->name = xstrdup("init");
+			node->mode = 0100755;
+			node->filesize = (uint32_t)st.st_size;
+			node->data = new_data;
+			node->nlink = 1;
+			node->next = head;
+			head = node;
+		}
+		fprintf(stderr, "[+] Injected new init '%s' (%zu bytes)\n", arg, (size_t)st.st_size);
+		modified = true;
+	} else if (strcmp(action, "wrap") == 0 || strcmp(action, "inject-wrapper") == 0) {
+		int in_fd;
+		struct stat st;
+		void *wrap_data;
+		cpio_node_t *init_node = NULL;
+		cpio_node_t *real_node = NULL;
+		cpio_node_t *new_init;
+
+		if (!arg) {
+			bb_error_msg("missing wrapper binary argument");
+			cpio_free_all(head);
+			boot_img_free(&boot);
+			return 1;
+		}
+
+		in_fd = open(arg, O_RDONLY);
+		if (in_fd < 0 || fstat(in_fd, &st) < 0 || st.st_size <= 0) {
+			bb_perror_msg("cannot read wrapper binary '%s'", arg);
+			if (in_fd >= 0) close(in_fd);
+			cpio_free_all(head);
+			boot_img_free(&boot);
+			return 1;
+		}
+		wrap_data = xmalloc(st.st_size);
+		if (full_read(in_fd, wrap_data, st.st_size) != (ssize_t)st.st_size) {
+			free(wrap_data);
+			close(in_fd);
+			cpio_free_all(head);
+			boot_img_free(&boot);
+			return 1;
+		}
+		close(in_fd);
+
+		for (curr = head; curr; curr = curr->next) {
+			if (strcmp(curr->name, "init") == 0) init_node = curr;
+			if (strcmp(curr->name, "init.real") == 0) real_node = curr;
+		}
+
+		if (init_node && !real_node) {
+			free(init_node->name);
+			init_node->name = xstrdup("init.real");
+			init_node->mode = 0100755;
+			fprintf(stderr, "[+] Preserved original /init -> /init.real (%u bytes)\n", init_node->filesize);
+		}
+
+		new_init = xzalloc(sizeof(*new_init));
+		new_init->name = xstrdup("init");
+		new_init->mode = 0100755;
+		new_init->filesize = (uint32_t)st.st_size;
+		new_init->data = wrap_data;
+		new_init->nlink = 1;
+		new_init->next = head;
+		head = new_init;
+
+		fprintf(stderr, "[+] Installed wrapper binary as /init (%zu bytes)\n", (size_t)st.st_size);
+		modified = true;
+	} else if (strcmp(action, "unwrap") == 0 || strcmp(action, "restore") == 0) {
+		cpio_node_t *prev = NULL;
+		cpio_node_t *init_prev = NULL;
+		cpio_node_t *init_node = NULL;
+		cpio_node_t *real_node = NULL;
+
+		for (curr = head; curr; curr = curr->next) {
+			if (strcmp(curr->name, "init") == 0) {
+				init_node = curr;
+				init_prev = prev;
+			} else if (strcmp(curr->name, "init.real") == 0) {
+				real_node = curr;
+			}
+			prev = curr;
+		}
+
+		if (!real_node) {
+			bb_error_msg("no /init.real found in '%s' to restore", image);
+			cpio_free_all(head);
+			boot_img_free(&boot);
+			return 1;
+		}
+
+		if (init_node) {
+			if (init_prev) init_prev->next = init_node->next;
+			else head = init_node->next;
+			free(init_node->name);
+			free(init_node->data);
+			free(init_node);
+		}
+
+		free(real_node->name);
+		real_node->name = xstrdup("init");
+		real_node->mode = 0100755;
+		fprintf(stderr, "[+] Restored /init.real -> /init (%u bytes)\n", real_node->filesize);
+		modified = true;
+	} else if (strcmp(action, "rm") == 0 || strcmp(action, "remove") == 0) {
+		cpio_node_t *prev = NULL;
+		for (curr = head; curr; curr = curr->next) {
+			if (strcmp(curr->name, "init") == 0) {
+				if (prev) prev->next = curr->next;
+				else head = curr->next;
+				free(curr->name);
+				free(curr->data);
+				free(curr);
+				fprintf(stderr, "[+] Removed /init from ramdisk\n");
+				modified = true;
+				break;
+			}
+			prev = curr;
+		}
+		if (!modified) {
+			bb_error_msg("no /init entry found to remove in '%s'", image);
+			cpio_free_all(head);
+			boot_img_free(&boot);
+			return 1;
+		}
+	} else {
+		bb_error_msg("unknown init action '%s' (supported: extract, replace, wrap, unwrap, rm, status)", action);
+		cpio_free_all(head);
+		boot_img_free(&boot);
+		return 1;
+	}
+
+	if (modified) {
+		char tmp_new_cpio[PATH_MAX];
+		char tmp_new_rd[PATH_MAX];
+		char final_target[PATH_MAX];
+		char tmp_out_boot[PATH_MAX + 64];
+		int out_fd;
+		uint32_t page_sz;
+		size_t hdr_pad;
+		uint32_t kernel_sz = 0;
+		uint32_t ramdisk_sz = 0;
+		uint32_t second_sz;
+		uint32_t extra_sz;
+		uint32_t recov_dtbo_sz;
+		uint32_t dtb_sz;
+		uint32_t bootconfig_sz;
+
+		snprintf(tmp_new_cpio, sizeof(tmp_new_cpio), "/tmp/mb_new_cpio_%d.cpio", (int)getpid());
+		cpio_write_all(tmp_new_cpio, head);
+		cpio_free_all(head);
+
+		if (boot_fmt_compressed(boot.r_fmt)) {
+			snprintf(tmp_new_rd, sizeof(tmp_new_rd), "/tmp/mb_new_rd_%d.comp", (int)getpid());
+			if (compress_file_format(tmp_new_cpio, tmp_new_rd, boot.r_fmt) != 0) {
+				bb_error_msg("failed to compress ramdisk (format: %s)", boot_fmt2name(boot.r_fmt));
+				unlink(tmp_new_cpio);
+				cpio_free_all(head);
+				boot_img_free(&boot);
+				return 1;
+			}
+			unlink(tmp_new_cpio);
+		} else {
+			strncpy(tmp_new_rd, tmp_new_cpio, sizeof(tmp_new_rd) - 1);
+			tmp_new_rd[sizeof(tmp_new_rd) - 1] = '\0';
+		}
+
+		if (outfile && outfile[0] != '\0') {
+			strncpy(final_target, outfile, sizeof(final_target) - 1);
+			final_target[sizeof(final_target) - 1] = '\0';
+		} else {
+			strncpy(final_target, image, sizeof(final_target) - 1);
+			final_target[sizeof(final_target) - 1] = '\0';
+		}
+
+		snprintf(tmp_out_boot, sizeof(tmp_out_boot), "%s.tmp.%d", final_target, (int)getpid());
+
+		out_fd = open(tmp_out_boot, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+		if (out_fd < 0) {
+			bb_perror_msg("failed to create output boot image '%s'", tmp_out_boot);
+			unlink(tmp_new_rd);
+			boot_img_free(&boot);
+			return 1;
+		}
+
+		page_sz = dyn_hdr_page_size(&boot.hdr);
+		hdr_pad = align_to(boot.hdr.raw_sz, page_sz);
+		lseek(out_fd, hdr_pad, SEEK_SET);
+
+		/* 1. Write kernel section */
+		if (!dyn_hdr_is_vendor(&boot.hdr) && boot.kernel && boot.kernel_size > 0) {
+			size_t rem;
+			kernel_sz = (uint32_t)boot.kernel_size;
+			full_write(out_fd, boot.kernel, kernel_sz);
+			if (boot.kernel_dtb && boot.kernel_dtb_size > 0) {
+				full_write(out_fd, boot.kernel_dtb, boot.kernel_dtb_size);
+				kernel_sz += (uint32_t)boot.kernel_dtb_size;
+			}
+			rem = kernel_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+			*dyn_hdr_kernel_size(&boot.hdr) = kernel_sz;
+		}
+
+		/* 2. Write new ramdisk */
+		copy_file_section(out_fd, tmp_new_rd, page_sz, &ramdisk_sz);
+		*dyn_hdr_ramdisk_size(&boot.hdr) = ramdisk_sz;
+		unlink(tmp_new_rd);
+
+		/* 3. Write remaining sections from memory */
+		second_sz = (uint32_t)boot.second_size;
+		if (boot.second && second_sz > 0) {
+			size_t rem;
+			full_write(out_fd, boot.second, second_sz);
+			rem = second_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		}
+
+		extra_sz = (uint32_t)boot.extra_size;
+		if (boot.extra && extra_sz > 0) {
+			size_t rem;
+			full_write(out_fd, boot.extra, extra_sz);
+			rem = extra_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		}
+
+		recov_dtbo_sz = (uint32_t)boot.recovery_dtbo_size;
+		if (boot.recovery_dtbo && recov_dtbo_sz > 0) {
+			size_t rem;
+			full_write(out_fd, boot.recovery_dtbo, recov_dtbo_sz);
+			rem = recov_dtbo_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		}
+
+		dtb_sz = (uint32_t)boot.dtb_size;
+		if (boot.dtb && dtb_sz > 0) {
+			size_t rem;
+			full_write(out_fd, boot.dtb, dtb_sz);
+			rem = dtb_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		}
+
+		bootconfig_sz = (uint32_t)boot.bootconfig_size;
+		if (boot.bootconfig && bootconfig_sz > 0) {
+			size_t rem;
+			full_write(out_fd, boot.bootconfig, bootconfig_sz);
+			rem = bootconfig_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		}
+
+		/* 4. Recalculate SHA ID */
+		dyn_hdr_recalc_id(&boot.hdr, out_fd, hdr_pad, page_sz,
+		                  kernel_sz, ramdisk_sz, second_sz, extra_sz,
+		                  recov_dtbo_sz, dtb_sz);
+
+		/* 5. Handle AVB footer */
+		if ((boot.flags & BOOT_FLAG_AVB) && boot.avb_footer) {
+			uint64_t orig_vbmeta_off = __builtin_bswap64(boot.avb_footer->vbmeta_offset);
+			uint64_t orig_vbmeta_sz = __builtin_bswap64(boot.avb_footer->vbmeta_size);
+			if (orig_vbmeta_sz > 0 && orig_vbmeta_off + orig_vbmeta_sz <= boot.map_sz) {
+				struct avb_footer new_footer;
+				size_t rem;
+				off_t aosp_img_size = lseek(out_fd, 0, SEEK_CUR);
+				off_t new_vbmeta_off;
+
+				rem = (size_t)aosp_img_size % 4096;
+				if (rem > 0) {
+					static const uint8_t zeros[4096] = {0};
+					full_write(out_fd, zeros, 4096 - rem);
+				}
+				new_vbmeta_off = lseek(out_fd, 0, SEEK_CUR);
+				full_write(out_fd, (const uint8_t *)boot.map_ptr + orig_vbmeta_off, orig_vbmeta_sz);
+				rem = (size_t)orig_vbmeta_sz % 4096;
+				if (rem > 0) {
+					static const uint8_t zeros[4096] = {0};
+					full_write(out_fd, zeros, 4096 - rem);
+				}
+				memcpy(&new_footer, boot.avb_footer, sizeof(new_footer));
+				new_footer.original_image_size = __builtin_bswap64((uint64_t)aosp_img_size);
+				new_footer.vbmeta_offset = __builtin_bswap64((uint64_t)new_vbmeta_off);
+				new_footer.vbmeta_size = boot.avb_footer->vbmeta_size;
+				full_write(out_fd, &new_footer, sizeof(new_footer));
+			}
+		}
+
+		/* 6. Write finalized header at offset 0 */
+		lseek(out_fd, 0, SEEK_SET);
+		full_write(out_fd, boot.hdr.raw, boot.hdr.raw_sz);
+
+		if (hdr_pad > boot.hdr.raw_sz) {
+			static const uint8_t zeros[4096] = {0};
+			full_write(out_fd, zeros, hdr_pad - boot.hdr.raw_sz);
+		}
+
+		close(out_fd);
+		boot_img_free(&boot);
+
+		if (rename(tmp_out_boot, final_target) != 0) {
+			bb_perror_msg("failed to update '%s'", final_target);
+			unlink(tmp_out_boot);
+			return 1;
+		}
+
+		fprintf(stderr, "[+] Successfully updated boot image init -> '%s'\n", final_target);
+		return 0;
+	}
+
+	cpio_free_all(head);
+	boot_img_free(&boot);
+	return ret;
 }
 
 /* =========================================================================
@@ -2027,6 +2549,21 @@ int magiskboot_main(int argc, char **argv) {
 
 	if (strcmp(cmd, "cpio") == 0) {
 		return magiskboot_cpio(argc, argv);
+	}
+
+	if (strcmp(cmd, "init") == 0) {
+		const char *img;
+		const char *act;
+		const char *arg1 = NULL;
+		const char *arg2 = NULL;
+		int idx = 2;
+
+		if (argc < 4) bb_show_usage();
+		img = argv[idx++];
+		act = argv[idx++];
+		if (idx < argc) arg1 = argv[idx++];
+		if (idx < argc) arg2 = argv[idx++];
+		return magiskboot_init_op(img, act, arg1, arg2);
 	}
 
 	if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {
