@@ -32,6 +32,10 @@
 //usage:     "\n	hexpatch <file> <from> <to>   In-place hex string patch"
 //usage:     "\n	cpio <ramdisk.cpio> [args...] CPIO operations (test, ls, extract, add, mkdir, rm)"
 //usage:     "\n	init <boot.img> <action> [...] In-place init tool (status, extract, replace, wrap, unwrap, rm)"
+//usage:     "\n	kernel <img|rec> <act> [...]  Kernel tool (status, patch, sigenforce, cfi, de-enforce, permissive, rkp, hexpatch, cfi-hash)"
+//usage:     "\n	de-enforce <img|rec> [out]    Neutralize module signature enforcement & CFI in boot/kernel image"
+//usage:     "\n	patch-sigenforce <img|rec> [out] Neutralize kernel module signature enforcement (CONFIG_MODULE_SIG_FORCE)"
+//usage:     "\n	patch-cfi <img|rec> [out]     Neutralize Clang Control Flow Integrity (KCFI & Forward-Edge CFI)"
 //usage:     "\n	dtb <file> [test|print|patch] Device tree blob inspector and verity patcher"
 //usage:     "\n	decompress <in> [out]         Decompress kernel/ramdisk image"
 //usage:     "\n	cleanup                       Clean up unpacked temporary files"
@@ -1286,31 +1290,25 @@ static uint8_t parse_hex_nibble(char c) {
 	return 0;
 }
 
-static int magiskboot_hexpatch(const char *file, const char *from_hex, const char *to_hex) {
-	size_t from_len;
-	size_t to_len;
-	size_t pat_sz;
-	size_t patch_sz;
-	uint8_t *pat;
-	uint8_t *patch;
-	int fd;
-	struct stat st;
-	uint8_t *buf;
+static bool hexpatch_buffer(uint8_t *buf, size_t size, const char *from_hex, const char *to_hex) {
+	size_t from_len, to_len, pat_sz, patch_sz;
+	uint8_t *pat, *patch;
 	size_t count = 0;
-	size_t limit;
-	size_t i;
+	size_t limit, i;
 
-	if (!file || !from_hex || !to_hex) return 1;
+	if (!buf || !from_hex || !to_hex) return false;
 
 	from_len = strlen(from_hex);
 	to_len = strlen(to_hex);
 	if (from_len == 0 || (from_len % 2) != 0 || to_len == 0 || (to_len % 2) != 0) {
 		bb_error_msg("hex strings must have an even length");
-		return 1;
+		return false;
 	}
 
 	pat_sz = from_len / 2;
 	patch_sz = to_len / 2;
+	if (size < pat_sz) return false;
+
 	pat = xmalloc(pat_sz);
 	patch = xmalloc(patch_sz);
 
@@ -1321,18 +1319,38 @@ static int magiskboot_hexpatch(const char *file, const char *from_hex, const cha
 		patch[i] = (parse_hex_nibble(to_hex[i * 2]) << 4) | parse_hex_nibble(to_hex[i * 2 + 1]);
 	}
 
+	limit = size - pat_sz;
+	for (i = 0; i <= limit; ++i) {
+		if (buf[i] == pat[0] && memcmp(buf + i, pat, pat_sz) == 0) {
+			size_t replace_len = (patch_sz < pat_sz) ? patch_sz : pat_sz;
+			memcpy(buf + i, patch, replace_len);
+			fprintf(stderr, "[+] Hex patch @ 0x%08zX [%s] -> [%s]\n", i, from_hex, to_hex);
+			count++;
+			i += pat_sz - 1;
+		}
+	}
+
+	free(pat);
+	free(patch);
+	return (count > 0);
+}
+
+static int magiskboot_hexpatch(const char *file, const char *from_hex, const char *to_hex) {
+	int fd;
+	struct stat st;
+	uint8_t *buf;
+	bool ok;
+
+	if (!file || !from_hex || !to_hex) return 1;
+
 	fd = open(file, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		bb_perror_msg("failed to open '%s'", file);
-		free(pat);
-		free(patch);
 		return 1;
 	}
 
-	if (fstat(fd, &st) < 0 || st.st_size < (off_t)pat_sz) {
+	if (fstat(fd, &st) < 0 || st.st_size <= 0) {
 		close(fd);
-		free(pat);
-		free(patch);
 		return 1;
 	}
 
@@ -1340,29 +1358,16 @@ static int magiskboot_hexpatch(const char *file, const char *from_hex, const cha
 	if (buf == MAP_FAILED) {
 		bb_perror_msg("mmap failed");
 		close(fd);
-		free(pat);
-		free(patch);
 		return 1;
 	}
 
-	limit = (size_t)st.st_size - pat_sz;
-	for (i = 0; i <= limit; ++i) {
-		if (buf[i] == pat[0] && memcmp(buf + i, pat, pat_sz) == 0) {
-			size_t replace_len = (patch_sz < pat_sz) ? patch_sz : pat_sz;
-			memcpy(buf + i, patch, replace_len);
-			fprintf(stderr, "Patch @ 0x%08zX [%s] -> [%s]\n", i, from_hex, to_hex);
-			count++;
-			i += pat_sz - 1;
-		}
-	}
+	ok = hexpatch_buffer(buf, st.st_size, from_hex, to_hex);
 
 	msync(buf, st.st_size, MS_SYNC);
 	munmap(buf, st.st_size);
 	close(fd);
-	free(pat);
-	free(patch);
 
-	return (count > 0) ? 0 : 1;
+	return ok ? 0 : 1;
 }
 
 /* =========================================================================
@@ -2444,6 +2449,933 @@ static int magiskboot_init_op(const char *image, const char *action, const char 
 }
 
 /* =========================================================================
+ * 10. Direct Kernel Security & Manipulation Engine
+ * ========================================================================= */
+
+static inline uint32_t arm64_read_u32(const uint8_t *buf, size_t off) {
+	return (uint32_t)buf[off] |
+	       ((uint32_t)buf[off + 1] << 8) |
+	       ((uint32_t)buf[off + 2] << 16) |
+	       ((uint32_t)buf[off + 3] << 24);
+}
+
+static inline void arm64_write_u32(uint8_t *buf, size_t off, uint32_t val) {
+	buf[off]     = (uint8_t)(val & 0xff);
+	buf[off + 1] = (uint8_t)((val >> 8) & 0xff);
+	buf[off + 2] = (uint8_t)((val >> 16) & 0xff);
+	buf[off + 3] = (uint8_t)((val >> 24) & 0xff);
+}
+
+static bool arm64_decode_adrp(uint32_t insn, uint64_t pc, int *rd, uint64_t *page_addr) {
+	int64_t immlo;
+	int64_t immhi;
+	int64_t imm;
+
+	if ((insn & ARM64_ADRP_MASK) != ARM64_ADRP_VAL)
+		return false;
+
+	if (rd) *rd = (int)(insn & 0x1fU);
+
+	immlo = (int64_t)((insn >> 29) & 0x3U);
+	immhi = (int64_t)((insn >> 5) & 0x7ffffU);
+	imm = (immhi << 2) | immlo;
+	if (imm & (1LL << 20)) imm -= (1LL << 21);
+
+	if (page_addr) {
+		*page_addr = (pc & ~0xfffULL) + (uint64_t)(imm << 12);
+	}
+	return true;
+}
+
+static bool arm64_decode_mov_wide(uint32_t insn, int *rd, uint16_t *imm16, int *shift, int *opc) {
+	if ((insn & 0x1f800000U) != 0x12800000U)
+		return false;
+
+	if (rd) *rd = (int)(insn & 0x1fU);
+	if (imm16) *imm16 = (uint16_t)((insn >> 5) & 0xffffU);
+	if (shift) *shift = (int)(((insn >> 21) & 0x3U) * 16);
+	if (opc) *opc = (int)((insn >> 29) & 0x3U);
+	return true;
+}
+
+static bool arm64_decode_add_sub_imm(uint32_t insn, int *rd, int *rn, uint32_t *imm, bool *is_sub) {
+	uint32_t val;
+	if ((insn & 0x1f000000U) != 0x11000000U)
+		return false;
+
+	if (rd) *rd = (int)(insn & 0x1fU);
+	if (rn) *rn = (int)((insn >> 5) & 0x1fU);
+	if (is_sub) *is_sub = ((insn & (1U << 30)) != 0);
+
+	val = (insn >> 10) & 0xfffU;
+	if (insn & (1U << 22)) val <<= 12;
+	if (imm) *imm = val;
+	return true;
+}
+
+static bool patch_sigenforce_buf(uint8_t *buf, size_t size, int *out_checks, int *out_setters) {
+	size_t sig_enforce_offset = (size_t)-1;
+	int patched_checks = 0;
+	int neutralized_setters = 0;
+	size_t limit;
+	size_t i, j, k;
+	uint8_t old_val;
+	uint64_t target_page;
+	uint32_t target_off;
+
+	if (!buf || size < 64) return false;
+
+	limit = size - 16;
+	for (i = 0; i < limit; i += 4) {
+		uint32_t inst3 = arm64_read_u32(buf, i + 12);
+		int mov_rd, mov_shift, mov_opc;
+		uint16_t mov_imm;
+		bool is_errno_mov = false;
+
+		if (arm64_decode_mov_wide(inst3, &mov_rd, &mov_imm, &mov_shift, &mov_opc) &&
+		    mov_opc == 0 && mov_shift == 0) {
+			if (mov_imm == 125 || mov_imm == 128) is_errno_mov = true;
+		}
+		if (!is_errno_mov && (inst3 & 0x7fffffe0U) == 0x12800fa0U) {
+			is_errno_mov = true;
+		}
+		if (!is_errno_mov) continue;
+
+		{
+			uint32_t inst2 = arm64_read_u32(buf, i + 8);
+			int cbz_reg;
+			uint32_t inst1;
+			int ldr_rt, ldr_rn;
+			uint32_t inst0;
+			int adrp_rd;
+			uint64_t page_addr;
+			size_t target_addr;
+
+			if ((inst2 & ARM64_CBZ_MASK) != ARM64_CBZ_VAL) continue;
+			cbz_reg = (int)(inst2 & 0x1fU);
+
+			inst1 = arm64_read_u32(buf, i + 4);
+			if ((inst1 & ARM64_LDRB_IMM_MASK) != ARM64_LDRB_IMM_VAL) continue;
+			ldr_rt = (int)(inst1 & 0x1fU);
+			ldr_rn = (int)((inst1 >> 5) & 0x1fU);
+			if (ldr_rt != cbz_reg) continue;
+
+			inst0 = arm64_read_u32(buf, i);
+			if (!arm64_decode_adrp(inst0, (uint64_t)i, &adrp_rd, &page_addr) || adrp_rd != ldr_rn)
+				continue;
+
+			target_addr = (size_t)(page_addr + (((inst1 >> 10) & 0xfffU)));
+			if (target_addr < size) {
+				uint32_t mov_wzr = ARM64_MOV_W0_WZR_OPCODE | (uint32_t)cbz_reg;
+				sig_enforce_offset = target_addr;
+				arm64_write_u32(buf, i + 4, mov_wzr);
+				fprintf(stderr, "[+] Found inlined module_sig_check @ 0x%08zX (sig_enforce @ 0x%08zX)\n", i, target_addr);
+				fprintf(stderr, "[+] Patched check @ 0x%08zX to MOV w%d, wzr (0x%08X)\n", i + 4, cbz_reg, mov_wzr);
+				patched_checks++;
+				break;
+			}
+		}
+	}
+
+	if (sig_enforce_offset == (size_t)-1) {
+		for (i = 0; i + 20 <= size; i++) {
+			if (memcmp(buf + i, "module.sig_enforce=1", 20) == 0) {
+				buf[i + 19] = '0';
+				fprintf(stderr, "[+] Patched 'module.sig_enforce=1' -> '0' @ 0x%08zX\n", i);
+				patched_checks++;
+			}
+		}
+		if (out_checks) *out_checks = patched_checks;
+		if (out_setters) *out_setters = 0;
+		return (patched_checks > 0);
+	}
+
+	old_val = buf[sig_enforce_offset];
+	buf[sig_enforce_offset] = 0x00;
+	fprintf(stderr, "[+] Cleared sig_enforce variable in .data: 0x%02X -> 0x00\n", old_val);
+
+	target_page = (uint64_t)(sig_enforce_offset & ~0xfffULL);
+	target_off = (uint32_t)(sig_enforce_offset & 0xfffULL);
+
+	for (i = 0; i < limit; i += 4) {
+		uint32_t inst0 = arm64_read_u32(buf, i);
+		int adrp_rd;
+		uint64_t page_addr;
+
+		if (!arm64_decode_adrp(inst0, (uint64_t)i, &adrp_rd, &page_addr) || page_addr != target_page)
+			continue;
+
+		for (j = 1; j <= 4; j++) {
+			uint32_t inst1;
+			int str_rn;
+			uint32_t str_off;
+			int add_rd, add_rn;
+			uint32_t add_imm;
+			bool is_sub;
+
+			if (i + j * 4 >= size) break;
+			inst1 = arm64_read_u32(buf, i + j * 4);
+
+			if ((inst1 & ARM64_STRB_IMM_MASK) == ARM64_STRB_IMM_VAL) {
+				str_rn = (int)((inst1 >> 5) & 0x1fU);
+				str_off = (inst1 >> 10) & 0xfffU;
+				if (str_rn == adrp_rd && str_off == target_off) {
+					arm64_write_u32(buf, i + j * 4, ARM64_NOP_OPCODE);
+					fprintf(stderr, "[+] Neutralized runtime setter (STRB) @ 0x%08zX -> NOP\n", i + j * 4);
+					neutralized_setters++;
+				}
+			}
+
+			if (arm64_decode_add_sub_imm(inst1, &add_rd, &add_rn, &add_imm, &is_sub) &&
+			    !is_sub && add_rn == adrp_rd && add_imm == target_off) {
+				for (k = j + 1; k <= j + 3; k++) {
+					uint32_t inst2;
+					int s2_rn;
+					uint32_t s2_off;
+					if (i + k * 4 >= size) break;
+					inst2 = arm64_read_u32(buf, i + k * 4);
+					if ((inst2 & ARM64_STRB_IMM_MASK) == ARM64_STRB_IMM_VAL) {
+						s2_rn = (int)((inst2 >> 5) & 0x1fU);
+						s2_off = (inst2 >> 10) & 0xfffU;
+						if (s2_rn == add_rd && s2_off == 0) {
+							arm64_write_u32(buf, i + k * 4, ARM64_NOP_OPCODE);
+							fprintf(stderr, "[+] Neutralized runtime setter (ADD+STRB) @ 0x%08zX -> NOP\n", i + k * 4);
+							neutralized_setters++;
+						}
+					}
+				}
+			}
+		}
+	}
+
+	for (i = 0; i + 20 <= size; i++) {
+		if (memcmp(buf + i, "module.sig_enforce=1", 20) == 0) {
+			buf[i + 19] = '0';
+			fprintf(stderr, "[+] Patched 'module.sig_enforce=1' -> '0' @ 0x%08zX\n", i);
+		}
+	}
+
+	if (out_checks) *out_checks = patched_checks;
+	if (out_setters) *out_setters = neutralized_setters;
+	return true;
+}
+
+static bool patch_cfi_buf(uint8_t *buf, size_t size, int *out_kcfi, int *out_legacy) {
+	int kcfi_count = 0;
+	int legacy_count = 0;
+	size_t limit;
+	size_t i, j, p;
+
+	if (!buf || size < 32) return false;
+
+	/* Phase 1: KCFI Detection & Neutralization (Linux 6.1, 6.6, Mainline) */
+	limit = size - 16;
+	for (i = 0; i < limit; i += 4) {
+		uint32_t inst0 = arm64_read_u32(buf, i);
+		if (inst0 == ARM64_CMP_W0_1) {
+			uint32_t inst1 = arm64_read_u32(buf, i + 4);
+			uint32_t inst2 = arm64_read_u32(buf, i + 8);
+			uint32_t inst3 = arm64_read_u32(buf, i + 12);
+
+			if (inst1 == ARM64_B_EQ_40 && inst2 == ARM64_CMP_W0_2) {
+				if (inst3 == ARM64_B_TO_SKIP) {
+					fprintf(stderr, "[*] KCFI cfi_handler @ 0x%08zX already neutralized\n", i);
+					kcfi_count++;
+				} else if (inst3 == ARM64_B_EQ_12) {
+					arm64_write_u32(buf, i + 12, ARM64_B_TO_SKIP);
+					fprintf(stderr, "[+] Neutralized KCFI die branch @ 0x%08zX: B.EQ -> B +32 (skip faulting instruction)\n", i + 12);
+					kcfi_count++;
+				}
+			}
+		}
+	}
+
+	/* Phase 2: Legacy Forward-Edge CFI Detection & Neutralization (Linux 4.19, 5.10) */
+	for (j = 0; j < limit; j += 4) {
+		uint32_t inst_brk = arm64_read_u32(buf, j + 12);
+		if (inst_brk == ARM64_BRK_800 || inst_brk == ARM64_NOP_OPCODE) {
+			uint32_t inst_bl = arm64_read_u32(buf, j + 8);
+			uint32_t inst_mov = arm64_read_u32(buf, j + 4);
+
+			if ((inst_bl & ARM64_BL_MASK) == ARM64_BL_VAL && inst_mov == ARM64_MOV_X1_X19) {
+				bool is_cfi_context = false;
+				for (p = 1; p <= 8; p++) {
+					size_t pc_off = p * 4;
+					if (j >= pc_off) {
+						uint32_t prev = arm64_read_u32(buf, j - pc_off);
+						int rd;
+						uint64_t target_page;
+						if (arm64_decode_adrp(prev, (uint64_t)(j - pc_off), &rd, &target_page)) {
+							if (target_page < size) {
+								size_t chk_end = (target_page + 4096 < size) ? (target_page + 4096) : size;
+								size_t s;
+								for (s = target_page; s + 11 <= chk_end; s++) {
+									if (memcmp(buf + s, "CFI failure", 11) == 0 ||
+									    memcmp(buf + s, "cfi_failure", 11) == 0) {
+										is_cfi_context = true;
+										break;
+									}
+								}
+								if (is_cfi_context) break;
+							}
+						}
+					}
+				}
+
+				if (is_cfi_context) {
+					if (inst_brk == ARM64_NOP_OPCODE) {
+						fprintf(stderr, "[*] Legacy CFI BUG trap @ 0x%08zX already neutralized\n", j + 12);
+						legacy_count++;
+					} else {
+						arm64_write_u32(buf, j + 12, ARM64_NOP_OPCODE);
+						fprintf(stderr, "[+] Neutralized Legacy Forward-Edge CFI BUG trap @ 0x%08zX: BRK #0x800 -> NOP\n", j + 12);
+						legacy_count++;
+					}
+				}
+			}
+		}
+	}
+
+	if (out_kcfi) *out_kcfi = kcfi_count;
+	if (out_legacy) *out_legacy = legacy_count;
+	return (kcfi_count + legacy_count > 0);
+}
+
+static bool patch_selinux_permissive(uint8_t *buf, size_t size) {
+	bool modified = false;
+	size_t i;
+	static const char p1_from[] = "androidboot.selinux=enforcing";
+	static const char p1_to[]   = "androidboot.selinux=permissive";
+	static const char p2_from[] = "selinux_enforcing=1";
+	static const char p2_to[]   = "selinux_enforcing=0";
+
+	for (i = 0; i + sizeof(p1_from) - 1 <= size; i++) {
+		if (memcmp(buf + i, p1_from, sizeof(p1_from) - 1) == 0) {
+			memcpy(buf + i, p1_to, sizeof(p1_to) - 1);
+			buf[i + sizeof(p1_to) - 1] = '\0';
+			fprintf(stderr, "[+] Patched 'androidboot.selinux=enforcing' -> 'permissive' @ 0x%08zX\n", i);
+			modified = true;
+		}
+	}
+	for (i = 0; i + sizeof(p2_from) - 1 <= size; i++) {
+		if (memcmp(buf + i, p2_from, sizeof(p2_from) - 1) == 0) {
+			memcpy(buf + i, p2_to, sizeof(p2_to) - 1);
+			fprintf(stderr, "[+] Patched 'selinux_enforcing=1' -> '0' @ 0x%08zX\n", i);
+			modified = true;
+		}
+	}
+	return modified;
+}
+
+static bool patch_samsung_rkp(uint8_t *buf, size_t size) {
+	bool modified = false;
+	size_t i;
+	for (i = 0; i + 8 <= size; i++) {
+		if (memcmp(buf + i, "rkp_init", 8) == 0) {
+			memcpy(buf + i, "rkp_skip", 8);
+			fprintf(stderr, "[+] Patched Samsung RKP 'rkp_init' -> 'rkp_skip' @ 0x%08zX\n", i);
+			modified = true;
+		}
+	}
+	return modified;
+}
+
+static void scan_kcfi_hashes(const uint8_t *buf, size_t size) {
+	size_t count = 0;
+	size_t i, step;
+
+	if (!buf || size < 16) return;
+
+	printf("====================================================\n");
+	printf("  ARM64 KCFI Call Site & Type Hash Inspector\n");
+	printf("====================================================\n");
+
+	for (i = 0; i + 4 <= size; i += 4) {
+		uint32_t inst = arm64_read_u32(buf, i);
+		if ((inst & 0xffe0001fU) == 0xd4200000U) {
+			uint32_t imm16 = (inst >> 5) & 0xffffU;
+			if ((imm16 & 0x8000U) == 0x8000U) {
+				uint8_t target_reg = (uint8_t)(imm16 & 0x1fU);
+				uint8_t type_reg = (uint8_t)((imm16 >> 5) & 0x1fU);
+				uint16_t low_imm = 0, high_imm = 0;
+				bool has_low = false, has_high = false;
+				size_t scan_steps = (i / 4 < 16) ? (i / 4) : 16;
+
+				for (step = 1; step <= scan_steps; step++) {
+					uint32_t pinst = arm64_read_u32(buf, i - step * 4);
+					int mrd, mshift, mopc;
+					uint16_t mimm;
+					if (arm64_decode_mov_wide(pinst, &mrd, &mimm, &mshift, &mopc)) {
+						if ((uint8_t)mrd == type_reg && (mopc == 2 || mopc == 3)) {
+							if (mshift == 0) { low_imm = mimm; has_low = true; }
+							else if (mshift == 16) { high_imm = mimm; has_high = true; }
+						}
+					}
+					if (has_low && has_high) break;
+				}
+
+				if (has_low && has_high) {
+					uint32_t hash = ((uint32_t)high_imm << 16) | (uint32_t)low_imm;
+					printf("  [+] Call site @ 0x%08zX: KCFI hash 0x%08x (type=w%u, target=x%u)\n",
+					       i, hash, type_reg, target_reg);
+					count++;
+				}
+			}
+		}
+	}
+	printf("====================================================\n");
+	printf("[+] Total KCFI call sites discovered: %zu\n", count);
+}
+
+static void kernel_status_buf(const uint8_t *buf, size_t size, const char *name) {
+	const char *banner = NULL;
+	size_t i;
+	int kcfi_count = 0;
+	bool has_sig_check = false;
+	bool sig_neutralized = false;
+	bool selinux_permissive = false;
+	bool rkp_patched = false;
+
+	printf("====================================================\n");
+	printf("  Kernel Security & Image Status: %s\n", name);
+	printf("====================================================\n");
+	printf("Kernel Payload Size: %zu bytes (%.2f MB)\n", size, (double)size / (1024.0 * 1024.0));
+
+	if (size >= sizeof(struct arm64_image_header)) {
+		const struct arm64_image_header *hdr = (const struct arm64_image_header *)buf;
+		if (hdr->magic == ARM64_IMAGE_MAGIC) {
+			printf("Architecture:        ARM64 (magic 'ARM\\x64')\n");
+			printf("Text Offset:         0x%lx\n", (unsigned long)hdr->text_offset);
+			printf("Image Size:          0x%lx (%lu bytes)\n", (unsigned long)hdr->image_size, (unsigned long)hdr->image_size);
+			printf("Flags:               0x%lx\n", (unsigned long)hdr->flags);
+		}
+	}
+
+	for (i = 0; i + 14 <= size; i++) {
+		if (memcmp(buf + i, "Linux version ", 14) == 0) {
+			banner = (const char *)(buf + i);
+			break;
+		}
+	}
+	if (banner) {
+		char bstr[128];
+		size_t blen = 0;
+		while (blen < sizeof(bstr) - 1 && banner[blen] && banner[blen] != '\n' && banner[blen] != '\r') blen++;
+		memcpy(bstr, banner, blen);
+		bstr[blen] = '\0';
+		printf("Kernel Banner:       %s\n", bstr);
+	}
+
+	for (i = 0; i + 16 <= size; i += 4) {
+		uint32_t inst3 = arm64_read_u32(buf, i + 12);
+		if ((inst3 & 0x7fffffe0U) == 0x12800fa0U) {
+			uint32_t inst2 = arm64_read_u32(buf, i + 8);
+			if ((inst2 & ARM64_CBZ_MASK) == ARM64_CBZ_VAL) {
+				uint32_t inst1 = arm64_read_u32(buf, i + 4);
+				has_sig_check = true;
+				if ((inst1 & 0xffffffe0U) == ARM64_MOV_W0_WZR_OPCODE) {
+					sig_neutralized = true;
+				}
+				break;
+			}
+		}
+	}
+	if (has_sig_check) {
+		printf("Module Sig Enforce:  %s\n", sig_neutralized ? "NEUTRALIZED (MOV wzr)" : "ACTIVE (enforcing)");
+	} else {
+		printf("Module Sig Enforce:  NOT PRESENT / INACTIVE\n");
+	}
+
+	for (i = 0; i + 16 <= size; i += 4) {
+		uint32_t inst0 = arm64_read_u32(buf, i);
+		if (inst0 == ARM64_CMP_W0_1) {
+			uint32_t inst1 = arm64_read_u32(buf, i + 4);
+			uint32_t inst2 = arm64_read_u32(buf, i + 8);
+			uint32_t inst3 = arm64_read_u32(buf, i + 12);
+			if (inst1 == ARM64_B_EQ_40 && inst2 == ARM64_CMP_W0_2) {
+				if (inst3 == ARM64_B_TO_SKIP) kcfi_count++;
+			}
+		}
+	}
+	printf("KCFI Skip Status:    %s\n", (kcfi_count > 0) ? "NEUTRALIZED (B to skip)" : "STANDARD (or N/A)");
+
+	for (i = 0; i + 30 <= size; i++) {
+		if (memcmp(buf + i, "androidboot.selinux=permissive", 30) == 0) {
+			selinux_permissive = true;
+			break;
+		}
+	}
+	printf("SELinux Default:     %s\n", selinux_permissive ? "PERMISSIVE" : "ENFORCING");
+
+	for (i = 0; i + 8 <= size; i++) {
+		if (memcmp(buf + i, "rkp_skip", 8) == 0) {
+			rkp_patched = true;
+			break;
+		}
+	}
+	if (rkp_patched) {
+		printf("Samsung RKP:         NEUTRALIZED (rkp_skip)\n");
+	}
+	printf("====================================================\n");
+}
+
+static int magiskboot_kernel_op(const char *image, const char *action, int argc, char **argv) {
+	boot_img_t boot;
+	bool is_boot_img = false;
+	uint8_t *k_data = NULL;
+	size_t k_size = 0;
+	uint8_t k_fmt = BOOT_FMT_UNKNOWN;
+	char tmp_kdecomp[PATH_MAX];
+	int kd_fd = -1;
+	struct stat kd_st;
+	bool modified = false;
+	const char *outfile = NULL;
+	char final_target[PATH_MAX];
+	char tmp_out_boot[PATH_MAX + 64];
+
+	bool do_sigenforce = false;
+	bool do_cfi = false;
+	bool do_permissive = false;
+	bool do_rkp = false;
+	const char *hex_from = NULL;
+	const char *hex_to = NULL;
+	bool do_hash_scan = false;
+
+	if (!image || !action) return 1;
+
+	/* Parse subcommand & options */
+	if (strcmp(action, "status") == 0 || strcmp(action, "info") == 0) {
+		/* read-only status */
+	} else if (strcmp(action, "sigenforce") == 0 || strcmp(action, "patch-sigenforce") == 0 ||
+	           strcmp(action, "nosig") == 0) {
+		do_sigenforce = true;
+		if (argc >= 4 && strcmp(argv[1], "patch-sigenforce") == 0) {
+			if (argv[3][0] != '-') outfile = argv[3];
+		} else if (argc >= 5 && argv[4][0] != '-') {
+			outfile = argv[4];
+		}
+	} else if (strcmp(action, "cfi") == 0 || strcmp(action, "patch-cfi") == 0) {
+		do_cfi = true;
+		if (argc >= 4 && strcmp(argv[1], "patch-cfi") == 0) {
+			if (argv[3][0] != '-') outfile = argv[3];
+		} else if (argc >= 5 && argv[4][0] != '-') {
+			outfile = argv[4];
+		}
+	} else if (strcmp(action, "de-enforce") == 0) {
+		do_sigenforce = true;
+		do_cfi = true;
+		if (argc >= 4 && strcmp(argv[1], "de-enforce") == 0) {
+			if (argc >= 4 && argv[3][0] != '-') outfile = argv[3];
+		} else if (argc >= 5 && argv[4][0] != '-') {
+			outfile = argv[4];
+		}
+	} else if (strcmp(action, "permissive") == 0) {
+		do_permissive = true;
+		if (argc >= 5 && argv[4][0] != '-') outfile = argv[4];
+	} else if (strcmp(action, "disable-rkp") == 0 || strcmp(action, "rkp") == 0) {
+		do_rkp = true;
+		if (argc >= 5 && argv[4][0] != '-') outfile = argv[4];
+	} else if (strcmp(action, "cfi-hash") == 0) {
+		do_hash_scan = true;
+	} else if (strcmp(action, "hexpatch") == 0) {
+		if (argc < 6) {
+			bb_error_msg("usage: magiskboot kernel <image> hexpatch <from_hex> <to_hex> [out]");
+			return 1;
+		}
+		hex_from = argv[4];
+		hex_to = argv[5];
+		if (argc >= 7 && argv[6][0] != '-') outfile = argv[6];
+	} else if (strcmp(action, "patch") == 0 || strcmp(action, "patch-all") == 0) {
+		int i;
+		for (i = 4; i < argc; i++) {
+			if (strcmp(argv[i], "--sigenforce") == 0 || strcmp(argv[i], "--no-module-verify") == 0 ||
+			    strcmp(argv[i], "--de-enforce") == 0) {
+				do_sigenforce = true;
+			} else if (strcmp(argv[i], "--cfi") == 0) {
+				do_cfi = true;
+			} else if (strcmp(argv[i], "--permissive") == 0) {
+				do_permissive = true;
+			} else if (strcmp(argv[i], "--disable-rkp") == 0 || strcmp(argv[i], "--rkp") == 0) {
+				do_rkp = true;
+			} else if (strcmp(argv[i], "--all") == 0) {
+				do_sigenforce = true;
+				do_cfi = true;
+				do_permissive = true;
+				do_rkp = true;
+			} else if (strcmp(argv[i], "--hex") == 0) {
+				if (i + 2 < argc) {
+					hex_from = argv[i + 1];
+					hex_to = argv[i + 2];
+					i += 2;
+				} else {
+					bb_error_msg("--hex requires <from_hex> <to_hex>");
+					return 1;
+				}
+			} else if (argv[i][0] != '-' && !outfile) {
+				outfile = argv[i];
+			}
+		}
+		if (strcmp(action, "patch-all") == 0) {
+			do_sigenforce = true;
+			do_cfi = true;
+			do_permissive = true;
+			do_rkp = true;
+		}
+	} else {
+		bb_error_msg("unknown kernel action '%s' (supported: status, patch, sigenforce, cfi, de-enforce, permissive, rkp, hexpatch, cfi-hash)", action);
+		return 1;
+	}
+
+	/* Try opening image as Android Boot Image */
+	if (boot_img_parse(&boot, image)) {
+		is_boot_img = true;
+		if (!boot.kernel || boot.kernel_size == 0) {
+			bb_error_msg("no kernel section found in boot image '%s'", image);
+			boot_img_free(&boot);
+			return 1;
+		}
+		k_fmt = boot.k_fmt;
+		snprintf(tmp_kdecomp, sizeof(tmp_kdecomp), "/tmp/mb_kraw_%d.raw", (int)getpid());
+		kd_fd = open(tmp_kdecomp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+		if (kd_fd < 0) {
+			bb_perror_msg("failed to create temporary kernel file");
+			boot_img_free(&boot);
+			return 1;
+		}
+		if (boot_fmt_compressed(k_fmt)) {
+			bb_decompress_data(k_fmt, boot.kernel, boot.kernel_size, kd_fd);
+		} else {
+			full_write(kd_fd, boot.kernel, boot.kernel_size);
+		}
+	} else {
+		int in_fd = open(image, O_RDONLY | O_CLOEXEC);
+		struct stat st;
+		uint8_t *in_map;
+
+		if (in_fd < 0 || fstat(in_fd, &st) < 0 || st.st_size < 16) {
+			bb_perror_msg("cannot open kernel image '%s'", image);
+			if (in_fd >= 0) close(in_fd);
+			return 1;
+		}
+		in_map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, in_fd, 0);
+		close(in_fd);
+		if (in_map == MAP_FAILED) {
+			bb_perror_msg("mmap failed");
+			return 1;
+		}
+		k_fmt = boot_check_fmt(in_map, st.st_size);
+
+		snprintf(tmp_kdecomp, sizeof(tmp_kdecomp), "/tmp/mb_kraw_%d.raw", (int)getpid());
+		kd_fd = open(tmp_kdecomp, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+		if (kd_fd < 0) {
+			munmap(in_map, st.st_size);
+			bb_perror_msg("failed to create temporary file");
+			return 1;
+		}
+		if (boot_fmt_compressed(k_fmt)) {
+			bb_decompress_data(k_fmt, in_map, st.st_size, kd_fd);
+		} else {
+			full_write(kd_fd, in_map, st.st_size);
+		}
+		munmap(in_map, st.st_size);
+	}
+
+	if (fstat(kd_fd, &kd_st) < 0 || kd_st.st_size <= 0) {
+		bb_error_msg("failed to obtain kernel payload from '%s'", image);
+		close(kd_fd);
+		unlink(tmp_kdecomp);
+		if (is_boot_img) boot_img_free(&boot);
+		return 1;
+	}
+	k_size = (size_t)kd_st.st_size;
+
+	k_data = mmap(NULL, k_size, PROT_READ | PROT_WRITE, MAP_SHARED, kd_fd, 0);
+	if (k_data == MAP_FAILED) {
+		bb_perror_msg("mmap failed for kernel payload");
+		close(kd_fd);
+		unlink(tmp_kdecomp);
+		if (is_boot_img) boot_img_free(&boot);
+		return 1;
+	}
+
+	/* Read-only inspections */
+	if (strcmp(action, "status") == 0 || strcmp(action, "info") == 0) {
+		kernel_status_buf(k_data, k_size, image);
+		munmap(k_data, k_size);
+		close(kd_fd);
+		unlink(tmp_kdecomp);
+		if (is_boot_img) boot_img_free(&boot);
+		return 0;
+	}
+
+	if (do_hash_scan) {
+		scan_kcfi_hashes(k_data, k_size);
+		munmap(k_data, k_size);
+		close(kd_fd);
+		unlink(tmp_kdecomp);
+		if (is_boot_img) boot_img_free(&boot);
+		return 0;
+	}
+
+	/* Apply patches */
+	if (do_sigenforce) {
+		int chks = 0, sets = 0;
+		if (patch_sigenforce_buf(k_data, k_size, &chks, &sets)) {
+			fprintf(stderr, "[+] Signature enforcement neutralized (checks: %d, setters: %d)\n", chks, sets);
+			modified = true;
+		}
+	}
+
+	if (do_cfi) {
+		int kcfi = 0, leg = 0;
+		if (patch_cfi_buf(k_data, k_size, &kcfi, &leg)) {
+			fprintf(stderr, "[+] Control Flow Integrity neutralized (KCFI: %d, Legacy: %d)\n", kcfi, leg);
+			modified = true;
+		}
+	}
+
+	if (do_permissive) {
+		if (patch_selinux_permissive(k_data, k_size)) {
+			modified = true;
+		}
+	}
+
+	if (do_rkp) {
+		if (patch_samsung_rkp(k_data, k_size)) {
+			modified = true;
+		}
+	}
+
+	if (hex_from && hex_to) {
+		if (hexpatch_buffer(k_data, k_size, hex_from, hex_to)) {
+			modified = true;
+		}
+	}
+
+	msync(k_data, k_size, MS_SYNC);
+	munmap(k_data, k_size);
+	close(kd_fd);
+
+	if (!modified) {
+		fprintf(stderr, "[!] No kernel modifications were required or matched\n");
+		unlink(tmp_kdecomp);
+		if (is_boot_img) boot_img_free(&boot);
+		return 0;
+	}
+
+	/* Determine destination */
+	if (outfile && outfile[0] != '\0') {
+		strncpy(final_target, outfile, sizeof(final_target) - 1);
+		final_target[sizeof(final_target) - 1] = '\0';
+	} else {
+		strncpy(final_target, image, sizeof(final_target) - 1);
+		final_target[sizeof(final_target) - 1] = '\0';
+	}
+
+	snprintf(tmp_out_boot, sizeof(tmp_out_boot), "%s.tmp.%d", final_target, (int)getpid());
+
+	if (is_boot_img) {
+		char tmp_new_k[PATH_MAX];
+		const char *k_payload_path = tmp_kdecomp;
+		int out_fd;
+		uint32_t page_sz;
+		size_t hdr_pad;
+		uint32_t kernel_sz = 0;
+		uint32_t ramdisk_sz = 0;
+		uint32_t second_sz, extra_sz, recov_dtbo_sz, dtb_sz, bootconfig_sz;
+
+		if (boot_fmt_compressed(k_fmt)) {
+			snprintf(tmp_new_k, sizeof(tmp_new_k), "/tmp/mb_kcomp_%d.comp", (int)getpid());
+			if (compress_file_format(tmp_kdecomp, tmp_new_k, k_fmt) != 0) {
+				bb_error_msg("failed to recompress kernel payload");
+				unlink(tmp_kdecomp);
+				boot_img_free(&boot);
+				return 1;
+			}
+			k_payload_path = tmp_new_k;
+		}
+
+		out_fd = open(tmp_out_boot, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+		if (out_fd < 0) {
+			bb_perror_msg("failed to create '%s'", tmp_out_boot);
+			unlink(tmp_kdecomp);
+			if (k_payload_path == tmp_new_k) unlink(tmp_new_k);
+			boot_img_free(&boot);
+			return 1;
+		}
+
+		page_sz = dyn_hdr_page_size(&boot.hdr);
+		hdr_pad = align_to(boot.hdr.raw_sz, page_sz);
+		lseek(out_fd, hdr_pad, SEEK_SET);
+
+		/* 1. Write kernel section */
+		copy_file_section(out_fd, k_payload_path, page_sz, &kernel_sz);
+		if (boot.kernel_dtb && boot.kernel_dtb_size > 0) {
+			size_t rem;
+			full_write(out_fd, boot.kernel_dtb, boot.kernel_dtb_size);
+			kernel_sz += (uint32_t)boot.kernel_dtb_size;
+			rem = kernel_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		}
+		*dyn_hdr_kernel_size(&boot.hdr) = kernel_sz;
+		unlink(tmp_kdecomp);
+		if (k_payload_path == tmp_new_k) unlink(tmp_new_k);
+
+		/* 2. Write ramdisk section */
+		ramdisk_sz = (uint32_t)boot.ramdisk_size;
+		if (boot.ramdisk && ramdisk_sz > 0) {
+			size_t rem;
+			full_write(out_fd, boot.ramdisk, ramdisk_sz);
+			rem = ramdisk_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		}
+		*dyn_hdr_ramdisk_size(&boot.hdr) = ramdisk_sz;
+
+		/* 3. Write remaining sections from memory */
+		second_sz = (uint32_t)boot.second_size;
+		if (boot.second && second_sz > 0) {
+			size_t rem;
+			full_write(out_fd, boot.second, second_sz);
+			rem = second_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		}
+
+		extra_sz = (uint32_t)boot.extra_size;
+		if (boot.extra && extra_sz > 0) {
+			size_t rem;
+			full_write(out_fd, boot.extra, extra_sz);
+			rem = extra_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		}
+
+		recov_dtbo_sz = (uint32_t)boot.recovery_dtbo_size;
+		if (boot.recovery_dtbo && recov_dtbo_sz > 0) {
+			size_t rem;
+			full_write(out_fd, boot.recovery_dtbo, recov_dtbo_sz);
+			rem = recov_dtbo_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		}
+
+		dtb_sz = (uint32_t)boot.dtb_size;
+		if (boot.dtb && dtb_sz > 0) {
+			size_t rem;
+			full_write(out_fd, boot.dtb, dtb_sz);
+			rem = dtb_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		}
+
+		bootconfig_sz = (uint32_t)boot.bootconfig_size;
+		if (boot.bootconfig && bootconfig_sz > 0) {
+			size_t rem;
+			full_write(out_fd, boot.bootconfig, bootconfig_sz);
+			rem = bootconfig_sz % page_sz;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, page_sz - rem);
+			}
+		}
+
+		/* 4. Recalculate SHA ID */
+		dyn_hdr_recalc_id(&boot.hdr, out_fd, hdr_pad, page_sz,
+		                  kernel_sz, ramdisk_sz, second_sz, extra_sz,
+		                  recov_dtbo_sz, dtb_sz);
+
+		/* 5. Handle AVB footer */
+		if ((boot.flags & BOOT_FLAG_AVB) && boot.avb_footer) {
+			uint64_t orig_vbmeta_off = __builtin_bswap64(boot.avb_footer->vbmeta_offset);
+			uint64_t orig_vbmeta_sz = __builtin_bswap64(boot.avb_footer->vbmeta_size);
+			if (orig_vbmeta_sz > 0 && orig_vbmeta_off + orig_vbmeta_sz <= boot.map_sz) {
+				struct avb_footer new_footer;
+				size_t rem;
+				off_t aosp_img_size = lseek(out_fd, 0, SEEK_CUR);
+				off_t new_vbmeta_off;
+
+				rem = (size_t)aosp_img_size % 4096;
+				if (rem > 0) {
+					static const uint8_t zeros[4096] = {0};
+					full_write(out_fd, zeros, 4096 - rem);
+				}
+				new_vbmeta_off = lseek(out_fd, 0, SEEK_CUR);
+				full_write(out_fd, (const uint8_t *)boot.map_ptr + orig_vbmeta_off, orig_vbmeta_sz);
+				rem = (size_t)orig_vbmeta_sz % 4096;
+				if (rem > 0) {
+					static const uint8_t zeros[4096] = {0};
+					full_write(out_fd, zeros, 4096 - rem);
+				}
+				memcpy(&new_footer, boot.avb_footer, sizeof(new_footer));
+				new_footer.original_image_size = __builtin_bswap64((uint64_t)aosp_img_size);
+				new_footer.vbmeta_offset = __builtin_bswap64((uint64_t)new_vbmeta_off);
+				new_footer.vbmeta_size = boot.avb_footer->vbmeta_size;
+				full_write(out_fd, &new_footer, sizeof(new_footer));
+			}
+		}
+
+		/* 6. Write finalized header at offset 0 */
+		lseek(out_fd, 0, SEEK_SET);
+		full_write(out_fd, boot.hdr.raw, boot.hdr.raw_sz);
+		if (hdr_pad > boot.hdr.raw_sz) {
+			static const uint8_t zeros[4096] = {0};
+			full_write(out_fd, zeros, hdr_pad - boot.hdr.raw_sz);
+		}
+
+		close(out_fd);
+		boot_img_free(&boot);
+
+		if (rename(tmp_out_boot, final_target) != 0) {
+			bb_perror_msg("failed to update '%s'", final_target);
+			unlink(tmp_out_boot);
+			return 1;
+		}
+
+		fprintf(stderr, "[+] Successfully updated boot image kernel -> '%s'\n", final_target);
+		return 0;
+	} else {
+		/* Standalone kernel output */
+		if (boot_fmt_compressed(k_fmt)) {
+			if (compress_file_format(tmp_kdecomp, tmp_out_boot, k_fmt) != 0) {
+				bb_error_msg("failed to recompress kernel payload");
+				unlink(tmp_kdecomp);
+				return 1;
+			}
+			unlink(tmp_kdecomp);
+		} else {
+			if (rename(tmp_kdecomp, tmp_out_boot) != 0) {
+				bb_perror_msg("failed to create '%s'", tmp_out_boot);
+				unlink(tmp_kdecomp);
+				return 1;
+			}
+		}
+
+		if (rename(tmp_out_boot, final_target) != 0) {
+			bb_perror_msg("failed to update '%s'", final_target);
+			unlink(tmp_out_boot);
+			return 1;
+		}
+
+		fprintf(stderr, "[+] Successfully updated kernel -> '%s'\n", final_target);
+		return 0;
+	}
+}
+
+/* =========================================================================
  * 6. BusyBox Applet Entrypoint
  * ========================================================================= */
 
@@ -2564,6 +3496,26 @@ int magiskboot_main(int argc, char **argv) {
 		if (idx < argc) arg1 = argv[idx++];
 		if (idx < argc) arg2 = argv[idx++];
 		return magiskboot_init_op(img, act, arg1, arg2);
+	}
+
+	if (strcmp(cmd, "kernel") == 0) {
+		if (argc < 4) bb_show_usage();
+		return magiskboot_kernel_op(argv[2], argv[3], argc, argv);
+	}
+
+	if (strcmp(cmd, "de-enforce") == 0) {
+		if (argc < 3) bb_show_usage();
+		return magiskboot_kernel_op(argv[2], "de-enforce", argc, argv);
+	}
+
+	if (strcmp(cmd, "patch-sigenforce") == 0) {
+		if (argc < 3) bb_show_usage();
+		return magiskboot_kernel_op(argv[2], "sigenforce", argc, argv);
+	}
+
+	if (strcmp(cmd, "patch-cfi") == 0) {
+		if (argc < 3) bb_show_usage();
+		return magiskboot_kernel_op(argv[2], "cfi", argc, argv);
 	}
 
 	if (strcmp(cmd, "--help") == 0 || strcmp(cmd, "-h") == 0) {

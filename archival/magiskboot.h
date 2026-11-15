@@ -391,4 +391,41 @@ typedef struct {
     bool valid;
 } boot_img_t;
 
+/*
+ * ARM64 Linux Kernel Image Header and Opcode Constants
+ */
+#define ARM64_IMAGE_MAGIC        0x644d5241U /* "ARM\x64" */
+#define ARM64_NOP_OPCODE         0xd503201fU
+#define ARM64_MOV_W0_WZR_OPCODE  0x2a1f03e0U
+#define ARM64_B_TO_SKIP          0x14000008U
+#define ARM64_CMP_W0_1           0x7100041fU
+#define ARM64_B_EQ_40            0x54000140U
+#define ARM64_CMP_W0_2           0x7100081fU
+#define ARM64_B_EQ_12            0x54000060U
+#define ARM64_BRK_800            0xd4210000U
+#define ARM64_MOV_X1_X19         0xaa1303e1U
+#define ARM64_BL_MASK            0xfc000000U
+#define ARM64_BL_VAL             0x94000000U
+#define ARM64_ADRP_MASK          0x9f000000U
+#define ARM64_ADRP_VAL           0x90000000U
+#define ARM64_LDRB_IMM_MASK      0xffc00000U
+#define ARM64_LDRB_IMM_VAL       0x39400000U
+#define ARM64_CBZ_MASK           0x7f000000U
+#define ARM64_CBZ_VAL            0x34000000U
+#define ARM64_STRB_IMM_MASK      0xffc00000U
+#define ARM64_STRB_IMM_VAL       0x39000000U
+
+struct arm64_image_header {
+	uint32_t code0;
+	uint32_t code1;
+	uint64_t text_offset;
+	uint64_t image_size;
+	uint64_t flags;
+	uint64_t res2;
+	uint64_t res3;
+	uint64_t res4;
+	uint32_t magic;
+	uint32_t res5;
+};
+
 #endif /* MAGISKBOOT_H */
