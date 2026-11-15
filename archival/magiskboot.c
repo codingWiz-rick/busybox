@@ -24,8 +24,10 @@
 //usage:#define magiskboot_full_usage "\n\n"
 //usage:       "Android boot image tool\n"
 //usage:     "\nCommands:"
-//usage:     "\n	unpack [-h] <boot.img>        Unpack boot image into components"
+//usage:     "\n	unpack [-h|-k] <boot.img>     Unpack boot image components (-k: kernel only)"
 //usage:     "\n	repack [-n] <boot.img> [out]  Repack components into new boot image"
+//usage:     "\n	extract-kernel <img|rec> [out] Extract kernel from boot/recovery/TWRP image"
+//usage:     "\n	extract <image> <comp> [out]  Extract component (kernel, ramdisk, dtb, etc.)"
 //usage:     "\n	split <boot.img>              Split boot image without decompressing ramdisk"
 //usage:     "\n	hexpatch <file> <from> <to>   In-place hex string patch"
 //usage:     "\n	cpio <ramdisk.cpio> [args...] CPIO archive operations"
@@ -456,10 +458,11 @@ static int bb_decompress_data(uint8_t fmt, const void *in, size_t in_sz, int out
 	} else {
 		/* Uncompressed or unsupported: dump raw bytes */
 		if (full_write(out_fd, in, in_sz) != (ssize_t)in_sz) ret = -1;
+		else ret = 0;
 	}
 
 	close(in_fd);
-	return ret;
+	return (ret < 0) ? -1 : 0;
 }
 
 static int write_to_disk(const char *dest, const void *data, size_t size, uint8_t fmt, bool skip_decomp) {
@@ -661,9 +664,22 @@ static void boot_img_free(boot_img_t *img) {
  * 5. magiskboot unpack, repack, split, hexpatch commands
  * ========================================================================= */
 
-static int magiskboot_unpack(const char *image, bool skip_decomp, bool hdr_only) {
+static int magiskboot_unpack(const char *image, bool skip_decomp, bool hdr_only, bool kernel_only) {
 	boot_img_t boot;
 	if (!boot_img_parse(&boot, image)) return 1;
+
+	if (kernel_only) {
+		if (boot.kernel && boot.kernel_size > 0) {
+			write_to_disk(KERNEL_FILE, boot.kernel, boot.kernel_size, boot.k_fmt, skip_decomp);
+			fprintf(stderr, "[+] Extracted kernel -> [%s]\n", KERNEL_FILE);
+		}
+		if (boot.kernel_dtb && boot.kernel_dtb_size > 0) {
+			write_to_disk(KER_DTB_FILE, boot.kernel_dtb, boot.kernel_dtb_size, BOOT_FMT_UNKNOWN, true);
+			fprintf(stderr, "[+] Extracted kernel_dtb -> [%s]\n", KER_DTB_FILE);
+		}
+		boot_img_free(&boot);
+		return 0;
+	}
 
 	dyn_hdr_dump_props(&boot.hdr, HEADER_FILE);
 	if (hdr_only) {
@@ -833,7 +849,107 @@ static int magiskboot_repack(const char *src_img, const char *out_img, bool skip
 }
 
 static int magiskboot_split(const char *image) {
-	return magiskboot_unpack(image, true, false);
+	return magiskboot_unpack(image, true, false, false);
+}
+
+static int magiskboot_extract_kernel(const char *image, const char *outfile, bool skip_decomp) {
+	boot_img_t boot;
+	const char *dest;
+	int ret;
+
+	if (!image) return 1;
+	if (!boot_img_parse(&boot, image)) return 1;
+
+	if (!boot.kernel || boot.kernel_size == 0) {
+		bb_error_msg("no kernel found in '%s' (is this a vendor_boot image?)", image);
+		boot_img_free(&boot);
+		return 1;
+	}
+
+	dest = outfile ? outfile : KERNEL_FILE;
+	ret = write_to_disk(dest, boot.kernel, boot.kernel_size, boot.k_fmt, skip_decomp);
+	if (ret == 0) {
+		fprintf(stderr, "[+] Extracted kernel -> [%s] (%s, %u bytes)\n",
+				dest, boot_fmt2name(boot.k_fmt), boot.kernel_size);
+		if (boot.kernel_dtb && boot.kernel_dtb_size > 0) {
+			char *dtb_dest = outfile ? xasprintf("%s.dtb", outfile) : (char *)KER_DTB_FILE;
+			write_to_disk(dtb_dest, boot.kernel_dtb, boot.kernel_dtb_size, BOOT_FMT_UNKNOWN, true);
+			fprintf(stderr, "[+] Extracted embedded kernel DTB -> [%s] (%zu bytes)\n",
+					dtb_dest, boot.kernel_dtb_size);
+			if (outfile) free(dtb_dest);
+		}
+	} else {
+		bb_error_msg("failed to write kernel to '%s'", dest);
+	}
+
+	boot_img_free(&boot);
+	return (ret == 0) ? 0 : 1;
+}
+
+static int magiskboot_extract_component(const char *image, const char *comp, const char *outfile, bool skip_decomp) {
+	boot_img_t boot;
+	const char *dest;
+	const void *data = NULL;
+	size_t sz = 0;
+	uint8_t fmt = BOOT_FMT_UNKNOWN;
+	int ret;
+
+	if (!image || !comp) return 1;
+	if (!boot_img_parse(&boot, image)) return 1;
+
+	if (strcmp(comp, "kernel") == 0) {
+		data = boot.kernel;
+		sz = boot.kernel_size;
+		fmt = boot.k_fmt;
+		dest = outfile ? outfile : KERNEL_FILE;
+	} else if (strcmp(comp, "ramdisk") == 0) {
+		data = boot.ramdisk;
+		sz = boot.ramdisk_size;
+		fmt = boot.r_fmt;
+		dest = outfile ? outfile : RAMDISK_FILE;
+	} else if (strcmp(comp, "dtb") == 0) {
+		data = boot.dtb;
+		sz = boot.dtb_size;
+		dest = outfile ? outfile : DTB_FILE;
+	} else if (strcmp(comp, "kernel_dtb") == 0) {
+		data = boot.kernel_dtb;
+		sz = boot.kernel_dtb_size;
+		dest = outfile ? outfile : KER_DTB_FILE;
+	} else if (strcmp(comp, "recovery_dtbo") == 0) {
+		data = boot.recovery_dtbo;
+		sz = boot.recovery_dtbo_size;
+		dest = outfile ? outfile : RECV_DTBO_FILE;
+	} else if (strcmp(comp, "second") == 0) {
+		data = boot.second;
+		sz = boot.second_size;
+		dest = outfile ? outfile : SECOND_FILE;
+	} else if (strcmp(comp, "extra") == 0) {
+		data = boot.extra;
+		sz = boot.extra_size;
+		fmt = boot.e_fmt;
+		dest = outfile ? outfile : EXTRA_FILE;
+	} else if (strcmp(comp, "bootconfig") == 0) {
+		data = boot.bootconfig;
+		sz = boot.bootconfig_size;
+		dest = outfile ? outfile : BOOTCONFIG_FILE;
+	} else {
+		bb_error_msg("unknown component '%s' (supported: kernel, ramdisk, dtb, kernel_dtb, recovery_dtbo, second, extra, bootconfig)", comp);
+		boot_img_free(&boot);
+		return 1;
+	}
+
+	if (!data || sz == 0) {
+		bb_error_msg("component '%s' not present in '%s'", comp, image);
+		boot_img_free(&boot);
+		return 1;
+	}
+
+	ret = write_to_disk(dest, data, sz, fmt, skip_decomp);
+	if (ret == 0) {
+		fprintf(stderr, "[+] Component '%s' extracted to [%s] (%zu bytes)\n", comp, dest, sz);
+	}
+	boot_img_free(&boot);
+	return (ret == 0) ? 0 : 1;
 }
 
 static uint8_t parse_hex_nibble(char c) {
@@ -938,15 +1054,52 @@ int magiskboot_main(int argc, char **argv) {
 
 	if (strcmp(cmd, "unpack") == 0) {
 		bool hdr_only = false;
+		bool kernel_only = false;
 		const char *img;
+		int idx = 2;
 		if (argc < 3) bb_show_usage();
-		img = argv[2];
-		if (strcmp(argv[2], "-h") == 0) {
-			if (argc < 4) bb_show_usage();
-			hdr_only = true;
-			img = argv[3];
+		while (idx < argc && argv[idx][0] == '-') {
+			if (strcmp(argv[idx], "-h") == 0) hdr_only = true;
+			else if (strcmp(argv[idx], "-k") == 0) kernel_only = true;
+			idx++;
 		}
-		return magiskboot_unpack(img, false, hdr_only);
+		if (idx >= argc) bb_show_usage();
+		img = argv[idx];
+		return magiskboot_unpack(img, false, hdr_only, kernel_only);
+	}
+
+	if (strcmp(cmd, "extract-kernel") == 0) {
+		const char *img;
+		const char *out = NULL;
+		bool skip_decomp = false;
+		int idx = 2;
+		if (argc < 3) bb_show_usage();
+		if (strcmp(argv[idx], "-n") == 0) {
+			skip_decomp = true;
+			idx++;
+			if (idx >= argc) bb_show_usage();
+		}
+		img = argv[idx++];
+		if (idx < argc) out = argv[idx];
+		return magiskboot_extract_kernel(img, out, skip_decomp);
+	}
+
+	if (strcmp(cmd, "extract") == 0) {
+		const char *img;
+		const char *comp;
+		const char *out = NULL;
+		bool skip_decomp = false;
+		int idx = 2;
+		if (argc < 4) bb_show_usage();
+		if (strcmp(argv[idx], "-n") == 0) {
+			skip_decomp = true;
+			idx++;
+			if (idx >= argc) bb_show_usage();
+		}
+		img = argv[idx++];
+		comp = argv[idx++];
+		if (idx < argc) out = argv[idx];
+		return magiskboot_extract_component(img, comp, out, skip_decomp);
 	}
 
 	if (strcmp(cmd, "repack") == 0) {
