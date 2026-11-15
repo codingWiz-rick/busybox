@@ -433,6 +433,150 @@ struct arm64_image_header {
 };
 typedef struct arm64_image_header arm64_image_header_t;
 
+/*
+ * Kernel Module & ELF Structure Manipulation (BTF, Relocation, Vermagic, CFI)
+ */
+#include <elf.h>
+
+#define ARM64_RET_OPCODE         0xd65f03c0U
+#define ARM64_NOP_OPCODE         0xd503201fU
+
+#define DEFAULT_MODULE_PATH      "/lib/modules/kroot.ko"
+#define FALLBACK_MODULE_PATH     "/data/adb/modules/kroot/kroot.ko"
+#define LEGACY_FALLBACK_PATH     "/data/adb/modules/kcompat/compat_modern_kernel.ko"
+
+#define KROOT_BTF_MAGIC          0xeb9f
+#define KROOT_BTF_VERSION        1
+
+#define KROOT_BTF_KIND_UNKN      0
+#define KROOT_BTF_KIND_INT       1
+#define KROOT_BTF_KIND_PTR       2
+#define KROOT_BTF_KIND_ARRAY     3
+#define KROOT_BTF_KIND_STRUCT    4
+#define KROOT_BTF_KIND_UNION     5
+#define KROOT_BTF_KIND_ENUM      6
+#define KROOT_BTF_KIND_FWD       7
+#define KROOT_BTF_KIND_TYPEDEF   8
+#define KROOT_BTF_KIND_VOLATILE  9
+#define KROOT_BTF_KIND_CONST     10
+#define KROOT_BTF_KIND_RESTRICT  11
+#define KROOT_BTF_KIND_FUNC      12
+#define KROOT_BTF_KIND_FUNC_PROTO 13
+#define KROOT_BTF_KIND_VAR       14
+#define KROOT_BTF_KIND_DATASEC   15
+#define KROOT_BTF_KIND_FLOAT     16
+#define KROOT_BTF_KIND_DECL_TAG  17
+#define KROOT_BTF_KIND_TYPE_TAG  18
+#define KROOT_BTF_KIND_ENUM64    19
+
+struct kroot_btf_header {
+	uint16_t magic;
+	uint8_t  version;
+	uint8_t  flags;
+	uint32_t hdr_len;
+	uint32_t type_off;
+	uint32_t type_len;
+	uint32_t str_off;
+	uint32_t str_len;
+};
+
+struct kroot_btf_type {
+	uint32_t name_off;
+	uint32_t info;
+	union {
+		uint32_t size;
+		uint32_t type;
+	};
+};
+
+struct kroot_btf_member {
+	uint32_t name_off;
+	uint32_t type;
+	uint32_t offset;
+};
+
+struct kroot_btf_enum {
+	uint32_t name_off;
+	int32_t  val;
+};
+
+struct kroot_btf_enum64 {
+	uint32_t name_off;
+	uint32_t val_lo32;
+	uint32_t val_hi32;
+};
+
+struct kroot_btf_array {
+	uint32_t type;
+	uint32_t index_type;
+	uint32_t nelems;
+};
+
+struct kroot_btf_param {
+	uint32_t name_off;
+	uint32_t type;
+};
+
+struct kroot_btf_var {
+	uint32_t linkage;
+};
+
+struct kroot_btf_var_secinfo {
+	uint32_t type;
+	uint32_t offset;
+	uint32_t size;
+};
+
+struct module_layout_probe {
+	size_t mod_size;
+	size_t init_off;
+	size_t exit_off;
+	size_t core_layout_off;
+	size_t header_len;
+	bool   found;
+};
+
+#ifndef SYS_init_module
+# if defined(__aarch64__)
+#  define SYS_init_module 105
+# elif defined(__x86_64__)
+#  define SYS_init_module 175
+# else
+#  define SYS_init_module 105
+# endif
+#endif
+
+#ifndef SYS_delete_module
+# if defined(__aarch64__)
+#  define SYS_delete_module 106
+# elif defined(__x86_64__)
+#  define SYS_delete_module 176
+# else
+#  define SYS_delete_module 106
+# endif
+#endif
+
+#ifndef SYS_finit_module
+# if defined(__aarch64__)
+#  define SYS_finit_module 273
+# elif defined(__x86_64__)
+#  define SYS_finit_module 313
+# else
+#  define SYS_finit_module 273
+# endif
+#endif
+
+struct elf64_ctx {
+	uint8_t *buf;
+	size_t size;
+	size_t capacity;
+	bool is_allocated;
+	Elf64_Ehdr *ehdr;
+	Elf64_Shdr *shdrs;
+	size_t shnum;
+	const char *shstrtab;
+};
+
 
 /*
  * ZIP Archive & Flashable Package Generator
