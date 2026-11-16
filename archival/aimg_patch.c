@@ -1,12 +1,12 @@
 /* vi: set sw=4 ts=4: */
 /*
- * magiskboot_patch.c — Direct Kernel Security & Module Vermagic Patching Engine
+ * aimg_patch.c — Direct Kernel Security & Module Vermagic Patching Engine
  *
  * Implements direct kernel security neutralization (CONFIG_MODULE_SIG_FORCE,
  * KCFI, Forward-Edge CFI, SELinux permissive, Samsung RKP) and module vermagic /
- * ELF relocation patchers for magiskboot.
+ * ELF relocation patchers for aimg (Android Image Tool).
  *
- * Included directly into archival/magiskboot.c translation unit.
+ * Included directly into archival/aimg.c translation unit.
  * Conforms to Linux Kernel Coding Style & ISO C99/C11 standards.
  */
 
@@ -929,7 +929,7 @@ static int magiskboot_kernel_op(const char *image, const char *action, int argc,
 	case K_ACT_patch_sigenforce:
 	case K_ACT_nosig:
 		do_sigenforce = true;
-		if (argc >= 4 && strcmp(argv[1], "patch-sigenforce") == 0) {
+		if (argc >= 4 && (strcmp(argv[1], "patch-sigenforce") == 0 || strcmp(argv[1], "--patch-sigenforce") == 0)) {
 			if (argv[3][0] != '-') outfile = argv[3];
 		} else if (argc >= 5 && argv[4][0] != '-') {
 			outfile = argv[4];
@@ -938,7 +938,7 @@ static int magiskboot_kernel_op(const char *image, const char *action, int argc,
 	case K_ACT_cfi:
 	case K_ACT_patch_cfi:
 		do_cfi = true;
-		if (argc >= 4 && strcmp(argv[1], "patch-cfi") == 0) {
+		if (argc >= 4 && (strcmp(argv[1], "patch-cfi") == 0 || strcmp(argv[1], "--patch-cfi") == 0)) {
 			if (argv[3][0] != '-') outfile = argv[3];
 		} else if (argc >= 5 && argv[4][0] != '-') {
 			outfile = argv[4];
@@ -947,7 +947,7 @@ static int magiskboot_kernel_op(const char *image, const char *action, int argc,
 	case K_ACT_de_enforce:
 		do_sigenforce = true;
 		do_cfi = true;
-		if (argc >= 4 && strcmp(argv[1], "de-enforce") == 0) {
+		if (argc >= 4 && (strcmp(argv[1], "de-enforce") == 0 || strcmp(argv[1], "--de-enforce") == 0)) {
 			if (argc >= 4 && argv[3][0] != '-') outfile = argv[3];
 		} else if (argc >= 5 && argv[4][0] != '-') {
 			outfile = argv[4];
@@ -955,12 +955,20 @@ static int magiskboot_kernel_op(const char *image, const char *action, int argc,
 		break;
 	case K_ACT_permissive:
 		do_permissive = true;
-		if (argc >= 5 && argv[4][0] != '-') outfile = argv[4];
+		if (argc >= 4 && (strcmp(argv[1], "permissive") == 0 || strcmp(argv[1], "--permissive") == 0)) {
+			if (argc >= 4 && argv[3][0] != '-') outfile = argv[3];
+		} else if (argc >= 5 && argv[4][0] != '-') {
+			outfile = argv[4];
+		}
 		break;
 	case K_ACT_disable_rkp:
 	case K_ACT_rkp:
 		do_rkp = true;
-		if (argc >= 5 && argv[4][0] != '-') outfile = argv[4];
+		if (argc >= 4 && (strcmp(argv[1], "disable-rkp") == 0 || strcmp(argv[1], "--disable-rkp") == 0)) {
+			if (argc >= 4 && argv[3][0] != '-') outfile = argv[3];
+		} else if (argc >= 5 && argv[4][0] != '-') {
+			outfile = argv[4];
+		}
 		break;
 	case K_ACT_cfi_hash:
 		do_hash_scan = true;
@@ -1363,38 +1371,4 @@ static int magiskboot_kernel_op(const char *image, const char *action, int argc,
 	}
 }
 
-/* =========================================================================
- * Kernel Module Vermagic Patcher (patch-vermagic)
- * ========================================================================= */
 
-static int magiskboot_patch_vermagic_op(int argc, char **argv)
-{
-	const char *mod_path = NULL;
-	const char *out_path = NULL;
-	const char *target_magic = NULL;
-	const char *boot_img_path = NULL;
-	int i;
-
-	for (i = 2; i < argc; i++) {
-		if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
-			if (i + 1 < argc) out_path = argv[++i];
-		} else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--vermagic") == 0) {
-			if (i + 1 < argc) target_magic = argv[++i];
-		} else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--boot") == 0) {
-			if (i + 1 < argc) boot_img_path = argv[++i];
-		} else if (argv[i][0] != '-' && !mod_path) {
-			mod_path = argv[i];
-		} else if (argv[i][0] != '-' && !out_path) {
-			out_path = argv[i];
-		}
-	}
-
-	if (!mod_path) {
-		mod_path = resolve_default_module_path(argc, argv, 2);
-	}
-	if (!out_path) {
-		out_path = mod_path;
-	}
-
-	return module_patch_file(mod_path, out_path, target_magic, boot_img_path);
-}

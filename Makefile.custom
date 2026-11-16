@@ -228,18 +228,26 @@ $(1):
 	@if [ -z "$$(TARGET)" ] || [ "$$(TARGET)" = "busybox" ]; then \
 		mkdir -p $(BIN_DIR); \
 		cp -f $$(if $$(srctree),$$(srctree),.)/busybox $(BIN_DIR)/busybox-$(5); \
-		ln -sf busybox-$(5) $(BIN_DIR)/magiskboot-$(5); \
-		ln -sf bin/busybox-$(5) $$(if $$(srctree),$$(srctree),.)/busybox; \
-		ln -sf bin/magiskboot-$(5) $$(if $$(srctree),$$(srctree),.)/magiskboot; \
-		ln -sf bin/busybox-$(5) $$(if $$(srctree),$$(srctree),.)/busybox-$(5); \
-		ln -sf bin/magiskboot-$(5) $$(if $$(srctree),$$(srctree),.)/magiskboot-$(5); \
+		sz=`stat -c '%s' $(BIN_DIR)/busybox-$(5)`; \
+		sz_fmt=`awk -v b="$$$$sz" 'BEGIN { printf "%d bytes (%.2f KB / %.2f MB)", b, b/1024, b/1048576 }'`; \
+		mach=`readelf -h $(BIN_DIR)/busybox-$(5) 2>/dev/null | awk -F: '/Machine:/ {gsub(/^[ \t]+/, "", $$$$2); print $$$$2}'`; \
+		class=`readelf -h $(BIN_DIR)/busybox-$(5) 2>/dev/null | awk -F: '/Class:/ {gsub(/^[ \t]+/, "", $$$$2); print $$$$2}'`; \
+		entry=`readelf -h $(BIN_DIR)/busybox-$(5) 2>/dev/null | awk -F: '/Entry point/ {gsub(/^[ \t]+/, "", $$$$2); print $$$$2}'`; \
+		nsecs=`readelf -h $(BIN_DIR)/busybox-$(5) 2>/dev/null | awk -F: '/Number of section headers:/ {gsub(/^[ \t]+/, "", $$$$2); print $$$$2}'`; \
+		secs=`size $(BIN_DIR)/busybox-$(5) 2>/dev/null | tail -n 1 | awk '{printf "text: %s | data: %s | bss: %s | dec: %s (%s hex)", $$$$1, $$$$2, $$$$3, $$$$4, $$$$5}'`; \
+		bin_type=`file -b $(BIN_DIR)/busybox-$(5)`; \
+		bin_mode=`stat -c '%A (%a)' $(BIN_DIR)/busybox-$(5)`; \
+		bin_built=`date '+%Y-%m-%d %H:%M:%S %Z'`; \
+		bin_mod=`date -r $(BIN_DIR)/busybox-$(5) '+%Y-%m-%d %H:%M:%S %Z'`; \
 		echo "[✓] Successfully built and saved:"; \
-		echo "    -> $(BIN_DIR)/busybox-$(5)"; \
-		echo "    -> $(BIN_DIR)/magiskboot-$(5)"; \
-		echo "    -> ./busybox (symlink -> bin/busybox-$(5))"; \
-		echo "    -> ./magiskboot (symlink -> bin/magiskboot-$(5))"; \
-		echo "    -> ./busybox-$(5) (symlink -> bin/busybox-$(5))"; \
-		echo "    -> ./magiskboot-$(5) (symlink -> bin/magiskboot-$(5))"; \
+		echo "    -> Binary:   $(BIN_DIR)/busybox-$(5)"; \
+		echo "    -> Type:     $$$$bin_type"; \
+		echo "    -> Size:     $$$$sz_fmt"; \
+		echo "    -> Mode:     $$$$bin_mode"; \
+		echo "    -> Built:    $$$$bin_built"; \
+		echo "    -> Modified: $$$$bin_mod"; \
+		echo "    -> ELF Info: $$$$class, $$$$mach (Entry: $$$$entry, $$$$nsecs sections)"; \
+		echo "    -> Sections: $$$$secs"; \
 	fi
 
 $(1)-busybox:
@@ -248,7 +256,7 @@ $(1)-busybox:
 $(1)-clean:
 	@echo "[-] Cleaning build artifacts for $(6)..."
 	env -u CFLAGS -u AFLAGS -u LDFLAGS $$(MAKE) -C $$(if $$(srctree),$$(srctree),.) ARCH=$(2) $$(if $(3),CROSS_COMPILE=$(3)) $$(if $(4),CC=$(4)) clean
-	@rm -f $$(if $$(srctree),$$(srctree),.)/magiskboot $$(if $$(srctree),$$(srctree),.)/busybox $$(if $$(srctree),$$(srctree),.)/busybox_unstripped
+	@rm -f $$(if $$(srctree),$$(srctree),.)/busybox $$(if $$(srctree),$$(srctree),.)/busybox_unstripped
 	@echo "[✓] Cleaned $(6) in-tree objects."
 
 $(1)-menuconfig:
@@ -270,7 +278,7 @@ endef
 cross-clean clean-cross:
 	@echo "[-] Cleaning all BusyBox objects and root binaries..."
 	@$(MAKE) clean
-	@rm -f $(if $(srctree),$(srctree),.)/magiskboot $(if $(srctree),$(srctree),.)/busybox $(if $(srctree),$(srctree),.)/busybox_unstripped
+	@rm -f $(if $(srctree),$(srctree),.)/busybox $(if $(srctree),$(srctree),.)/busybox_unstripped
 	@echo "[✓] Cleaned root build objects successfully."
 
 clean-all cross-clean-all: cross-clean
@@ -281,7 +289,7 @@ clean-all cross-clean-all: cross-clean
 cross-distclean distclean-cross distclean-all:
 	@echo "[-] Distcleaning all configurations, objects, and $(BIN_DIR)..."
 	@$(MAKE) distclean
-	@rm -rf $(BIN_DIR) $(if $(srctree),$(srctree),.)/magiskboot $(if $(srctree),$(srctree),.)/busybox $(if $(srctree),$(srctree),.)/busybox_unstripped
+	@rm -rf $(BIN_DIR) $(if $(srctree),$(srctree),.)/busybox $(if $(srctree),$(srctree),.)/busybox_unstripped
 	@echo "[✓] Full distclean completed."
 
 # Instantiate cross-compile targets using DEFINE_CROSS_TARGET
@@ -308,19 +316,14 @@ cross-all all-cross all-arches:
 	@ls -la $(BIN_DIR)/
 	@echo "========================================================================"
 
-# Magiskboot convenience targets
-.PHONY: magiskboot-aarch64 magiskboot-native
-magiskboot-aarch64: cross-aarch64
-magiskboot-native: native-x86_64
-
 .PHONY: cross-help
 cross-help:
 	@echo "Available Cross-Compilation Delegation Targets:"
-	@echo "  cross-arm64 / cross-aarch64  - Build BusyBox + magiskboot for Android (aarch64 musl static)"
-	@echo "  native-x86_64 / native       - Build BusyBox + magiskboot natively for host (x86_64 gcc)"
-	@echo "  cross-aarch64-glibc          - Build BusyBox + magiskboot for container (aarch64 glibc dynamic)"
+	@echo "  cross-arm64 / cross-aarch64  - Build BusyBox for Android (aarch64 musl static)"
+	@echo "  native-x86_64 / native       - Build BusyBox natively for host (x86_64 gcc)"
+	@echo "  cross-aarch64-glibc          - Build BusyBox for container (aarch64 glibc dynamic)"
 	@echo "  cross-all / all-arches       - Build ALL architectures into bin/ without overwriting"
-	@echo "  TARGET=<target>              - Optional target override (e.g. make cross-arm64 TARGET=archival/magiskboot.o)"
+	@echo "  TARGET=<target>              - Optional target override (e.g. make cross-arm64 TARGET=archival/aimg.o)"
 	@echo "  cross-clean / clean-cross    - Clean root objects, binaries, and symlinks"
 	@echo "  clean-all                    - Clean objects, binaries, AND the bin/ storage directory"
 	@echo "  distclean-all                - Full distclean of configuration, objects, and bin/"

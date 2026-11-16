@@ -1,14 +1,14 @@
 /* vi: set sw=4 ts=4: */
 /*
- * magiskboot.h — Android Boot Image Architecture & Constants for BusyBox
+ * aimg.h — Android Image Tool Architecture & Constants for BusyBox
  *
  * Implements standard AOSP boot headers (v0, v1, v2, v3, v4), Vendor Boot headers
  * (v3, v4), Samsung PXA headers, OEM loader extensions, and AVB 2.0 structures.
  * Conforms to Linux Kernel Coding Style & ISO C99/C11 standards.
  */
 
-#ifndef MAGISKBOOT_H
-#define MAGISKBOOT_H 1
+#ifndef AIMG_H
+#define AIMG_H 1
 
 #include "libbb.h"
 
@@ -671,4 +671,4 @@ struct dist_package_options {
 	char **modules;
 };
 
-#endif /* MAGISKBOOT_H */
+#endif /* AIMG_H */

@@ -1,12 +1,12 @@
 /* vi: set sw=4 ts=4: */
 /*
- * magiskboot_zip.c — Universal Recovery Flashable ZIP Packaging & ZIP Archive Engine
+ * aimg_zip.c — Universal Recovery Flashable ZIP Packaging & ZIP Archive Engine
  *
  * Implements in-memory ZIP archive creation, directory recursion, recovery
  * flashable ZIP generation (META-INF, updater-script, update-binary DSL),
- * and BusyBox unzip integration for magiskboot.
+ * and BusyBox unzip integration for aimg (Android Image Tool).
  *
- * Included directly into archival/magiskboot.c translation unit.
+ * Included directly into archival/aimg.c translation unit.
  * Conforms to Linux Kernel Coding Style & ISO C99/C11 standards.
  */
 
@@ -245,14 +245,17 @@ static bool is_arm64_elf(const char *path) {
 	return true;
 }
 
-static char *resolve_magiskboot_binary(const char *custom) {
+static char *resolve_aimg_binary(const char *custom) {
 	static const char * const search_paths[] = {
-		"bin/magiskboot-arm64",
+		"bin/aimg-arm64",
 		"bin/busybox-arm64",
-		"bin/magiskboot-aarch64",
+		"bin/aimg-aarch64",
 		"bin/busybox-aarch64",
-		"./magiskboot-arm64",
+		"./aimg-arm64",
 		"./busybox-arm64",
+		"./aimg",
+		"bin/magiskboot-arm64",
+		"./magiskboot-arm64",
 		"./magiskboot",
 		NULL
 	};
@@ -262,11 +265,11 @@ static char *resolve_magiskboot_binary(const char *custom) {
 	char candidate[PATH_MAX];
 	size_t i;
 
-	/* 1. Custom CLI path specified via --magiskboot */
+	/* 1. Custom CLI path specified via --aimg or --binary */
 	if (custom && custom[0] != '\0') {
 		if (is_arm64_elf(custom))
 			return xstrdup(custom);
-		bb_error_msg("specified magiskboot binary '%s' is not an ARM64 ELF binary", custom);
+		bb_error_msg("specified binary '%s' is not an ARM64 ELF binary", custom);
 		return NULL;
 	}
 
@@ -290,7 +293,21 @@ static char *resolve_magiskboot_binary(const char *custom) {
 		if (slash) {
 			*slash = '\0';
 
+			snprintf(candidate, sizeof(candidate), "%s/aimg-arm64", exe_dir);
+			if (is_arm64_elf(candidate)) {
+				free(exe_path);
+				free(exe_dir);
+				return xstrdup(candidate);
+			}
+
 			snprintf(candidate, sizeof(candidate), "%s/magiskboot-arm64", exe_dir);
+			if (is_arm64_elf(candidate)) {
+				free(exe_path);
+				free(exe_dir);
+				return xstrdup(candidate);
+			}
+
+			snprintf(candidate, sizeof(candidate), "%s/../bin/aimg-arm64", exe_dir);
 			if (is_arm64_elf(candidate)) {
 				free(exe_path);
 				free(exe_dir);
@@ -394,9 +411,10 @@ static char *generate_universal_update_binary(const char *banner, const char *de
 		"cd \"$TMPDIR\"\n\n"
 		"ui_print \"- Extracting installer payload...\"\n"
 		"unzip -o \"$ZIPFILE\" >/dev/null 2>&1\n\n"
-		"MB=\"$TMPDIR/tools/magiskboot\"\n"
+		"MB=\"$TMPDIR/tools/aimg\"\n"
+		"[ ! -f \"$MB\" ] && MB=\"$TMPDIR/tools/magiskboot\"\n"
 		"if [ ! -f \"$MB\" ]; then\n"
-		"  ui_print \"! Error: Embedded magiskboot missing!\"\n"
+		"  ui_print \"! Error: Embedded aimg/magiskboot binary missing!\"\n"
 		"  cd /; rm -rf \"$TMPDIR\"; exit 1\n"
 		"fi\n"
 		"chmod 755 \"$MB\"\n"
@@ -751,14 +769,15 @@ static int package_dist_zip(struct dist_package_options *opts) {
 		fprintf(stderr, "[+] Bundled universal recovery live-patcher update-binary\n");
 	}
 
-	/* 3. tools/magiskboot */
-	mb_bin = resolve_magiskboot_binary(opts->magiskboot_bin);
+	/* 3. tools/aimg and tools/magiskboot */
+	mb_bin = resolve_aimg_binary(opts->magiskboot_bin);
 	if (mb_bin && access(mb_bin, R_OK) == 0) {
+		zip_writer_add_file(&zw, "tools/aimg", mb_bin, S_IFREG | 0755);
 		zip_writer_add_file(&zw, "tools/magiskboot", mb_bin, S_IFREG | 0755);
-		fprintf(stderr, "[+] Bundled tools/magiskboot from '%s'\n", mb_bin);
+		fprintf(stderr, "[+] Bundled tools/aimg from '%s'\n", mb_bin);
 		free(mb_bin);
 	} else {
-		fprintf(stderr, "[!] Warning: No compiled target magiskboot found to embed into tools/magiskboot\n");
+		fprintf(stderr, "[!] Warning: No compiled target aimg found to embed into tools/aimg\n");
 	}
 
 	/* 4. Modules into modules/ (*.ko) */

@@ -1,59 +1,73 @@
 /* vi: set sw=4 ts=4: */
 /*
- * magiskboot — Android Boot Image Tool for BusyBox
+ * aimg — Android Image Tool for BusyBox
  *
  * Implements Android boot image unpacking, repacking, component extraction,
- * header inspection, and in-place binary hex patching in memory-safe C.
- * Supports AOSP boot v0-v4, Vendor Boot v3-v4, Samsung PXA, and OEM loaders.
+ * kernel security neutralization (CONFIG_MODULE_SIG_FORCE, KCFI), module
+ * vermagic/altinstructions patching, ramdisk CPIO/init injection, and universal
+ * recovery flashable ZIP packaging in memory-safe C.
  *
  * Conforms to Linux Kernel Coding Style & ISO C90/C99/C11 standards.
  */
 
-//config:config MAGISKBOOT
-//config:	bool "magiskboot (Android boot image tool)"
+//config:config AIMG
+//config:	bool "aimg (Android Image Tool)"
 //config:	default y
 //config:	help
-//config:	Android boot image manipulator.
+//config:	Android Image Tool (boot, kernel, ramdisk, and recovery).
 
-//applet:IF_MAGISKBOOT(APPLET(magiskboot, BB_DIR_USR_BIN, BB_SUID_DROP))
-//applet:IF_MAGISKBOOT(APPLET_ODDNAME(magiskboot-x86_64, magiskboot, BB_DIR_USR_BIN, BB_SUID_DROP, magiskboot))
-//applet:IF_MAGISKBOOT(APPLET_ODDNAME(magiskboot-arm64, magiskboot, BB_DIR_USR_BIN, BB_SUID_DROP, magiskboot))
-//applet:IF_MAGISKBOOT(APPLET_ODDNAME(magiskboot-aarch64, magiskboot, BB_DIR_USR_BIN, BB_SUID_DROP, magiskboot))
+//applet:IF_AIMG(APPLET(aimg, BB_DIR_USR_BIN, BB_SUID_DROP))
 
-//kbuild:lib-$(CONFIG_MAGISKBOOT) += magiskboot.o
+//kbuild:lib-$(CONFIG_AIMG) += aimg.o
 
-//usage:#define magiskboot_trivial_usage
-//usage:       "COMMAND [ARGS]..."
-//usage:#define magiskboot_full_usage "\n\n"
-//usage:       "Android boot image tool\n"
-//usage:     "\nCommands:"
-//usage:     "\n	unpack [-h|-k] <boot.img>     Unpack boot image components (-k: kernel only)"
-//usage:     "\n	repack [-n] <boot.img> [out]  Repack components into new boot image"
-//usage:     "\n	extract-kernel <img|rec> [out] Extract kernel from boot/recovery/TWRP image"
-//usage:     "\n	extract <image> <comp> [out]  Extract component (kernel, ramdisk, dtb, etc.)"
-//usage:     "\n	split <boot.img>              Split boot image without decompressing ramdisk"
-//usage:     "\n	hexpatch <file> <from> <to>   In-place hex string patch"
-//usage:     "\n	cpio <ramdisk.cpio> [args...] CPIO operations (test, ls, extract, add, mkdir, rm)"
-//usage:     "\n	init <boot.img> <action> [...] In-place init tool (status, extract, replace, wrap, unwrap, rm)"
-//usage:     "\n	kernel <img|rec> <act> [...]  Kernel tool (status, patch, sigenforce, cfi, de-enforce, permissive, rkp, hexpatch, cfi-hash)"
-//usage:     "\n	de-enforce <img|rec> [out]    Neutralize module signature enforcement & CFI in boot/kernel image"
-//usage:     "\n	patch-sigenforce <img|rec> [out] Neutralize kernel module signature enforcement (CONFIG_MODULE_SIG_FORCE)"
-//usage:     "\n	patch-cfi <img|rec> [out]     Neutralize Clang Control Flow Integrity (KCFI & Forward-Edge CFI)"
-//usage:     "\n	dtb <file> [test|print|patch] Device tree blob inspector and verity patcher"
-//usage:     "\n	module <act> <mod.ko> [...]   Kernel module toolkit (info, check, audit, strip, patch, load, finit, unload)"
-//usage:     "\n	patch-vermagic <mod.ko> [opts] Patch module vermagic, altinstructions, and CFI stubs"
-//usage:     "\n	add-module [opts...] <boot.img> <mod.ko> [out.img] Inject module into boot image (--live, --install)"
-//usage:     "\n	dist [opts...] <out.zip>      Create universal Magisk/AnyKernel recovery flashable ZIP"
-//usage:     "\n	zip <file.zip> <act> [...]    ZIP archive toolkit (create, list, extract)"
-//usage:     "\n	fstab <file> <print|patch...> In-place fstab configuration tool"
-//usage:     "\n	cmdline <file> <print|patch|add|rm...> Kernel cmdline tool"
-//usage:     "\n	vbmeta <file> [status|disable|restore] VBMeta AVB 2.0 flags inspector and verity disabler"
-//usage:     "\n	decompress <in> [out]         Decompress kernel/ramdisk image"
-//usage:     "\n	cleanup                       Clean up unpacked temporary files"
+//usage:#define aimg_trivial_usage
+//usage:       "[ACTION] [OPTIONS] <file> [ARGS]..."
+//usage:#define aimg_full_usage "\n\n"
+//usage:       "Android Image Tool (Boot, Kernel Security, Ramdisk, and Recovery Packaging)\n"
+//usage:     "\nKernel Security Neutralization:"
+//usage:     "\n	--de-enforce <img|rec> [out]  Neutralize module sig enforcement & Clang CFI"
+//usage:     "\n	--patch-sigenforce <img|rec>  Neutralize CONFIG_MODULE_SIG_FORCE"
+//usage:     "\n	--patch-cfi <img|rec> [out]   Neutralize Clang KCFI & Forward-Edge CFI stubs"
+//usage:     "\n	--permissive <img|rec> [out]  Force SELinux permissive in kernel image"
+//usage:     "\n	--disable-rkp <img|rec> [out] Disable Samsung RKP / KNOX protections"
+//usage:     "\n	--kernel-status <img|rec>     Inspect kernel security features & CFI jump tables"
+//usage:     "\n"
+//usage:     "\nBoot Image Operations:"
+//usage:     "\n	-u, --unpack [dir] <boot.img> Unpack boot/recovery image components"
+//usage:     "\n	    -k, --kernel-only         Extract kernel only"
+//usage:     "\n	    -s, --split               Split image without decompressing ramdisk"
+//usage:     "\n	    -h, --header-only         Parse and print header information"
+//usage:     "\n	-r, --repack [out] <boot.img> Repack components into new boot image"
+//usage:     "\n	    -n, --no-comp             Do not compress repacked ramdisk"
+//usage:     "\n	-e, --extract <comp> [out]    Extract component (kernel, ramdisk, dtb, extra)"
+//usage:     "\n	-c, --cleanup                 Clean up unpacked temporary files"
+//usage:     "\n"
+//usage:     "\nKernel Module Toolkit:"
+//usage:     "\n	--mod-info <mod.ko>           Display module vermagic and ELF header info"
+//usage:     "\n	--mod-audit <mod.ko> [sym]    Audit unresolved symbols against kernel"
+//usage:     "\n	--mod-strip <mod.ko> [out]    Strip unneeded sections and debug symbols"
+//usage:     "\n	--mod-patch <mod.ko> [opts]   Patch module vermagic, altinstructions, and CFI stubs"
+//usage:     "\n	--mod-inject <boot.img> <mod> Inject module into boot ramdisk (--live, --install)"
+//usage:     "\n	--mod-load <mod.ko> [args]    In-kernel load via finit_module / init_module"
+//usage:     "\n	--mod-unload [name]           In-kernel unload via delete_module"
+//usage:     "\n"
+//usage:     "\nRamdisk & Component Patchers:"
+//usage:     "\n	--init <boot.img> <action>    In-place /init tool (status, wrap, replace, extract, rm)"
+//usage:     "\n	--cpio <ramdisk> <act> [...]  CPIO operations (test, ls, extract, add, mkdir, rm)"
+//usage:     "\n	--dtb <file> [print|patch]    DTB inspector and AVB/fstab verity patcher"
+//usage:     "\n	--vbmeta <file> [disable|...] VBMeta AVB 2.0 flags inspector and verity disabler"
+//usage:     "\n	--fstab <file> <print|patch>  In-place fstab configuration tool"
+//usage:     "\n	--cmdline <file> <print|patch> Kernel cmdline configuration tool"
+//usage:     "\n	--hexpatch <file> <from> <to> In-place binary hex string patch"
+//usage:     "\n	--decompress <in> [out]       Decompress kernel/ramdisk image"
+//usage:     "\n"
+//usage:     "\nPackaging:"
+//usage:     "\n	--dist <out.zip>              Create universal AnyKernel/Magisk flashable ZIP"
+//usage:     "\n	--zip <file.zip> <act> [...]  ZIP archive operations (create, list, extract)"
 
 #include "libbb.h"
 #include "bb_archive.h"
-#include "magiskboot.h"
+#include "aimg.h"
 
 #include <sys/mman.h>
 #include <sys/sendfile.h>
@@ -1300,43 +1314,6 @@ static int magiskboot_repack(const char *src_img, const char *out_img, bool skip
 	return 0;
 }
 
-static int magiskboot_split(const char *image) {
-	return magiskboot_unpack(image, true, false, false);
-}
-
-static int magiskboot_extract_kernel(const char *image, const char *outfile, bool skip_decomp) {
-	boot_img_t boot;
-	const char *dest;
-	int ret;
-
-	if (!image) return 1;
-	if (!boot_img_parse(&boot, image)) return 1;
-
-	if (!boot.kernel || boot.kernel_size == 0) {
-		bb_error_msg("no kernel found in '%s' (is this a vendor_boot image?)", image);
-		boot_img_free(&boot);
-		return 1;
-	}
-
-	dest = outfile ? outfile : KERNEL_FILE;
-	ret = write_to_disk(dest, boot.kernel, boot.kernel_size, boot.k_fmt, skip_decomp);
-	if (ret == 0) {
-		fprintf(stderr, "[+] Extracted kernel -> [%s] (%s, %u bytes)\n",
-				dest, boot_fmt2name(boot.k_fmt), boot.kernel_size);
-		if (boot.kernel_dtb && boot.kernel_dtb_size > 0) {
-			char *dtb_dest = outfile ? xasprintf("%s.dtb", outfile) : (char *)KER_DTB_FILE;
-			write_to_disk(dtb_dest, boot.kernel_dtb, boot.kernel_dtb_size, BOOT_FMT_UNKNOWN, true);
-			fprintf(stderr, "[+] Extracted embedded kernel DTB -> [%s] (%zu bytes)\n",
-					dtb_dest, boot.kernel_dtb_size);
-			if (outfile) free(dtb_dest);
-		}
-	} else {
-		bb_error_msg("failed to write kernel to '%s'", dest);
-	}
-
-	boot_img_free(&boot);
-	return (ret == 0) ? 0 : 1;
-}
 
 static int magiskboot_extract_component(const char *image, const char *comp, const char *outfile, bool skip_decomp) {
 	boot_img_t boot;
@@ -4829,12 +4806,12 @@ static int magiskboot_module_op(int argc, char **argv)
 /* =========================================================================
  * Kernel Security & Vermagic Patching Engine (de-enforce, patch-sigenforce, patch-cfi, patch-vermagic)
  * ========================================================================= */
-#include "magiskboot_patch.c"
+#include "aimg_patch.c"
 
 /* =========================================================================
  * 12. Universal Recovery Flashable ZIP Packaging & ZIP Archive Engine
  * ========================================================================= */
-#include "magiskboot_zip.c"
+#include "aimg_zip.c"
 
 /* =========================================================================
  * 13. Android FSTAB & Kernel Command-Line Toolkit
@@ -5605,85 +5582,160 @@ cleanup:
  * 6. BusyBox Applet Entrypoint
  * ========================================================================= */
 
-int magiskboot_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
-int magiskboot_main(int argc, char **argv) {
+int aimg_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+int aimg_main(int argc, char **argv) {
 	static const char cmds[] ALIGN1 =
-		"add-module\0"
-		"inject-module\0"
-		"unpack\0"
-		"extract-kernel\0"
-		"extract\0"
-		"repack\0"
-		"split\0"
-		"hexpatch\0"
-		"cleanup\0"
-		"decompress\0"
-		"dtb\0"
-		"cpio\0"
-		"init\0"
-		"kernel\0"
+		/* Kernel Security Neutralization */
+		"--de-enforce\0"
 		"de-enforce\0"
+		"--patch-sigenforce\0"
 		"patch-sigenforce\0"
+		"--patch-cfi\0"
 		"patch-cfi\0"
-		"module\0"
-		"mod\0"
-		"patch-vermagic\0"
-		"vermagic\0"
+		"--permissive\0"
+		"permissive\0"
+		"--disable-rkp\0"
+		"disable-rkp\0"
+		"--kernel-status\0"
+		"kernel-status\0"
+
+		/* Boot Image Operations */
+		"-u\0"
+		"--unpack\0"
+		"unpack\0"
+		"-r\0"
+		"--repack\0"
+		"repack\0"
+		"-e\0"
+		"--extract\0"
+		"extract\0"
+		"-c\0"
+		"--cleanup\0"
+		"cleanup\0"
+
+		/* Kernel Module Toolkit */
+		"--mod-info\0"
 		"mod-info\0"
-		"mod-check\0"
+		"--mod-audit\0"
 		"mod-audit\0"
+		"--mod-strip\0"
 		"mod-strip\0"
+		"--mod-patch\0"
+		"mod-patch\0"
+		"--mod-inject\0"
+		"mod-inject\0"
+		"--mod-load\0"
 		"mod-load\0"
+		"--mod-unload\0"
 		"mod-unload\0"
-		"dist\0"
-		"anykernel\0"
-		"package-kernel\0"
-		"package-zip\0"
-		"zip\0"
-		"fstab\0"
-		"cmdline\0"
+
+		/* Ramdisk & Component Patchers */
+		"--init\0"
+		"init\0"
+		"--cpio\0"
+		"cpio\0"
+		"--dtb\0"
+		"dtb\0"
+		"--vbmeta\0"
 		"vbmeta\0"
+		"--fstab\0"
+		"fstab\0"
+		"--cmdline\0"
+		"cmdline\0"
+		"--hexpatch\0"
+		"hexpatch\0"
+		"--decompress\0"
+		"decompress\0"
+
+		/* Packaging */
+		"--dist\0"
+		"dist\0"
+		"--zip\0"
+		"zip\0"
+
+		/* Generic Group Verbs */
+		"--kernel\0"
+		"kernel\0"
+		"--module\0"
+		"module\0"
+
+		/* Help */
 		"-h\0"
-		"--help\0";
+		"--help\0"
+		"help\0";
 
 	enum {
-		CMD_add_module = 0,
-		CMD_inject_module,
-		CMD_unpack,
-		CMD_extract_kernel,
-		CMD_extract,
-		CMD_repack,
-		CMD_split,
-		CMD_hexpatch,
-		CMD_cleanup,
-		CMD_decompress,
-		CMD_dtb,
-		CMD_cpio,
-		CMD_init,
-		CMD_kernel,
-		CMD_de_enforce,
+		CMD_de_enforce = 0,
+		CMD_de_enforce_no_dash,
 		CMD_patch_sigenforce,
+		CMD_patch_sigenforce_no_dash,
 		CMD_patch_cfi,
-		CMD_module,
-		CMD_mod,
-		CMD_patch_vermagic,
-		CMD_vermagic,
+		CMD_patch_cfi_no_dash,
+		CMD_permissive,
+		CMD_permissive_no_dash,
+		CMD_disable_rkp,
+		CMD_disable_rkp_no_dash,
+		CMD_kernel_status,
+		CMD_kernel_status_no_dash,
+
+		CMD_u,
+		CMD_unpack,
+		CMD_unpack_no_dash,
+		CMD_r,
+		CMD_repack,
+		CMD_repack_no_dash,
+		CMD_e,
+		CMD_extract,
+		CMD_extract_no_dash,
+		CMD_c,
+		CMD_cleanup,
+		CMD_cleanup_no_dash,
+
 		CMD_mod_info,
-		CMD_mod_check,
+		CMD_mod_info_no_dash,
 		CMD_mod_audit,
+		CMD_mod_audit_no_dash,
 		CMD_mod_strip,
+		CMD_mod_strip_no_dash,
+		CMD_mod_patch,
+		CMD_mod_patch_no_dash,
+		CMD_mod_inject,
+		CMD_mod_inject_no_dash,
 		CMD_mod_load,
+		CMD_mod_load_no_dash,
 		CMD_mod_unload,
-		CMD_dist,
-		CMD_anykernel,
-		CMD_package_kernel,
-		CMD_package_zip,
-		CMD_zip,
-		CMD_fstab,
-		CMD_cmdline,
+		CMD_mod_unload_no_dash,
+
+		CMD_init,
+		CMD_init_no_dash,
+		CMD_cpio,
+		CMD_cpio_no_dash,
+		CMD_dtb,
+		CMD_dtb_no_dash,
 		CMD_vbmeta,
+		CMD_vbmeta_no_dash,
+		CMD_fstab,
+		CMD_fstab_no_dash,
+		CMD_cmdline,
+		CMD_cmdline_no_dash,
+		CMD_hexpatch,
+		CMD_hexpatch_no_dash,
+		CMD_decompress,
+		CMD_decompress_no_dash,
+
+		CMD_dist,
+		CMD_dist_no_dash,
+		CMD_zip,
+		CMD_zip_no_dash,
+
+		CMD_kernel,
+		CMD_kernel_no_dash,
+		CMD_module,
+		CMD_module_no_dash,
+
 		CMD_h,
 		CMD_help,
+		CMD_help_no_dash,
 	};
 
 	const char *cmd;
@@ -5697,51 +5749,85 @@ int magiskboot_main(int argc, char **argv) {
 	subcmd = index_in_strings(cmds, cmd);
 
 	switch (subcmd) {
-	case CMD_add_module:
-	case CMD_inject_module:
+	case CMD_de_enforce:
+	case CMD_de_enforce_no_dash:
 		if (argc < 3) bb_show_usage();
-		return magiskboot_add_module_op(argc, argv);
+		return magiskboot_kernel_op(argv[2], "de-enforce", argc, argv);
 
-	case CMD_unpack: {
+	case CMD_patch_sigenforce:
+	case CMD_patch_sigenforce_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_kernel_op(argv[2], "patch-sigenforce", argc, argv);
+
+	case CMD_patch_cfi:
+	case CMD_patch_cfi_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_kernel_op(argv[2], "patch-cfi", argc, argv);
+
+	case CMD_permissive:
+	case CMD_permissive_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_kernel_op(argv[2], "permissive", argc, argv);
+
+	case CMD_disable_rkp:
+	case CMD_disable_rkp_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_kernel_op(argv[2], "disable-rkp", argc, argv);
+
+	case CMD_kernel_status:
+	case CMD_kernel_status_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_kernel_op(argv[2], "status", argc, argv);
+
+	case CMD_u:
+	case CMD_unpack:
+	case CMD_unpack_no_dash: {
 		bool hdr_only = false;
 		bool kernel_only = false;
+		bool skip_decomp = false;
 		const char *img;
 		int idx = 2;
 		if (argc < 3) bb_show_usage();
 		while (idx < argc && argv[idx][0] == '-') {
-			if (strcmp(argv[idx], "-h") == 0) hdr_only = true;
-			else if (strcmp(argv[idx], "-k") == 0) kernel_only = true;
+			if (strcmp(argv[idx], "-h") == 0 || strcmp(argv[idx], "--header-only") == 0) hdr_only = true;
+			else if (strcmp(argv[idx], "-k") == 0 || strcmp(argv[idx], "--kernel-only") == 0) kernel_only = true;
+			else if (strcmp(argv[idx], "-s") == 0 || strcmp(argv[idx], "--split") == 0) skip_decomp = true;
 			idx++;
 		}
 		if (idx >= argc) bb_show_usage();
 		img = argv[idx];
-		return magiskboot_unpack(img, false, hdr_only, kernel_only);
+		return magiskboot_unpack(img, skip_decomp, hdr_only, kernel_only);
 	}
 
-	case CMD_extract_kernel: {
-		const char *img;
-		const char *out = NULL;
-		bool skip_decomp = false;
+	case CMD_r:
+	case CMD_repack:
+	case CMD_repack_no_dash: {
+		bool skip_comp = false;
 		int idx = 2;
+		const char *src;
+		const char *out;
+
 		if (argc < 3) bb_show_usage();
-		if (strcmp(argv[idx], "-n") == 0) {
-			skip_decomp = true;
+		if (strcmp(argv[2], "-n") == 0 || strcmp(argv[2], "--no-comp") == 0) {
+			skip_comp = true;
 			idx++;
 			if (idx >= argc) bb_show_usage();
 		}
-		img = argv[idx++];
-		if (idx < argc) out = argv[idx];
-		return magiskboot_extract_kernel(img, out, skip_decomp);
+		src = argv[idx++];
+		out = (idx < argc) ? argv[idx] : NULL;
+		return magiskboot_repack(src, out, skip_comp);
 	}
 
-	case CMD_extract: {
+	case CMD_e:
+	case CMD_extract:
+	case CMD_extract_no_dash: {
 		const char *img;
 		const char *comp;
 		const char *out = NULL;
 		bool skip_decomp = false;
 		int idx = 2;
 		if (argc < 4) bb_show_usage();
-		if (strcmp(argv[idx], "-n") == 0) {
+		if (strcmp(argv[idx], "-n") == 0 || strcmp(argv[idx], "--no-decomp") == 0) {
 			skip_decomp = true;
 			idx++;
 			if (idx >= argc) bb_show_usage();
@@ -5752,45 +5838,84 @@ int magiskboot_main(int argc, char **argv) {
 		return magiskboot_extract_component(img, comp, out, skip_decomp);
 	}
 
-	case CMD_repack: {
-		bool skip_comp = false;
-		int idx = 2;
-		const char *src;
-		const char *out;
-
-		if (argc < 3) bb_show_usage();
-		if (strcmp(argv[2], "-n") == 0) {
-			skip_comp = true;
-			idx++;
-			if (idx >= argc) bb_show_usage();
-		}
-		src = argv[idx++];
-		out = (idx < argc) ? argv[idx] : NULL;
-		return magiskboot_repack(src, out, skip_comp);
-	}
-
-	case CMD_split:
-		if (argc < 3) bb_show_usage();
-		return magiskboot_split(argv[2]);
-
-	case CMD_hexpatch:
-		if (argc < 5) bb_show_usage();
-		return magiskboot_hexpatch(argv[2], argv[3], argv[4]);
-
+	case CMD_c:
 	case CMD_cleanup:
+	case CMD_cleanup_no_dash:
 		return magiskboot_cleanup();
 
-	case CMD_decompress:
-		if (argc < 3) bb_show_usage();
-		return magiskboot_decompress(argv[2], (argc >= 4) ? argv[3] : NULL);
+	case CMD_mod_info:
+	case CMD_mod_info_no_dash:
+		return module_info_file((argc >= 3) ? argv[2] : resolve_default_module_path(argc, argv, 2));
 
-	case CMD_dtb:
-		return magiskboot_dtb(argc, argv);
+	case CMD_mod_audit:
+	case CMD_mod_audit_no_dash: {
+		const char *path = (argc >= 3) ? argv[2] : resolve_default_module_path(argc, argv, 2);
+		int fd = open_or_warn(path, O_RDONLY | O_CLOEXEC);
+		struct stat st;
+		uint8_t *map;
+		struct elf64_ctx ctx;
+		int res;
 
-	case CMD_cpio:
-		return magiskboot_cpio(argc, argv);
+		if (fd < 0 || fstat(fd, &st) < 0) {
+			if (fd >= 0) close(fd);
+			return 1;
+		}
+		map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+		close(fd);
+		if (map == MAP_FAILED) return 1;
 
-	case CMD_init: {
+		if (!elf64_init_ctx(&ctx, map, st.st_size, st.st_size, false)) {
+			munmap(map, st.st_size);
+			return 1;
+		}
+		res = audit_module_symbols(&ctx, (argc >= 4) ? argv[3] : NULL);
+		elf64_free_ctx(&ctx);
+		munmap(map, st.st_size);
+		return res;
+	}
+
+	case CMD_mod_strip:
+	case CMD_mod_strip_no_dash: {
+		const char *in_f = (argc >= 3) ? argv[2] : resolve_default_module_path(argc, argv, 2);
+		const char *out_f = (argc >= 4) ? argv[3] : in_f;
+		return module_strip_file(in_f, out_f);
+	}
+
+	case CMD_mod_patch:
+	case CMD_mod_patch_no_dash: {
+		const char *in_f = (argc >= 3) ? argv[2] : resolve_default_module_path(argc, argv, 2);
+		const char *out_f = (argc >= 4 && argv[3][0] != '-') ? argv[3] : in_f;
+		const char *vmagic = NULL;
+		const char *boot_img = NULL;
+		int i;
+
+		for (i = 3; i < argc; i++) {
+			if (strcmp(argv[i], "--vermagic") == 0 && i + 1 < argc) vmagic = argv[++i];
+			else if (strcmp(argv[i], "--boot") == 0 && i + 1 < argc) boot_img = argv[++i];
+		}
+		return module_patch_file(in_f, out_f, vmagic, boot_img);
+	}
+
+	case CMD_mod_inject:
+	case CMD_mod_inject_no_dash:
+		if (argc < 4 && !strstr(cmd, "live")) bb_show_usage();
+		return magiskboot_add_module_op(argc, argv);
+
+	case CMD_mod_load:
+	case CMD_mod_load_no_dash: {
+		const char *in_f = (argc >= 3) ? argv[2] : resolve_default_module_path(argc, argv, 2);
+		const char *margs = (argc >= 4) ? argv[3] : "";
+		return module_load_file(in_f, margs);
+	}
+
+	case CMD_mod_unload:
+	case CMD_mod_unload_no_dash: {
+		const char *mname = (argc >= 3) ? argv[2] : "kroot";
+		return module_unload_name(mname);
+	}
+
+	case CMD_init:
+	case CMD_init_no_dash: {
 		const char *img;
 		const char *act;
 		const char *arg1 = NULL;
@@ -5805,127 +5930,71 @@ int magiskboot_main(int argc, char **argv) {
 		return magiskboot_init_op(img, act, arg1, arg2);
 	}
 
-	case CMD_kernel:
-		if (argc < 4) bb_show_usage();
-		return magiskboot_kernel_op(argv[2], argv[3], argc, argv);
-
-	case CMD_de_enforce: {
-		const char *img = (argc >= 3) ? argv[2] : NULL;
-		char discovered_boot[PATH_MAX];
-		if (!img) {
-			if (find_target_boot_image(discovered_boot, sizeof(discovered_boot)) == 0) {
-				img = discovered_boot;
-				fprintf(stderr, "[+] Auto-detected boot image: %s\n", img);
-			} else {
-				bb_error_msg("cannot auto-detect target boot partition; please specify <boot.img>");
-				return 1;
-			}
-		}
-		return magiskboot_kernel_op(img, "de-enforce", argc, argv);
-	}
-
-	case CMD_patch_sigenforce: {
-		const char *img = (argc >= 3) ? argv[2] : NULL;
-		char discovered_boot[PATH_MAX];
-		if (!img) {
-			if (find_target_boot_image(discovered_boot, sizeof(discovered_boot)) == 0) {
-				img = discovered_boot;
-				fprintf(stderr, "[+] Auto-detected boot image: %s\n", img);
-			} else {
-				bb_error_msg("cannot auto-detect target boot partition; please specify <boot.img>");
-				return 1;
-			}
-		}
-		return magiskboot_kernel_op(img, "sigenforce", argc, argv);
-	}
-
-	case CMD_patch_cfi: {
-		const char *img = (argc >= 3) ? argv[2] : NULL;
-		char discovered_boot[PATH_MAX];
-		if (!img) {
-			if (find_target_boot_image(discovered_boot, sizeof(discovered_boot)) == 0) {
-				img = discovered_boot;
-				fprintf(stderr, "[+] Auto-detected boot image: %s\n", img);
-			} else {
-				bb_error_msg("cannot auto-detect target boot partition; please specify <boot.img>");
-				return 1;
-			}
-		}
-		return magiskboot_kernel_op(img, "cfi", argc, argv);
-	}
-
-	case CMD_module:
-	case CMD_mod:
+	case CMD_cpio:
+	case CMD_cpio_no_dash:
 		if (argc < 3) bb_show_usage();
-		return magiskboot_module_op(argc, argv);
+		return magiskboot_cpio(argc, argv);
 
-	case CMD_patch_vermagic:
-	case CMD_vermagic:
+	case CMD_dtb:
+	case CMD_dtb_no_dash:
 		if (argc < 3) bb_show_usage();
-		return magiskboot_patch_vermagic_op(argc, argv);
+		return magiskboot_dtb(argc, argv);
 
-	case CMD_mod_info:
+	case CMD_vbmeta:
+	case CMD_vbmeta_no_dash:
 		if (argc < 3) bb_show_usage();
-		return module_info_file(argv[2]);
-
-	case CMD_mod_check:
-		if (argc < 3) bb_show_usage();
-		return module_check_file(argv[2]);
-
-	case CMD_mod_audit: {
-		int fd;
-		struct stat st;
-		uint8_t *map;
-		struct elf64_ctx ctx;
-		int res;
-		if (argc < 3) bb_show_usage();
-		fd = open_or_warn(argv[2], O_RDONLY | O_CLOEXEC);
-		if (fd < 0 || fstat(fd, &st) < 0) { if (fd >= 0) close(fd); return 1; }
-		map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-		close(fd);
-		if (map == MAP_FAILED) return 1;
-		if (!elf64_init_ctx(&ctx, map, st.st_size, st.st_size, false)) { munmap(map, st.st_size); return 1; }
-		res = audit_module_symbols(&ctx, (argc >= 4) ? argv[3] : NULL);
-		elf64_free_ctx(&ctx);
-		munmap(map, st.st_size);
-		return res;
-	}
-
-	case CMD_mod_strip:
-		if (argc < 3) bb_show_usage();
-		return module_strip_file(argv[2], (argc >= 4) ? argv[3] : NULL);
-
-	case CMD_mod_load:
-		if (argc < 3) bb_show_usage();
-		return module_load_file(argv[2], (argc >= 4) ? argv[3] : "");
-
-	case CMD_mod_unload:
-		return module_unload_name((argc >= 3) ? argv[2] : "kroot");
-
-	case CMD_dist:
-	case CMD_anykernel:
-	case CMD_package_kernel:
-	case CMD_package_zip:
-		return magiskboot_dist_op(argc, argv);
-
-	case CMD_zip:
-		return magiskboot_zip_op(argc, argv);
+		return magiskboot_vbmeta_op(argc, argv);
 
 	case CMD_fstab:
+	case CMD_fstab_no_dash:
+		if (argc < 3) bb_show_usage();
 		return magiskboot_fstab_op(argc, argv);
 
 	case CMD_cmdline:
+	case CMD_cmdline_no_dash:
+		if (argc < 3) bb_show_usage();
 		return magiskboot_cmdline_op(argc, argv);
 
-	case CMD_vbmeta:
-		return magiskboot_vbmeta_op(argc, argv);
+	case CMD_hexpatch:
+	case CMD_hexpatch_no_dash:
+		if (argc < 5) bb_show_usage();
+		return magiskboot_hexpatch(argv[2], argv[3], argv[4]);
+
+	case CMD_decompress:
+	case CMD_decompress_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_decompress(argv[2], (argc >= 4) ? argv[3] : NULL);
+
+	case CMD_dist:
+	case CMD_dist_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_dist_op(argc, argv);
+
+	case CMD_zip:
+	case CMD_zip_no_dash:
+		if (argc < 3) bb_show_usage();
+		if (strcmp(argv[2], "dist") == 0) {
+			return magiskboot_dist_op(argc - 1, argv + 1);
+		}
+		return magiskboot_zip_op(argc, argv);
+
+	case CMD_kernel:
+	case CMD_kernel_no_dash:
+		if (argc < 4) bb_show_usage();
+		return magiskboot_kernel_op(argv[2], argv[3], argc, argv);
+
+	case CMD_module:
+	case CMD_module_no_dash:
+		if (argc < 3) bb_show_usage();
+		if (strcmp(argv[2], "inject") == 0) {
+			return magiskboot_add_module_op(argc - 1, argv + 1);
+		}
+		return magiskboot_module_op(argc, argv);
 
 	case CMD_h:
 	case CMD_help:
-		bb_show_usage();
-
+	case CMD_help_no_dash:
 	default:
-		bb_error_msg("unknown command '%s'", cmd);
 		bb_show_usage();
 		return 1;
 	}
