@@ -22,8 +22,18 @@
 //config:	Executes as PID 1, mounts early pseudo-filesystems, loads kernel
 //config:	modules from modules.load, and chainloads Android init.
 
+//config:config INIT_WRAPPER_AS_INIT
+//config:	bool "Alias 'init' applet to init_wrapper (Android first-stage PID 1)"
+//config:	default y
+//config:	depends on INIT_WRAPPER && !INIT
+//config:	help
+//config:	Allows BusyBox to act directly as PID 1 /init in Android ramdisks.
+//config:	When the kernel executes /init -> /sbin/busybox, BusyBox dispatches
+//config:	init_wrapper_main without requiring traditional /etc/inittab.
+
 //applet:IF_INIT_WRAPPER(APPLET(init_wrapper, BB_DIR_SBIN, BB_SUID_DROP))
 //applet:IF_INIT_WRAPPER(APPLET_ODDNAME(early_init, init_wrapper, BB_DIR_SBIN, BB_SUID_DROP, init_wrapper))
+//applet:IF_INIT_WRAPPER_AS_INIT(APPLET_ODDNAME(init, init_wrapper, BB_DIR_SBIN, BB_SUID_DROP, init_wrapper))
 
 //kbuild:lib-$(CONFIG_INIT_WRAPPER) += init_wrapper.o
 

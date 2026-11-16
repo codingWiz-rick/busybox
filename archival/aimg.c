@@ -5714,6 +5714,9 @@ static void cpio_append_line_if_missing(cpio_node_t **head_ptr, const char *path
 static char *resolve_init_wrapper_binary(const char *custom)
 {
 	static const char *const names[] = {
+		"busybox",
+		"busybox-arm64",
+		"busybox-aarch64",
 		"init_wrapper",
 		"init_wrapper_aarch64",
 		"init_wrapper-arm64",
@@ -5730,7 +5733,11 @@ static char *resolve_init_wrapper_binary(const char *custom)
 	if (custom && access(custom, R_OK) == 0)
 		return xstrdup(custom);
 
-	/* 2. Environment variable override */
+	/* 2. Environment variable overrides */
+	env_path = getenv("BUSYBOX_BIN");
+	if (env_path && access(env_path, R_OK) == 0)
+		return xstrdup(env_path);
+
 	env_path = getenv("INIT_WRAPPER_BIN");
 	if (env_path && access(env_path, R_OK) == 0)
 		return xstrdup(env_path);
@@ -5878,7 +5885,7 @@ static int ramdisk_inject_kernel_module(const char *cpio_path, const char *mod_p
 		printf("[+] Ramdisk injection: Mirrored to %s\n", mod_target);
 	}
 
-	/* 6. Universal First-Stage Init Wrapper (PID 1 Module Loader) */
+	/* 6. Universal First-Stage Init Wrapper (PID 1 Module Loader & BusyBox Integration) */
 	{
 		char *wrapper_bin_path = resolve_init_wrapper_binary(NULL);
 		if (wrapper_bin_path) {
@@ -5888,49 +5895,66 @@ static int ramdisk_inject_kernel_module(const char *cpio_path, const char *mod_p
 				cpio_node_t *init_node = NULL;
 				cpio_node_t *init_real_node = NULL;
 				cpio_node_t *n;
+				bool is_busybox = false;
+				const char *bname = bb_basename(wrapper_bin_path);
+
+				if (strncmp(bname, "busybox", 7) == 0)
+					is_busybox = true;
 
 				for (n = head; n; n = n->next) {
 					if (strcmp(n->name, "init") == 0) init_node = n;
 					else if (strcmp(n->name, "init.real") == 0) init_real_node = n;
 				}
 
-				if (init_node) {
+				/* Back up stock /init before modifying */
+				if (init_node && !init_real_node) {
 					if (S_ISLNK(init_node->mode)) {
-						if (!init_real_node) {
-							const char *tgt = (const char *)init_node->data;
-							if (tgt && tgt[0] != '\0') {
-								cpio_set_file(&head, "init.real", 0120777, xstrdup(tgt), (uint32_t)strlen(tgt));
-							} else {
-								cpio_set_file(&head, "init.real", 0120777, xstrdup("/system/bin/init"), (uint32_t)strlen("/system/bin/init"));
-							}
-							printf("[+] First-stage init: Preserved symlink target -> init.real\n");
+						const char *tgt = (const char *)init_node->data;
+						if (tgt && tgt[0] != '\0') {
+							cpio_set_file(&head, "init.real", 0120777, xstrdup(tgt), (uint32_t)strlen(tgt));
+						} else {
+							cpio_set_file(&head, "init.real", 0120777, xstrdup("/system/bin/init"), (uint32_t)strlen("/system/bin/init"));
 						}
-						free(init_node->data);
-						init_node->mode = 0100755;
-						init_node->filesize = (uint32_t)w_sz;
-						init_node->data = xmemdup(w_data, w_sz);
-						printf("[+] First-stage init: Injected universal init_wrapper as PID 1 /init (replaced symlink)\n");
+						printf("[+] First-stage init: Preserved symlink target -> init.real\n");
 					} else {
-						if (!init_real_node) {
-							cpio_set_file(&head, "init.real", init_node->mode,
-							              xmemdup(init_node->data, init_node->filesize), init_node->filesize);
-							printf("[+] First-stage init: Preserved stock binary -> init.real\n");
-						}
+						cpio_set_file(&head, "init.real", init_node->mode,
+						              xmemdup(init_node->data, init_node->filesize), init_node->filesize);
+						printf("[+] First-stage init: Preserved stock binary -> init.real\n");
+					}
+				}
+
+				if (is_busybox) {
+					/* Inject BusyBox into sbin/busybox and make /init a symlink to it */
+					cpio_set_file(&head, "sbin/busybox", 0100755, xmemdup(w_data, w_sz), (uint32_t)w_sz);
+					printf("[+] First-stage init: Injected BusyBox universal binary -> sbin/busybox (%zu bytes)\n", w_sz);
+
+					if (init_node) {
+						free(init_node->data);
+						init_node->mode = 0120777;
+						init_node->filesize = (uint32_t)strlen("/sbin/busybox");
+						init_node->data = xstrdup("/sbin/busybox");
+					} else {
+						cpio_set_file(&head, "init", 0120777, xstrdup("/sbin/busybox"), (uint32_t)strlen("/sbin/busybox"));
+					}
+					printf("[+] First-stage init: Configured PID 1 /init -> /sbin/busybox (applet: init_wrapper)\n");
+				} else {
+					/* Inject standalone init_wrapper as /init binary */
+					if (init_node) {
 						free(init_node->data);
 						init_node->mode = 0100755;
 						init_node->filesize = (uint32_t)w_sz;
 						init_node->data = xmemdup(w_data, w_sz);
-						printf("[+] First-stage init: Injected universal init_wrapper as PID 1 /init (replaced binary)\n");
+						printf("[+] First-stage init: Injected universal init_wrapper as PID 1 /init\n");
+					} else {
+						cpio_set_file(&head, "init", 0100755, xmemdup(w_data, w_sz), (uint32_t)w_sz);
+						printf("[+] First-stage init: Injected universal init_wrapper as PID 1 /init\n");
 					}
-				} else {
-					cpio_set_file(&head, "init", 0100755, xmemdup(w_data, w_sz), (uint32_t)w_sz);
-					printf("[+] First-stage init: Injected universal init_wrapper as PID 1 /init\n");
 				}
 				free(w_data);
 			}
 			free(wrapper_bin_path);
 		} else {
-			printf("[!] Warning: init_wrapper binary not found; falling back to init.modules.rc\n");
+			printf("[!] Warning: init_wrapper / busybox binary not found; falling back to init.modules.rc\n");
 		}
 	}
 
@@ -6456,6 +6480,7 @@ static int magiskboot_set_recovery_op(int argc, char **argv)
 	/* 6. Flash directly if --install requested */
 	if (install) {
 		struct stat st_out;
+		uint64_t bdev_sz = 0;
 		int sec_sz = 512;
 		char stream_buf[1024 * 1024];
 		struct timespec t_start, t_end;
@@ -6492,6 +6517,9 @@ static int magiskboot_set_recovery_op(int argc, char **argv)
 #ifdef BLKSSZGET
 			ioctl(out_fd, BLKSSZGET, &sec_sz);
 #endif
+			if (bdev_sz > 0)
+				printf("    • Target Capacity    : %llu bytes (%.2f MB)\n",
+				       (unsigned long long)bdev_sz, (double)bdev_sz / (1024.0 * 1024.0));
 		}
 
 		written = 0;
