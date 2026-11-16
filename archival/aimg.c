@@ -60,6 +60,8 @@
 //usage:     "\n	--cmdline <file> <print|patch> Kernel cmdline configuration tool"
 //usage:     "\n	--hexpatch <file> <from> <to> In-place binary hex string patch"
 //usage:     "\n	--decompress <in> [out]       Decompress kernel/ramdisk image"
+//usage:     "\n	--set-recovery <boot> <rec>   Inject custom recovery (TWRP) into boot image (--live, --install)"
+//usage:     "\n	--extract-recovery <boot> [o] Extract recovery subsystem (cpio, img, or dir) from boot image"
 //usage:     "\n"
 //usage:     "\nPackaging:"
 //usage:     "\n	--dist <out.zip>              Create universal AnyKernel/Magisk flashable ZIP"
@@ -75,6 +77,7 @@
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
 #include <linux/fs.h>
+#include <sys/sysmacros.h>
 
 #ifndef BLKGETSIZE64
 #define BLKGETSIZE64 _IOR(0x12, 114, size_t)
@@ -82,10 +85,21 @@
 #ifndef BLKROSET
 #define BLKROSET _IO(0x12, 93)
 #endif
+#ifndef BLKSSZGET
+#define BLKSSZGET _IO(0x12, 104)
+#endif
+#ifndef major
+#define major(dev) ((unsigned int)(((dev) >> 8) & 0xfff))
+#endif
+#ifndef minor
+#define minor(dev) ((unsigned int)((dev) & 0xff))
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic ignored "-Waddress-of-packed-member"
 #endif
+
+#include "aimg_lz4.c"
 
 /* =========================================================================
  * 1. Format Detection & Helper Functions
@@ -106,8 +120,11 @@ static uint8_t boot_check_fmt(const void *buf, size_t len) {
 	if (len >= 4) {
 		if (memcmp(b, "\x04\x22\x4d\x18", 4) == 0 || memcmp(b, "\x03\x21\x4c\x18", 4) == 0)
 			return BOOT_FMT_LZ4;
-		if (memcmp(b, "\x02\x21\x4c\x18", 4) == 0)
+		if (memcmp(b, "\x02\x21\x4c\x18", 4) == 0) {
+			if (boot_hdr_is_lz4_lg(b, len))
+				return BOOT_FMT_LZ4_LG;
 			return BOOT_FMT_LZ4_LEGACY;
+		}
 	}
 	if (len >= 4 && memcmp(b, "\xd0\x0d\xfe\xed", 4) == 0) return BOOT_FMT_DTB;
 	if (len >= 8 && memcmp(b, "\x44\x48\x54\x42\x01\x00\x00\x00", 8) == 0) return BOOT_FMT_DHTB;
@@ -185,6 +202,7 @@ static int32_t boot_find_dtb_offset(const void *buf, size_t len) {
 	return -1;
 }
 
+
 static inline size_t align_to(size_t v, size_t a) {
 	if (a == 0) return v;
 	return (v + a - 1) / a * a;
@@ -200,6 +218,7 @@ static int safe_rename_or_copy(const char *src, const char *dst) {
 	}
 	return -1;
 }
+
 
 static void *magiskboot_read_file(const char *path, size_t *out_sz) {
 	size_t max_sz = (size_t)INT_MAX - 4095;
@@ -577,46 +596,55 @@ static int dyn_hdr_load_props(boot_dyn_hdr_t *hdr, const char *path) {
 	return 0;
 }
 
-static void dyn_hdr_print(const boot_dyn_hdr_t *hdr) {
+static void boot_img_print_info(const boot_img_t *img, const char *path) {
 	uint32_t ver;
 	bool is_vnd;
 	uint32_t os_ver = 0;
 
-	if (!hdr || !hdr->raw) return;
+	if (!img || !img->hdr.raw) return;
 
-	ver = dyn_hdr_version(hdr);
-	is_vnd = dyn_hdr_is_vendor(hdr);
+	ver = dyn_hdr_version(&img->hdr);
+	is_vnd = dyn_hdr_is_vendor(&img->hdr);
 
-	fprintf(stderr, "%-*s [%u]\n", PADDING, "HEADER_VER", ver);
-	if (!is_vnd) {
-		fprintf(stderr, "%-*s [%u]\n", PADDING, "KERNEL_SZ", *dyn_hdr_kernel_size((boot_dyn_hdr_t *)hdr));
+	printf("Image:                %s\n", path);
+	printf("Format:               Android %sBoot Image (v%u)\n", is_vnd ? "Vendor " : "", ver);
+	if (!is_vnd && img->kernel_size > 0) {
+		printf("Kernel size:          %u bytes (%s)\n", img->kernel_size, boot_fmt2name(img->k_fmt));
 	}
-	fprintf(stderr, "%-*s [%u]\n", PADDING, "RAMDISK_SZ", *dyn_hdr_ramdisk_size((boot_dyn_hdr_t *)hdr));
-	if (ver < 3 && !is_vnd) {
-		fprintf(stderr, "%-*s [%u]\n", PADDING, "SECOND_SZ", *dyn_hdr_second_size((boot_dyn_hdr_t *)hdr));
+	if (img->kernel_dtb_size > 0) {
+		printf("Kernel DTB size:      %zu bytes\n", img->kernel_dtb_size);
 	}
-	if (ver == 1 || ver == 2) {
-		fprintf(stderr, "%-*s [%u]\n", PADDING, "RECOV_DTBO_SZ", *dyn_hdr_recovery_dtbo_size((boot_dyn_hdr_t *)hdr));
+	if (img->ramdisk_size > 0) {
+		printf("Ramdisk size:         %u bytes (%s)\n", img->ramdisk_size, boot_fmt2name(img->r_fmt));
 	}
-	if (ver == 2 || is_vnd) {
-		fprintf(stderr, "%-*s [%u]\n", PADDING, "DTB_SZ", *dyn_hdr_dtb_size((boot_dyn_hdr_t *)hdr));
+	if (img->second_size > 0) {
+		printf("Second size:          %u bytes\n", img->second_size);
 	}
-	if (ver == 4 && is_vnd) {
-		fprintf(stderr, "%-*s [%u]\n", PADDING, "BOOTCONFIG_SZ", *dyn_hdr_bootconfig_size((boot_dyn_hdr_t *)hdr));
+	if (img->recovery_dtbo_size > 0) {
+		printf("Recovery DTBO size:   %u bytes\n", img->recovery_dtbo_size);
+	}
+	if (img->dtb_size > 0) {
+		printf("DTB size:             %u bytes\n", img->dtb_size);
+	}
+	if (img->bootconfig_size > 0) {
+		printf("Bootconfig size:      %u bytes\n", img->bootconfig_size);
 	}
 
 	if (ver < 3) {
-		os_ver = ((struct boot_img_hdr_v0 *)hdr->raw)->os_version;
+		os_ver = ((struct boot_img_hdr_v0 *)img->hdr.raw)->os_version;
 	} else if (!is_vnd) {
-		os_ver = ((struct boot_img_hdr_v3 *)hdr->raw)->os_version;
+		os_ver = ((struct boot_img_hdr_v3 *)img->hdr.raw)->os_version;
 	}
 	if (os_ver) {
 		int a = 0, b = 0, c = 0, y = 0, m = 0;
 		boot_hdr_decode_os_version(os_ver, &a, &b, &c, &y, &m);
-		fprintf(stderr, "%-*s [%d.%d.%d]\n", PADDING, "OS_VERSION", a, b, c);
-		fprintf(stderr, "%-*s [%d-%02d]\n", PADDING, "OS_PATCH_LEVEL", y, m);
+		printf("OS version:           %d.%d.%d\n", a, b, c);
+		printf("OS patch level:       %d-%02d\n", y, m);
 	}
-	fprintf(stderr, "%-*s [%u]\n", PADDING, "PAGESIZE", dyn_hdr_page_size(hdr));
+	printf("Page size:            %u bytes\n", dyn_hdr_page_size(&img->hdr));
+	if (img->flags & BOOT_FLAG_AVB) {
+		printf("AVB 2.0 footer:       PRESENT\n");
+	}
 }
 
 /* =========================================================================
@@ -630,6 +658,12 @@ static int bb_decompress_data(uint8_t fmt, const void *in, size_t in_sz, int out
 	transformer_state_t xstate;
 
 	if (!in || in_sz == 0 || out_fd < 0) return -1;
+
+	if (fmt == BOOT_FMT_LZ4_LEGACY || fmt == BOOT_FMT_LZ4_LG) {
+		return lz4_legacy_decompress(in, in_sz, out_fd);
+	} else if (fmt == BOOT_FMT_LZ4) {
+		return lz4_frame_decompress(in, in_sz, out_fd);
+	}
 
 	in_fd = xmkstemp(tmp_path);
 	unlink(tmp_path);
@@ -768,7 +802,6 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 		return false;
 	}
 
-	fprintf(stderr, "Parsing boot image: [%s]\n", path);
 	start = (const uint8_t *)img->map_ptr;
 	end = start + img->map_sz;
 
@@ -800,7 +833,6 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 		uint32_t ver = *(uint32_t *)(hdr_ptr + 8);
 		if (ver == 4) img->hdr.type = BOOT_HDR_VND_V4;
 		else img->hdr.type = BOOT_HDR_VND_V3;
-		fprintf(stderr, "VENDOR_BOOT_HDR\n");
 	} else {
 		uint32_t ver = *(uint32_t *)(hdr_ptr + 40);
 		if (ver == 1) img->hdr.type = BOOT_HDR_V1;
@@ -813,8 +845,6 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 	img->hdr.raw_sz = dyn_hdr_size(img->hdr.type);
 	img->hdr.raw = xzalloc(img->hdr.raw_sz);
 	memcpy(img->hdr.raw, hdr_ptr, img->hdr.raw_sz);
-
-	dyn_hdr_print(&img->hdr);
 
 	page_sz = dyn_hdr_page_size(&img->hdr);
 	off = align_to(img->hdr.raw_sz, page_sz);
@@ -831,9 +861,7 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 				img->kernel = (const uint8_t *)img->kernel + sizeof(struct mtk_hdr);
 				img->kernel_size -= sizeof(struct mtk_hdr);
 				img->k_fmt = boot_check_fmt(img->kernel, img->kernel_size);
-				fprintf(stderr, "%-*s [MTK-KERNEL]\n", PADDING, "MTK_HEADER");
 			}
-			fprintf(stderr, "%-*s [%s]\n", PADDING, "KERNEL_FMT", boot_fmt2name(img->k_fmt));
 			off += align_to(img->kernel_size, page_sz);
 
 			dtb_off = boot_find_dtb_offset(img->kernel, img->kernel_size);
@@ -841,7 +869,6 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 				img->kernel_dtb = img->kernel + dtb_off;
 				img->kernel_dtb_size = img->kernel_size - dtb_off;
 				img->kernel_size = dtb_off;
-				fprintf(stderr, "%-*s [%zu]\n", PADDING, "KERNEL_DTB_SZ", img->kernel_dtb_size);
 			}
 		}
 	}
@@ -855,9 +882,7 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 			img->ramdisk = (const uint8_t *)img->ramdisk + sizeof(struct mtk_hdr);
 			img->ramdisk_size -= sizeof(struct mtk_hdr);
 			img->r_fmt = boot_check_fmt(img->ramdisk, img->ramdisk_size);
-			fprintf(stderr, "%-*s [MTK-RAMDISK]\n", PADDING, "MTK_HEADER");
 		}
-		fprintf(stderr, "%-*s [%s]\n", PADDING, "RAMDISK_FMT", boot_fmt2name(img->r_fmt));
 		off += align_to(img->ramdisk_size, page_sz);
 	}
 
@@ -896,7 +921,6 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 	if (img->map_sz >= sizeof(struct avb_footer)) {
 		const uint8_t *footer_ptr = (const uint8_t *)img->map_ptr + img->map_sz - sizeof(struct avb_footer);
 		if (memcmp(footer_ptr, AVB_FOOTER_MAGIC, AVB_FOOTER_MAGIC_LEN) == 0) {
-			fprintf(stderr, "VBMETA\n");
 			img->flags |= BOOT_FLAG_AVB;
 			img->avb_footer = (const struct avb_footer *)footer_ptr;
 		}
@@ -930,11 +954,11 @@ static int magiskboot_unpack(const char *image, bool skip_kernel_decomp, bool sk
 	if (kernel_only) {
 		if (boot.kernel && boot.kernel_size > 0) {
 			write_to_disk(KERNEL_FILE, boot.kernel, boot.kernel_size, boot.k_fmt, skip_kernel_decomp);
-			fprintf(stderr, "[+] Extracted kernel -> [%s]\n", KERNEL_FILE);
+			printf("Extracted kernel (%u bytes) -> %s\n", boot.kernel_size, KERNEL_FILE);
 		}
 		if (boot.kernel_dtb && boot.kernel_dtb_size > 0) {
 			write_to_disk(KER_DTB_FILE, boot.kernel_dtb, boot.kernel_dtb_size, BOOT_FMT_UNKNOWN, true);
-			fprintf(stderr, "[+] Extracted kernel_dtb -> [%s]\n", KER_DTB_FILE);
+			printf("Extracted kernel_dtb (%zu bytes) -> %s\n", boot.kernel_dtb_size, KER_DTB_FILE);
 		}
 		boot_img_free(&boot);
 		return 0;
@@ -942,9 +966,12 @@ static int magiskboot_unpack(const char *image, bool skip_kernel_decomp, bool sk
 
 	dyn_hdr_dump_props(&boot.hdr, HEADER_FILE);
 	if (hdr_only) {
+		boot_img_print_info(&boot, image);
 		boot_img_free(&boot);
 		return 0;
 	}
+
+	boot_img_print_info(&boot, image);
 
 	if (boot.kernel && boot.kernel_size > 0) {
 		write_to_disk(KERNEL_FILE, boot.kernel, boot.kernel_size, boot.k_fmt, skip_kernel_decomp);
@@ -1020,11 +1047,16 @@ static int compress_file_format(const char *src, const char *dst, uint8_t fmt) {
 	const char *arg = "-9c";
 	pid_t pid;
 
+	if (fmt == BOOT_FMT_LZ4_LEGACY) {
+		return lz4_legacy_compress(src, dst, false);
+	} else if (fmt == BOOT_FMT_LZ4_LG) {
+		return lz4_legacy_compress(src, dst, true);
+	} else if (fmt == BOOT_FMT_LZ4) {
+		return lz4_frame_compress(src, dst);
+	}
+
 	if (fmt == BOOT_FMT_XZ || fmt == BOOT_FMT_LZMA) {
 		prog = "xz";
-		arg = "-c";
-	} else if (fmt == BOOT_FMT_LZ4 || fmt == BOOT_FMT_LZ4_LEGACY || fmt == BOOT_FMT_LZ4_LG) {
-		prog = "lz4";
 		arg = "-c";
 	} else if (fmt == BOOT_FMT_BZIP2) {
 		prog = "bzip2";
@@ -1061,6 +1093,7 @@ static int compress_file_format(const char *src, const char *dst, uint8_t fmt) {
 	return -1;
 }
 
+
 static const char *prepare_kernel_for_repack(boot_img_t *boot, bool skip_comp, char *tmp_buf, size_t tmp_sz) {
 	if (access(KERNEL_FILE, R_OK) != 0) return KERNEL_FILE;
 
@@ -1092,10 +1125,10 @@ static const char *prepare_ramdisk_for_repack(boot_img_t *boot, bool skip_comp, 
 	if (!skip_comp && boot_fmt_compressed(boot->r_fmt) && access(RAMDISK_FILE, R_OK) == 0) {
 		int in_fd = open_or_warn(RAMDISK_FILE, O_RDONLY);
 		if (in_fd >= 0) {
-			uint8_t magic[2];
-			ssize_t n = full_read(in_fd, magic, 2);
+			uint8_t magic[16];
+			ssize_t n = full_read(in_fd, magic, sizeof(magic));
 			close(in_fd);
-			if (n == 2 && magic[0] == 0x1f && magic[1] == 0x8b) {
+			if (n >= 2 && boot_check_fmt(magic, n) == boot->r_fmt) {
 				return RAMDISK_FILE;
 			}
 		}
@@ -1231,11 +1264,9 @@ static int magiskboot_repack(const char *src_img, const char *out_img, bool skip
 	/* 1. Reload properties from ./header if present */
 	if (access(HEADER_FILE, R_OK) == 0) {
 		dyn_hdr_load_props(&boot.hdr, HEADER_FILE);
-		fprintf(stderr, "[+] Loaded header properties from '%s'\n", HEADER_FILE);
 	}
 
 	target = out_img ? out_img : "new-boot.img";
-	fprintf(stderr, "Repack to boot image: [%s]\n", target);
 
 	out_fd = open3_or_warn(target, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
 	if (out_fd < 0) {
@@ -1384,8 +1415,6 @@ static int magiskboot_repack(const char *src_img, const char *out_img, bool skip
 			new_footer.vbmeta_offset = SWAP_BE64((uint64_t)new_vbmeta_off);
 			new_footer.vbmeta_size = boot.avb_footer->vbmeta_size;
 			full_write(out_fd, &new_footer, sizeof(new_footer));
-			fprintf(stderr, "[+] Preserved AVB 2.0 footer (original_image_size=%zu, vbmeta_offset=%zu)\n",
-			        (size_t)aosp_img_size, (size_t)new_vbmeta_off);
 		}
 	}
 
@@ -1399,13 +1428,14 @@ static int magiskboot_repack(const char *src_img, const char *out_img, bool skip
 		full_write(out_fd, zeros, hdr_pad - boot.hdr.raw_sz);
 	}
 
-	dyn_hdr_print(&boot.hdr);
-
 	close(out_fd);
+	printf("Repacked boot image -> %s\n", target);
 	boot_img_free(&boot);
 	return 0;
 }
 
+
+static int magiskboot_extract_recovery_op(int argc, char **argv);
 
 static int magiskboot_extract_component(const char *image, const char *comp, const char *outfile, bool skip_decomp) {
 	boot_img_t boot;
@@ -1423,7 +1453,8 @@ static int magiskboot_extract_component(const char *image, const char *comp, con
 		"recovery_dtbo\0"
 		"second\0"
 		"extra\0"
-		"bootconfig\0";
+		"bootconfig\0"
+		"recovery\0";
 	enum {
 		COMP_kernel = 0,
 		COMP_ramdisk,
@@ -1433,6 +1464,7 @@ static int magiskboot_extract_component(const char *image, const char *comp, con
 		COMP_second,
 		COMP_extra,
 		COMP_bootconfig,
+		COMP_recovery,
 	};
 
 	if (!image || !comp) return 1;
@@ -1482,8 +1514,22 @@ static int magiskboot_extract_component(const char *image, const char *comp, con
 		sz = boot.bootconfig_size;
 		dest = outfile ? outfile : BOOTCONFIG_FILE;
 		break;
+	case COMP_recovery: {
+		char *rec_argv[5];
+		int rec_argc = 3;
+		boot_img_free(&boot);
+		rec_argv[0] = (char *)"aimg";
+		rec_argv[1] = (char *)"--extract-recovery";
+		rec_argv[2] = (char *)image;
+		if (outfile) {
+			rec_argv[3] = (char *)outfile;
+			rec_argc = 4;
+		}
+		rec_argv[rec_argc] = NULL;
+		return magiskboot_extract_recovery_op(rec_argc, rec_argv);
+	}
 	default:
-		bb_error_msg("unknown component '%s' (supported: kernel, ramdisk, dtb, kernel_dtb, recovery_dtbo, second, extra, bootconfig)", comp);
+		bb_error_msg("unknown component '%s' (supported: kernel, ramdisk, dtb, kernel_dtb, recovery_dtbo, second, extra, bootconfig, recovery)", comp);
 		boot_img_free(&boot);
 		return 1;
 	}
@@ -1496,7 +1542,7 @@ static int magiskboot_extract_component(const char *image, const char *comp, con
 
 	ret = write_to_disk(dest, data, sz, fmt, skip_decomp);
 	if (ret == 0) {
-		fprintf(stderr, "[+] Component '%s' extracted to [%s] (%zu bytes)\n", comp, dest, sz);
+		printf("Extracted '%s' (%zu bytes) -> %s\n", comp, sz, dest);
 	}
 	boot_img_free(&boot);
 	return (ret == 0) ? 0 : 1;
@@ -1536,7 +1582,7 @@ static bool hexpatch_buffer(uint8_t *buf, size_t size, const char *from_hex, con
 		if (buf[i] == pat[0] && memcmp(buf + i, pat, pat_sz) == 0) {
 			size_t replace_len = (patch_sz < pat_sz) ? patch_sz : pat_sz;
 			memcpy(buf + i, patch, replace_len);
-			fprintf(stderr, "[+] Hex patch @ 0x%08zX [%s] -> [%s]\n", i, from_hex, to_hex);
+			printf("Hex patch @ 0x%08zX: %s -> %s\n", i, from_hex, to_hex);
 			count++;
 			i += pat_sz - 1;
 		}
@@ -1551,7 +1597,7 @@ static int magiskboot_hexpatch(const char *file, const char *from_hex, const cha
 	int fd;
 	struct stat st;
 	uint8_t *buf;
-	bool ok;
+	bool is_ok;
 
 	if (!file || !from_hex || !to_hex) return 1;
 
@@ -1570,13 +1616,13 @@ static int magiskboot_hexpatch(const char *file, const char *from_hex, const cha
 		return 1;
 	}
 
-	ok = hexpatch_buffer(buf, st.st_size, from_hex, to_hex);
+	is_ok = hexpatch_buffer(buf, st.st_size, from_hex, to_hex);
 
 	msync(buf, st.st_size, MS_SYNC);
 	munmap(buf, st.st_size);
 	close(fd);
 
-	return ok ? 0 : 1;
+	return is_ok ? 0 : 1;
 }
 
 /* =========================================================================
@@ -1976,7 +2022,14 @@ static int cpio_exec_cmd(cpio_node_t **head_ptr, int argc, char **argv, bool *mo
 			bool found = false;
 			for (curr = *head_ptr; curr; curr = curr->next) {
 				if (strcmp(curr->name, target_entry) == 0) {
-					int out_fd = open3_or_warn(out_file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, curr->mode & 07777);
+					int out_fd;
+					const char *slash = strrchr(out_file, '/');
+					if (slash) {
+						char *d = xstrndup(out_file, slash - out_file);
+						bb_make_directory(d, 0755, FILEUTILS_RECUR);
+						free(d);
+					}
+					out_fd = open3_or_warn(out_file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, curr->mode & 07777);
 					if (out_fd >= 0) {
 						if (curr->data && curr->filesize > 0) {
 							full_write(out_fd, curr->data, curr->filesize);
@@ -1984,7 +2037,7 @@ static int cpio_exec_cmd(cpio_node_t **head_ptr, int argc, char **argv, bool *mo
 						close(out_fd);
 						chmod(out_file, curr->mode & 07777);
 						found = true;
-						fprintf(stderr, "[+] Extracted '%s' -> '%s'\n", target_entry, out_file);
+						printf("Extracted '%s' -> %s\n", target_entry, out_file);
 					}
 					break;
 				}
@@ -2015,7 +2068,7 @@ static int cpio_exec_cmd(cpio_node_t **head_ptr, int argc, char **argv, bool *mo
 					}
 				}
 			}
-			fprintf(stderr, "[+] Extracted all cpio entries into current directory\n");
+			printf("Extracted all cpio entries into current directory\n");
 			return 1;
 		}
 	}
@@ -2168,16 +2221,16 @@ static int magiskboot_dtb(int argc, char **argv) {
 		for (i = 0; i + 8 <= (size_t)st.st_size; i++) {
 			if (memcmp(p + i, ",verify", 7) == 0) {
 				memset(p + i, 0, 7);
-				fprintf(stderr, "[+] Patched fstab verity @ 0x%08zX\n", i);
+				printf("Patched fstab verity @ 0x%08zX\n", i);
 				count++;
 			} else if (memcmp(p + i, ",avb", 4) == 0) {
 				memset(p + i, 0, 4);
-				fprintf(stderr, "[+] Patched fstab avb @ 0x%08zX\n", i);
+				printf("Patched fstab avb @ 0x%08zX\n", i);
 				count++;
 			}
 		}
 		msync(p, st.st_size, MS_SYNC);
-		fprintf(stderr, "[+] DTB patch complete: %d patches applied\n", count);
+		printf("DTB patch complete: %d patches applied\n", count);
 		break;
 	}
 	default:
@@ -2208,7 +2261,7 @@ static int magiskboot_cleanup(void) {
 	for (i = 0; files[i]; i++) {
 		if (unlink(files[i]) == 0) count++;
 	}
-	fprintf(stderr, "[+] Cleaned up %d temporary boot files\n", count);
+	printf("Cleaned up %d temporary boot files\n", count);
 	return 0;
 }
 
@@ -2262,7 +2315,7 @@ static int magiskboot_decompress(const char *infile, const char *outfile) {
 	munmap(in_map, st.st_size);
 
 	if (ret == 0) {
-		fprintf(stderr, "[+] Decompressed [%s] (%s) -> [%s]\n", infile, boot_fmt2name(fmt), outfile);
+		printf("Decompressed %s (%s) -> %s\n", infile, boot_fmt2name(fmt), outfile);
 	} else {
 		bb_error_msg("decompression failed for '%s'", infile);
 		unlink(outfile);
@@ -2400,8 +2453,8 @@ static int magiskboot_init_op(const char *image, const char *action, const char 
 		}
 		close(ofd);
 		chmod(dest, 0755);
-		fprintf(stderr, "[+] Extracted '%s' from '%s' -> '%s' (%u bytes)\n",
-		        init_node->name, image, dest, init_node->filesize);
+		printf("Extracted '%s' from '%s' -> %s (%u bytes)\n",
+		       init_node->name, image, dest, init_node->filesize);
 		cpio_free_all(head);
 		boot_img_free(&boot);
 		return 0;
@@ -3154,6 +3207,7 @@ static int parse_module_layout_from_btf(const uint8_t *btf_raw, size_t btf_size,
 	return -1;
 }
 
+
 static int probe_module_layout_from_kernel_image(const uint8_t *data, size_t size,
                                                  struct module_layout_probe *out)
 {
@@ -3424,13 +3478,13 @@ static int find_by_name_dir(const char *base, int depth, char *out_dir, size_t m
 			if (stat(subpath, &st) == 0 && S_ISDIR(st.st_mode)) {
 				char test_boot[PATH_MAX];
 				/* Verify this by-name directory actually contains boot or boot_a */
-				snprintf(test_boot, sizeof(test_boot), "%s/boot", subpath);
+				snprintf(test_boot, sizeof(test_boot), "%.*s/boot", (int)(sizeof(test_boot) - 16), subpath);
 				if (access(test_boot, F_OK) == 0) {
 					safe_strncpy(out_dir, subpath, max_len);
 					closedir(d);
 					return 0;
 				}
-				snprintf(test_boot, sizeof(test_boot), "%s/boot_a", subpath);
+				snprintf(test_boot, sizeof(test_boot), "%.*s/boot_a", (int)(sizeof(test_boot) - 16), subpath);
 				if (access(test_boot, F_OK) == 0) {
 					safe_strncpy(out_dir, subpath, max_len);
 					closedir(d);
@@ -3449,6 +3503,7 @@ static int find_by_name_dir(const char *base, int depth, char *out_dir, size_t m
 	closedir(d);
 	return -1;
 }
+
 
 static int get_active_slot_suffix(char *slot_suffix, size_t max_len)
 {
@@ -3475,8 +3530,8 @@ static int get_active_slot_suffix(char *slot_suffix, size_t max_len)
 				p = strstr(buf, "androidboot.slot=");
 				if (p) {
 					char sname[16] = {0};
-					if (sscanf(p + 17, "%15s", sname) == 1) {
-						snprintf(slot_suffix, max_len, "_%s", sname);
+					if (sscanf(p + 17, "%15s", sname) == 1 && max_len > 1) {
+						snprintf(slot_suffix, max_len, "_%.*s", (int)(max_len - 2), sname);
 					}
 				}
 			}
@@ -3535,6 +3590,7 @@ static int get_active_slot_suffix(char *slot_suffix, size_t max_len)
 	return -1;
 }
 
+
 static int find_target_boot_image(char *out_path, size_t max_len)
 {
 	char by_name_dir[PATH_MAX];
@@ -3552,7 +3608,7 @@ static int find_target_boot_image(char *out_path, size_t max_len)
 	}
 
 	/* Dynamically determine if the device is A/B by inspecting the partition table */
-	snprintf(test_path, sizeof(test_path), "%s/boot_a", by_name_dir);
+	snprintf(test_path, sizeof(test_path), "%.*s/boot_a", (int)(sizeof(test_path) - 16), by_name_dir);
 	if (access(test_path, F_OK) == 0) {
 		is_ab = true;
 	}
@@ -3569,9 +3625,9 @@ static int find_target_boot_image(char *out_path, size_t max_len)
 	       slot_suffix[0] ? ")" : "");
 
 	if (is_ab && slot_suffix[0] != '\0') {
-		snprintf(out_path, max_len, "%s/boot%s", by_name_dir, slot_suffix);
+		snprintf(out_path, max_len, "%.*s/boot%s", (int)(max_len - 32), by_name_dir, slot_suffix);
 	} else {
-		snprintf(out_path, max_len, "%s/boot", by_name_dir);
+		snprintf(out_path, max_len, "%.*s/boot", (int)(max_len - 16), by_name_dir);
 	}
 
 	if (access(out_path, F_OK) == 0) {
@@ -3582,6 +3638,7 @@ static int find_target_boot_image(char *out_path, size_t max_len)
 	bb_error_msg("target boot partition '%s' does not exist", out_path);
 	return -1;
 }
+
 
 static int extract_vermagic_from_buffer(const uint8_t *data, size_t size, char *out_magic, size_t max_len)
 {
@@ -3637,6 +3694,7 @@ static int extract_vermagic_from_buffer(const uint8_t *data, size_t size, char *
 	}
 	return -1;
 }
+
 
 static int detect_vermagic_from_boot_image(const char *boot_path, char *out_magic, size_t max_len)
 {
@@ -3764,6 +3822,7 @@ static int probe_target_module_layout(const char *boot_img_path, const char *tar
 
 	return -1;
 }
+
 
 /*
  * Running Kernel Config & Vermagic Detection
@@ -3932,6 +3991,7 @@ static int elf64_find_section(struct elf64_ctx *ctx, const char *name, Elf64_Shd
 	return -1;
 }
 
+
 static int elf64_find_section_by_type(struct elf64_ctx *ctx, uint32_t type, Elf64_Shdr **out_shdr, size_t *out_idx)
 {
 	size_t i;
@@ -3945,6 +4005,7 @@ static int elf64_find_section_by_type(struct elf64_ctx *ctx, uint32_t type, Elf6
 	}
 	return -1;
 }
+
 
 static int elf64_find_symbol(struct elf64_ctx *ctx, const char *name, Elf64_Sym *out_sym, size_t *out_idx)
 {
@@ -3975,6 +4036,7 @@ static int elf64_find_symbol(struct elf64_ctx *ctx, const char *name, Elf64_Sym 
 	}
 	return -1;
 }
+
 
 static int elf64_update_sym(struct elf64_ctx *ctx, size_t sym_idx, const Elf64_Sym *sym)
 {
@@ -4021,6 +4083,7 @@ static int elf64_find_rela_by_symbol(struct elf64_ctx *ctx, size_t rela_sec_idx,
 	}
 	return -1;
 }
+
 
 static int elf64_update_rela(struct elf64_ctx *ctx, size_t rela_sec_idx, size_t rela_idx, const Elf64_Rela *rela)
 {
@@ -5543,6 +5606,346 @@ static int magiskboot_vbmeta_op(int argc, char **argv) {
 #define BLKROSET _IO(0x12, 93)
 #endif
 
+/*
+ * Set or replace an entry in the in-memory CPIO linked list.
+ * Takes ownership of data.
+ */
+static void cpio_set_file(cpio_node_t **head_ptr, const char *name, uint32_t mode, void *data, uint32_t size)
+{
+	cpio_node_t *curr;
+	for (curr = *head_ptr; curr; curr = curr->next) {
+		if (strcmp(curr->name, name) == 0) {
+			free(curr->data);
+			curr->data = data;
+			curr->filesize = size;
+			curr->mode = mode;
+			return;
+		}
+	}
+
+	curr = xzalloc(sizeof(*curr));
+	curr->name = xstrdup(name);
+	curr->mode = mode;
+	curr->filesize = size;
+	curr->data = data;
+	curr->nlink = 1;
+	{
+		cpio_node_t **tail_ptr = head_ptr;
+		while (*tail_ptr) tail_ptr = &(*tail_ptr)->next;
+		*tail_ptr = curr;
+	}
+}
+
+/*
+ * Append a single-line entry to a text file in CPIO if not already present.
+ */
+static void cpio_append_line_if_missing(cpio_node_t **head_ptr, const char *path, const char *line)
+{
+	cpio_node_t *curr;
+	size_t line_len = strlen(line);
+
+	for (curr = *head_ptr; curr; curr = curr->next) {
+		if (strcmp(curr->name, path) == 0) {
+			if (curr->data && curr->filesize > 0) {
+				const char *d = (const char *)curr->data;
+				size_t dsz = curr->filesize;
+				const char *p = d;
+				bool found = false;
+
+				while (p < d + dsz && (p = strstr(p, line)) != NULL) {
+					bool start_ok = (p == d || *(p - 1) == '\n');
+					const char *end_p = p + line_len;
+					bool end_ok = (end_p == d + dsz || *end_p == '\n' || *end_p == '\r' || *end_p == '\0');
+					if (start_ok && end_ok) {
+						found = true;
+						break;
+					}
+					p += line_len;
+				}
+
+				if (found) {
+					return; /* Already present */
+				}
+
+				{
+					/* Append line cleanly */
+					size_t new_sz;
+					char *new_data;
+					size_t pos;
+
+					new_sz = dsz + line_len + 2;
+					new_data = xmalloc(new_sz);
+					memcpy(new_data, d, dsz);
+					pos = dsz;
+					if (pos > 0 && new_data[pos - 1] != '\n') {
+						new_data[pos++] = '\n';
+					}
+					memcpy(new_data + pos, line, line_len);
+					pos += line_len;
+					new_data[pos++] = '\n';
+
+					free(curr->data);
+					curr->data = new_data;
+					curr->filesize = (uint32_t)pos;
+					return;
+				}
+			} else {
+				char *new_data = xasprintf("%s\n", line);
+				free(curr->data);
+				curr->data = new_data;
+				curr->filesize = (uint32_t)strlen(new_data);
+				return;
+			}
+		}
+	}
+
+	/* Entry does not exist: create file with this line */
+	{
+		char *new_data = xasprintf("%s\n", line);
+		cpio_set_file(head_ptr, path, 0100644, new_data, (uint32_t)strlen(new_data));
+	}
+}
+
+/*
+ * Universal Kernel Module Ramdisk Injector.
+ * Injects any .ko module into ramdisk.cpio, dynamically updating
+ * modules.load and modules.dep for early kernel first-stage init modprobe.
+ */
+static char *resolve_init_wrapper_binary(const char *custom)
+{
+	static const char *const names[] = {
+		"init_wrapper",
+		"init_wrapper_aarch64",
+		"init_wrapper-arm64",
+		"init_wrapper-aarch64",
+		NULL
+	};
+	const char *env_path;
+	char exe_path[PATH_MAX];
+	char exe_dir[PATH_MAX];
+	ssize_t len;
+	int i;
+
+	/* 1. Explicit CLI argument */
+	if (custom && access(custom, R_OK) == 0)
+		return xstrdup(custom);
+
+	/* 2. Environment variable override */
+	env_path = getenv("INIT_WRAPPER_BIN");
+	if (env_path && access(env_path, R_OK) == 0)
+		return xstrdup(env_path);
+
+	/* 3. Probe relative to the running executable's directory */
+	len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+	if (len > 0) {
+		char *slash;
+		exe_path[len] = '\0';
+		safe_strncpy(exe_dir, exe_path, sizeof(exe_dir));
+		slash = strrchr(exe_dir, '/');
+		if (slash) {
+			*slash = '\0';
+			for (i = 0; names[i]; i++) {
+				char cand[PATH_MAX];
+				snprintf(cand, sizeof(cand), "%.*s/%s", (int)(sizeof(cand) - 64), exe_dir, names[i]);
+				if (access(cand, R_OK) == 0)
+					return xstrdup(cand);
+			}
+			/* Check sibling directories bin/ or tools/ */
+			for (i = 0; names[i]; i++) {
+				char cand[PATH_MAX];
+				snprintf(cand, sizeof(cand), "%.*s/../bin/%s", (int)(sizeof(cand) - 64), exe_dir, names[i]);
+				if (access(cand, R_OK) == 0)
+					return xstrdup(cand);
+				snprintf(cand, sizeof(cand), "%.*s/../tools/%s", (int)(sizeof(cand) - 64), exe_dir, names[i]);
+				if (access(cand, R_OK) == 0)
+					return xstrdup(cand);
+				snprintf(cand, sizeof(cand), "%.*s/tools/%s", (int)(sizeof(cand) - 64), exe_dir, names[i]);
+				if (access(cand, R_OK) == 0)
+					return xstrdup(cand);
+			}
+		}
+	}
+
+	/* 4. Probe current working directory */
+	for (i = 0; names[i]; i++) {
+		if (access(names[i], R_OK) == 0)
+			return xstrdup(names[i]);
+		{
+			char cand[PATH_MAX];
+			snprintf(cand, sizeof(cand), "bin/%s", names[i]);
+			if (access(cand, R_OK) == 0)
+				return xstrdup(cand);
+			snprintf(cand, sizeof(cand), "tools/%s", names[i]);
+			if (access(cand, R_OK) == 0)
+				return xstrdup(cand);
+		}
+	}
+
+	return NULL;
+}
+
+static int ramdisk_inject_kernel_module(const char *cpio_path, const char *mod_path, const char *mod_filename)
+{
+	cpio_node_t *head;
+	cpio_node_t *curr;
+	size_t mod_sz = 0;
+	void *mod_data;
+	bool has_system_modules = false;
+	char mod_target[PATH_MAX];
+	char dep_line[PATH_MAX];
+
+	head = cpio_read_all(cpio_path);
+	if (!head) {
+		bb_error_msg("failed to parse ramdisk CPIO archive '%s'", cpio_path);
+		return -1;
+	}
+
+	mod_data = magiskboot_read_file(mod_path, &mod_sz);
+	if (!mod_data || mod_sz == 0) {
+		bb_error_msg("failed to read staged module '%s'", mod_path);
+		if (mod_data) free(mod_data);
+		cpio_free_all(head);
+		return -1;
+	}
+
+	/* Check ramdisk directory structure conventions */
+	for (curr = head; curr; curr = curr->next) {
+		if (strncmp(curr->name, "system/lib/modules", 18) == 0) {
+			has_system_modules = true;
+			break;
+		}
+	}
+
+	/* Format dependency entry (<filename>:\n) */
+	snprintf(dep_line, sizeof(dep_line), "%s:", mod_filename);
+
+	/* 1. Inject into standard canonical /lib/modules/ */
+	snprintf(mod_target, sizeof(mod_target), "lib/modules/%s", mod_filename);
+	cpio_set_file(&head, mod_target, 0100644, xmemdup(mod_data, mod_sz), (uint32_t)mod_sz);
+	cpio_append_line_if_missing(&head, "lib/modules/modules.load", mod_filename);
+	cpio_append_line_if_missing(&head, "lib/modules/modules.dep", dep_line);
+	printf("[+] Ramdisk injection: Added %s (%zu bytes)\n", mod_target, mod_sz);
+	printf("[+] Autoload configuration: Updated lib/modules/modules.load & modules.dep\n");
+
+	/* 2. Create empty index files if not present */
+	{
+		cpio_node_t *node;
+		bool has_alias = false, has_syms = false;
+		for (node = head; node; node = node->next) {
+			if (strcmp(node->name, "lib/modules/modules.alias") == 0) has_alias = true;
+			else if (strcmp(node->name, "lib/modules/modules.symbols") == 0) has_syms = true;
+		}
+		if (!has_alias) cpio_set_file(&head, "lib/modules/modules.alias", 0100644, xzalloc(1), 0);
+		if (!has_syms) cpio_set_file(&head, "lib/modules/modules.symbols", 0100644, xzalloc(1), 0);
+	}
+
+	/* 3. Inject root-level copy (failsafe for early init) */
+	cpio_set_file(&head, mod_filename, 0100644, xmemdup(mod_data, mod_sz), (uint32_t)mod_sz);
+
+	/* 4. Second-stage early-init fallback triggers in init.modules.rc */
+	{
+		cpio_node_t *rc_node = NULL;
+		cpio_node_t *n;
+		char insmod_line1[PATH_MAX + 32];
+		char insmod_line2[PATH_MAX + 32];
+
+		snprintf(insmod_line1, sizeof(insmod_line1), "    insmod /lib/modules/%s", mod_filename);
+		snprintf(insmod_line2, sizeof(insmod_line2), "    insmod /%s", mod_filename);
+
+		for (n = head; n; n = n->next) {
+			if (strcmp(n->name, "init.modules.rc") == 0) {
+				rc_node = n;
+				break;
+			}
+		}
+
+		if (rc_node && rc_node->data && rc_node->filesize > 0) {
+			cpio_append_line_if_missing(&head, "init.modules.rc", insmod_line1);
+			cpio_append_line_if_missing(&head, "init.modules.rc", insmod_line2);
+		} else {
+			char *rc_content = xasprintf("on early-init\n%s\n%s\n", insmod_line1, insmod_line2);
+			cpio_set_file(&head, "init.modules.rc", 0100644, rc_content, (uint32_t)strlen(rc_content));
+		}
+	}
+	printf("[+] Dual-stage fallback: Generated init.modules.rc & root /%s\n", mod_filename);
+
+	/* 5. If system/lib/modules exists (system-as-root / Android 10+ ramdisk layout), mirror there */
+	if (has_system_modules) {
+		snprintf(mod_target, sizeof(mod_target), "system/lib/modules/%s", mod_filename);
+		cpio_set_file(&head, mod_target, 0100644, xmemdup(mod_data, mod_sz), (uint32_t)mod_sz);
+		cpio_append_line_if_missing(&head, "system/lib/modules/modules.load", mod_filename);
+		cpio_append_line_if_missing(&head, "system/lib/modules/modules.dep", dep_line);
+		printf("[+] Ramdisk injection: Mirrored to %s\n", mod_target);
+	}
+
+	/* 6. Universal First-Stage Init Wrapper (PID 1 Module Loader) */
+	{
+		char *wrapper_bin_path = resolve_init_wrapper_binary(NULL);
+		if (wrapper_bin_path) {
+			size_t w_sz = 0;
+			void *w_data = magiskboot_read_file(wrapper_bin_path, &w_sz);
+			if (w_data && w_sz > 0) {
+				cpio_node_t *init_node = NULL;
+				cpio_node_t *init_real_node = NULL;
+				cpio_node_t *n;
+
+				for (n = head; n; n = n->next) {
+					if (strcmp(n->name, "init") == 0) init_node = n;
+					else if (strcmp(n->name, "init.real") == 0) init_real_node = n;
+				}
+
+				if (init_node) {
+					if (S_ISLNK(init_node->mode)) {
+						if (!init_real_node) {
+							const char *tgt = (const char *)init_node->data;
+							if (tgt && tgt[0] != '\0') {
+								cpio_set_file(&head, "init.real", 0120777, xstrdup(tgt), (uint32_t)strlen(tgt));
+							} else {
+								cpio_set_file(&head, "init.real", 0120777, xstrdup("/system/bin/init"), (uint32_t)strlen("/system/bin/init"));
+							}
+							printf("[+] First-stage init: Preserved symlink target -> init.real\n");
+						}
+						free(init_node->data);
+						init_node->mode = 0100755;
+						init_node->filesize = (uint32_t)w_sz;
+						init_node->data = xmemdup(w_data, w_sz);
+						printf("[+] First-stage init: Injected universal init_wrapper as PID 1 /init (replaced symlink)\n");
+					} else {
+						if (!init_real_node) {
+							cpio_set_file(&head, "init.real", init_node->mode,
+							              xmemdup(init_node->data, init_node->filesize), init_node->filesize);
+							printf("[+] First-stage init: Preserved stock binary -> init.real\n");
+						}
+						free(init_node->data);
+						init_node->mode = 0100755;
+						init_node->filesize = (uint32_t)w_sz;
+						init_node->data = xmemdup(w_data, w_sz);
+						printf("[+] First-stage init: Injected universal init_wrapper as PID 1 /init (replaced binary)\n");
+					}
+				} else {
+					cpio_set_file(&head, "init", 0100755, xmemdup(w_data, w_sz), (uint32_t)w_sz);
+					printf("[+] First-stage init: Injected universal init_wrapper as PID 1 /init\n");
+				}
+				free(w_data);
+			}
+			free(wrapper_bin_path);
+		} else {
+			printf("[!] Warning: init_wrapper binary not found; falling back to init.modules.rc\n");
+		}
+	}
+
+	free(mod_data);
+
+	if (cpio_write_all(cpio_path, head) != 0) {
+		bb_error_msg("failed to write modified CPIO archive '%s'", cpio_path);
+		cpio_free_all(head);
+		return -1;
+	}
+
+	cpio_free_all(head);
+	return 0;
+}
+
 static int magiskboot_add_module_op(int argc, char **argv)
 {
 	bool live = false;
@@ -5551,15 +5954,13 @@ static int magiskboot_add_module_op(int argc, char **argv)
 	const char *boot_img = NULL;
 	const char *module_ko = NULL;
 	const char *out_img = NULL;
+	const char *mod_filename = NULL;
 	char discovered_boot[512];
 	char tmp_work_dir[256];
 	char old_cwd[512];
 	char abs_module_ko[PATH_MAX];
 	char staged_module[PATH_MAX];
 	char repacked_img[PATH_MAX];
-	char cpio_cmd1[PATH_MAX + 64];
-	char cpio_cmd2[PATH_MAX + 64];
-	char *cpio_args[6];
 	int i;
 	int ret = 0;
 	int in_fd, out_fd;
@@ -5650,23 +6051,23 @@ static int magiskboot_add_module_op(int argc, char **argv)
 	}
 
 	/* 2. Patch module vermagic and relocations to align with boot kernel */
-	snprintf(staged_module, sizeof(staged_module), "%s/kroot.ko", tmp_work_dir);
+	mod_filename = bb_basename(abs_module_ko);
+	if (!mod_filename || mod_filename[0] == '\0') {
+		mod_filename = "module.ko";
+	}
+
+	snprintf(staged_module, sizeof(staged_module), "%s/%s", tmp_work_dir, mod_filename);
 	copy_file(abs_module_ko, staged_module, FILEUTILS_FORCE);
 	module_patch_file(staged_module, staged_module, NULL, boot_img);
 
-	/* 3. Inject module into ramdisk.cpio */
+	/* 3. Inject module and autoload lists into ramdisk.cpio */
 	if (access("ramdisk.cpio", F_OK) == 0) {
-		printf("[*] Injecting module into ramdisk.cpio...\n");
-		snprintf(cpio_cmd1, sizeof(cpio_cmd1), "add 0644 lib/modules/kroot.ko %s", staged_module);
-		snprintf(cpio_cmd2, sizeof(cpio_cmd2), "add 0644 kroot.ko %s", staged_module);
-
-		cpio_args[0] = (char *)"magiskboot";
-		cpio_args[1] = (char *)"cpio";
-		cpio_args[2] = (char *)"ramdisk.cpio";
-		cpio_args[3] = cpio_cmd1;
-		cpio_args[4] = cpio_cmd2;
-		cpio_args[5] = NULL;
-		magiskboot_cpio(5, cpio_args);
+		printf("[*] Injecting module '%s' into ramdisk.cpio...\n", mod_filename);
+		if (ramdisk_inject_kernel_module("ramdisk.cpio", staged_module, mod_filename) != 0) {
+			bb_error_msg("failed to inject module into ramdisk.cpio");
+			ret = 1;
+			goto cleanup;
+		}
 	} else {
 		bb_error_msg("ramdisk.cpio not found after unpack");
 		ret = 1;
@@ -5697,6 +6098,13 @@ static int magiskboot_add_module_op(int argc, char **argv)
 
 	/* 5. If --install is specified, flash directly to target block device */
 	if (install) {
+		struct stat st_out;
+		off_t bdev_sz = 0;
+		int sec_sz = 512;
+		char stream_buf[1024 * 1024]; /* 1MB streaming buffer */
+		struct timespec t_start, t_end;
+		double elapsed, mb_sec;
+
 		printf("[*] Flashing patched boot image directly to %s...\n", boot_img);
 		in_fd = open_or_warn(repacked_img, O_RDONLY | O_CLOEXEC);
 		if (in_fd < 0) {
@@ -5723,9 +6131,48 @@ static int magiskboot_add_module_op(int argc, char **argv)
 			ioctl(out_fd, BLKROSET, &ro);
 		}
 #endif
-		/* Stream exact byte count directly using BusyBox libbb (battle-tested dd engine) */
-		written = bb_copyfd_size(in_fd, out_fd, st_img.st_size);
+		if (fstat(out_fd, &st_out) == 0) {
+			bdev_sz = get_file_or_bdev_size(out_fd, &st_out);
+#ifdef BLKSSZGET
+			ioctl(out_fd, BLKSSZGET, &sec_sz);
+#endif
+			printf("[*] Target Storage Geometry & Diagnostics:\n");
+			printf("    • Node Path          : %s\n", boot_img);
+			printf("    • Device Type        : %s (major %u, minor %u)\n",
+			       S_ISBLK(st_out.st_mode) ? "Block Device" : "Regular File",
+			       (unsigned)major(st_out.st_rdev), (unsigned)minor(st_out.st_rdev));
+			printf("    • Partition Capacity : %lld bytes (%.2f MB)\n",
+			       (long long)bdev_sz, (double)bdev_sz / (1024.0 * 1024.0));
+			printf("    • Logical Sector Size: %d bytes\n", sec_sz);
+			printf("    • Write Access       : Unlocked via BLKROSET ioctl\n");
+		}
+
+		written = 0;
+		clock_gettime(CLOCK_MONOTONIC, &t_start);
+		printf("[*] Streaming patched boot image to %s (%lld bytes, %.2f MB)...\n",
+		       boot_img, (long long)st_img.st_size, (double)st_img.st_size / (1024.0 * 1024.0));
+
+		while (written < st_img.st_size) {
+			size_t chunk = (st_img.st_size - written > (off_t)sizeof(stream_buf)) ?
+			               sizeof(stream_buf) : (size_t)(st_img.st_size - written);
+			ssize_t nr = full_read(in_fd, stream_buf, chunk);
+			ssize_t nw;
+			int pct;
+			if (nr <= 0) break;
+			nw = full_write(out_fd, stream_buf, nr);
+			if (nw != nr) break;
+			written += nw;
+			pct = (int)((written * 100) / st_img.st_size);
+			printf("    -> Committing blocks: %3d%% [%lld / %lld bytes]\n",
+			       pct, (long long)written, (long long)st_img.st_size);
+		}
 		close(in_fd);
+
+		clock_gettime(CLOCK_MONOTONIC, &t_end);
+		elapsed = (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+		mb_sec = (elapsed > 0.001) ? ((double)written / (1024.0 * 1024.0)) / elapsed : 0.0;
+		printf("[+] Flashed %lld bytes in %.3f seconds (%.2f MB/s)\n",
+		       (long long)written, elapsed, mb_sec);
 
 		if (written != st_img.st_size) {
 			bb_error_msg("flashing incomplete: wrote %lld of %lld bytes",
@@ -5735,37 +6182,598 @@ static int magiskboot_add_module_op(int argc, char **argv)
 			goto cleanup;
 		}
 
-		/* Zero-pad remainder of partition matching AnyKernel3 (`cat boot-new.img /dev/zero > $BLOCK`) */
-		{
-			struct stat st_out;
-			if (fstat(out_fd, &st_out) == 0 && S_ISBLK(st_out.st_mode)) {
-				off_t bdev_sz = get_file_or_bdev_size(out_fd, &st_out);
-				if (bdev_sz > written) {
-					off_t pad_remain = bdev_sz - written;
-					static const char zero_buf[65536] = {0};
-					printf("[*] Zero-padding remainder of partition (%lld bytes) matching AnyKernel3...\n",
-					       (long long)pad_remain);
-					while (pad_remain > 0) {
-						size_t chunk = (pad_remain > (off_t)sizeof(zero_buf)) ? sizeof(zero_buf) : (size_t)pad_remain;
-						ssize_t nw = full_write(out_fd, zero_buf, chunk);
-						if (nw <= 0) break;
-						pad_remain -= nw;
-					}
-				}
-			}
-		}
-
+		printf("[*] Flushing hardware write caches to physical storage (fsync)...\n");
 		fsync(out_fd);
 		close(out_fd);
 		sync();
 
-		printf("[✓] SUCCESS: Flashed %lld bytes to %s\n", (long long)written, boot_img);
+		printf("[✓] SUCCESS: Verified %lld bytes committed directly to %s\n", (long long)written, boot_img);
 	} else {
 		printf("[✓] SUCCESS: Patched boot image saved to %s\n", repacked_img);
 	}
 
 cleanup:
 	chdir(old_cwd);
+	remove_file(tmp_work_dir, FILEUTILS_RECUR | FILEUTILS_FORCE);
+	return ret;
+}
+
+/*
+ * Checks if a CPIO entry name belongs to recovery subsystem
+ */
+static bool is_recovery_component_entry(const char *name)
+{
+	if (!name) return false;
+	if (strcmp(name, "system/bin/recovery") == 0 ||
+	    strcmp(name, "system/bin/twrp") == 0 ||
+	    strcmp(name, "sbin/twrp") == 0 ||
+	    strcmp(name, "system/bin/teamwin") == 0 ||
+	    strncmp(name, "system/bin/bash_twrp", 20) == 0 ||
+	    strncmp(name, "system/bin/nano_twrp", 20) == 0 ||
+	    strncmp(name, "system/bin/tzdata_twrp", 22) == 0 ||
+	    strstr(name, "twrpapp") != NULL ||
+	    strncmp(name, "twres", 5) == 0 ||
+	    strncmp(name, "license", 7) == 0 ||
+	    strncmp(name, "system/etc/twrp", 15) == 0 ||
+	    strncmp(name, "etc/twrp", 8) == 0 ||
+	    strncmp(name, "system/etc/recovery", 19) == 0 ||
+	    strncmp(name, "etc/recovery", 12) == 0 ||
+	    strncmp(name, "init.recovery.", 14) == 0 ||
+	    strncmp(name, "system/etc/init/init.recovery.", 30) == 0 ||
+	    strstr(name, "recovery.rc") != NULL ||
+	    strncmp(name, "system/lib64/", 13) == 0 ||
+	    strncmp(name, "system/lib/", 11) == 0 ||
+	    strncmp(name, "vendor/lib64/", 13) == 0 ||
+	    strncmp(name, "vendor/lib/", 11) == 0 ||
+	    strstr(name, "twrp") != NULL ||
+	    strstr(name, "recovery") != NULL)
+		return true;
+	return false;
+}
+
+/*
+ * Recovery Changer Engine
+ * Integrates / changes custom recovery (TWRP) inside a target boot.img
+ */
+static int magiskboot_set_recovery_op(int argc, char **argv)
+{
+	bool live = false;
+	bool install = false;
+	const char *part_name = NULL;
+	const char *boot_img = NULL;
+	const char *rec_src = NULL;
+	const char *out_img = NULL;
+	char discovered_boot[512];
+	char tmp_work_dir[256];
+	char old_cwd[512];
+	char abs_boot_img[PATH_MAX];
+	char abs_rec_src[PATH_MAX];
+	char repacked_img[PATH_MAX];
+	char target_dir[PATH_MAX];
+	char rec_dir[PATH_MAX];
+	char target_cpio[PATH_MAX];
+	char rec_cpio[PATH_MAX];
+	cpio_node_t *target_head = NULL;
+	cpio_node_t *rec_head = NULL;
+	cpio_node_t *node;
+	int count = 0;
+	int i;
+	int ret = 0;
+	int in_fd, out_fd;
+	struct stat st_img;
+	off_t written;
+
+	discovered_boot[0] = '\0';
+	abs_boot_img[0] = '\0';
+	abs_rec_src[0] = '\0';
+
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--live") == 0) {
+			live = true;
+		} else if (strcmp(argv[i], "--install") == 0) {
+			install = true;
+		} else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+			part_name = argv[++i];
+		} else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+			i++; /* skip device ID */
+		} else if (argv[i][0] == '-') {
+			/* skip unrecognized options */
+		} else {
+			if (!boot_img && !live) {
+				boot_img = argv[i];
+			} else if (!rec_src) {
+				rec_src = argv[i];
+			} else if (!out_img) {
+				out_img = argv[i];
+			}
+		}
+	}
+
+	if (part_name) {
+		char pbuf[PATH_MAX];
+		snprintf(pbuf, sizeof(pbuf), "/dev/block/by-name/%s", part_name);
+		if (access(pbuf, F_OK) == 0) {
+			strncpy(discovered_boot, pbuf, sizeof(discovered_boot) - 1);
+			discovered_boot[sizeof(discovered_boot) - 1] = '\0';
+			boot_img = discovered_boot;
+		} else {
+			snprintf(pbuf, sizeof(pbuf), "/dev/block/bootdevice/by-name/%s", part_name);
+			if (access(pbuf, F_OK) == 0) {
+				strncpy(discovered_boot, pbuf, sizeof(discovered_boot) - 1);
+				discovered_boot[sizeof(discovered_boot) - 1] = '\0';
+				boot_img = discovered_boot;
+			}
+		}
+	}
+
+	if (live || !boot_img) {
+		live = true;
+		if (find_target_boot_image(discovered_boot, sizeof(discovered_boot)) != 0) {
+			bb_error_msg("failed to auto-detect target boot partition");
+			return 1;
+		}
+		boot_img = discovered_boot;
+		printf("[+] Auto-detected live boot target: %s\n", boot_img);
+	}
+
+	if (!rec_src) {
+		bb_error_msg("missing recovery source image argument");
+		return 1;
+	}
+
+	if (!realpath(boot_img, abs_boot_img)) {
+		safe_strncpy(abs_boot_img, boot_img, sizeof(abs_boot_img));
+	}
+	if (!realpath(rec_src, abs_rec_src)) {
+		safe_strncpy(abs_rec_src, rec_src, sizeof(abs_rec_src));
+	}
+
+	if (!getcwd(old_cwd, sizeof(old_cwd))) {
+		strcpy(old_cwd, ".");
+	}
+	safe_strncpy(tmp_work_dir, "/tmp/mb_setrec_XXXXXX", sizeof(tmp_work_dir));
+	if (!mkdtemp(tmp_work_dir)) {
+		bb_perror_msg("cannot create temporary directory '%s'", tmp_work_dir);
+		return 1;
+	}
+
+	snprintf(target_dir, sizeof(target_dir), "%s/target", tmp_work_dir);
+	snprintf(rec_dir, sizeof(rec_dir), "%s/rec", tmp_work_dir);
+	mkdir(target_dir, 0755);
+	mkdir(rec_dir, 0755);
+
+	/* 1. Unpack target boot image */
+	printf("[*] Unpacking target boot image: %s\n", abs_boot_img);
+	chdir(target_dir);
+	if (magiskboot_unpack(abs_boot_img, true, false, false, false) != 0) {
+		bb_error_msg("failed to unpack target boot image '%s'", abs_boot_img);
+		ret = 1;
+		goto cleanup;
+	}
+
+	/* Optional: bypass module signature enforcement on target kernel */
+	if (access("kernel", F_OK) == 0) {
+		magiskboot_kernel_op("kernel", "patch-sigenforce", 0, NULL);
+	}
+
+	/* 2. Unpack recovery source image */
+	printf("[*] Unpacking recovery source image: %s\n", abs_rec_src);
+	chdir(rec_dir);
+	if (magiskboot_unpack(abs_rec_src, true, false, false, false) != 0) {
+		/* Check if source is already a raw or compressed CPIO archive */
+		int c_fd = open_or_warn(abs_rec_src, O_RDONLY | O_CLOEXEC);
+		if (c_fd >= 0) {
+			uint8_t m[32];
+			ssize_t mn = full_read(c_fd, m, sizeof(m));
+			close(c_fd);
+			if (mn >= 6 && (memcmp(m, "070701", 6) == 0 || memcmp(m, "070702", 6) == 0)) {
+				copy_file(abs_rec_src, "ramdisk.cpio", FILEUTILS_FORCE);
+			} else {
+				uint8_t fmt = (mn > 0) ? boot_check_fmt(m, mn) : BOOT_FMT_UNKNOWN;
+				if (boot_fmt_compressed(fmt)) {
+					int out_rfd = open3_or_warn("ramdisk.cpio", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+					if (out_rfd >= 0) {
+						c_fd = open(abs_rec_src, O_RDONLY | O_CLOEXEC);
+						if (c_fd >= 0) {
+							bb_decompress_data(fmt, NULL, 0, out_rfd);
+							close(c_fd);
+						}
+						close(out_rfd);
+					}
+				}
+			}
+		}
+	}
+
+	snprintf(target_cpio, sizeof(target_cpio), "%.*s/ramdisk.cpio", (int)(sizeof(target_cpio) - 16), target_dir);
+	snprintf(rec_cpio, sizeof(rec_cpio), "%.*s/ramdisk.cpio", (int)(sizeof(rec_cpio) - 16), rec_dir);
+
+	if (access(target_cpio, F_OK) != 0) {
+		bb_error_msg("target boot image has no ramdisk.cpio");
+		ret = 1;
+		goto cleanup;
+	}
+	if (access(rec_cpio, F_OK) != 0) {
+		bb_error_msg("recovery source image has no ramdisk.cpio");
+		ret = 1;
+		goto cleanup;
+	}
+
+	/* 3. Read CPIO archives in memory */
+	target_head = cpio_read_all(target_cpio);
+	rec_head = cpio_read_all(rec_cpio);
+
+	if (!target_head || !rec_head) {
+		bb_error_msg("failed to parse ramdisk archives");
+		ret = 1;
+		goto cleanup;
+	}
+
+	/* 4. Transfer recovery subsystem components into target ramdisk */
+	printf("[*] Merging recovery subsystem from %s into target boot ramdisk...\n", rec_src);
+	for (node = rec_head; node; node = node->next) {
+		if (is_recovery_component_entry(node->name)) {
+			void *copy_data = NULL;
+			if (node->data && node->filesize > 0) {
+				copy_data = xmemdup(node->data, node->filesize);
+			}
+			cpio_set_file(&target_head, node->name, node->mode, copy_data, node->filesize);
+			count++;
+		}
+	}
+	printf("[+] Successfully integrated %d recovery components into target boot ramdisk\n", count);
+
+	/* Write updated target ramdisk */
+	if (cpio_write_all(target_cpio, target_head) != 0) {
+		bb_error_msg("failed to write updated target ramdisk CPIO");
+		ret = 1;
+		goto cleanup;
+	}
+
+	/* 5. Repack target boot image */
+	chdir(target_dir);
+	if (out_img && !install) {
+		if (out_img[0] == '/') {
+			safe_strncpy(repacked_img, out_img, sizeof(repacked_img));
+		} else {
+			char *p = concat_path_file(old_cwd, out_img);
+			safe_strncpy(repacked_img, p, sizeof(repacked_img));
+			free(p);
+		}
+	} else {
+		char *p = concat_path_file(tmp_work_dir, "new-boot.img");
+		safe_strncpy(repacked_img, p, sizeof(repacked_img));
+		free(p);
+	}
+
+	printf("[*] Repacking hybrid boot image -> %s...\n", repacked_img);
+	if (magiskboot_repack(abs_boot_img, repacked_img, false) != 0) {
+		bb_error_msg("failed to repack hybrid boot image");
+		ret = 1;
+		goto cleanup;
+	}
+
+	/* 6. Flash directly if --install requested */
+	if (install) {
+		struct stat st_out;
+		int sec_sz = 512;
+		char stream_buf[1024 * 1024];
+		struct timespec t_start, t_end;
+		double elapsed, mb_sec;
+		ssize_t nr, nw;
+
+		printf("[*] Flashing hybrid boot image directly to %s...\n", boot_img);
+		in_fd = open_or_warn(repacked_img, O_RDONLY | O_CLOEXEC);
+		if (in_fd < 0) {
+			ret = 1;
+			goto cleanup;
+		}
+		if (fstat(in_fd, &st_img) < 0 || st_img.st_size < 4096) {
+			bb_error_msg("invalid repacked boot image size");
+			close(in_fd);
+			ret = 1;
+			goto cleanup;
+		}
+
+		out_fd = open_or_warn(boot_img, O_RDWR | O_SYNC | O_CLOEXEC);
+		if (out_fd < 0) {
+			close(in_fd);
+			ret = 1;
+			goto cleanup;
+		}
+#ifdef BLKROSET
+		{
+			int ro = 0;
+			ioctl(out_fd, BLKROSET, &ro);
+		}
+#endif
+		if (fstat(out_fd, &st_out) == 0) {
+			bdev_sz = get_file_or_bdev_size(out_fd, &st_out);
+#ifdef BLKSSZGET
+			ioctl(out_fd, BLKSSZGET, &sec_sz);
+#endif
+		}
+
+		written = 0;
+		clock_gettime(CLOCK_MONOTONIC, &t_start);
+		printf("[*] Streaming hybrid boot image to %s (%lld bytes, %.2f MB)...\n",
+		       boot_img, (long long)st_img.st_size, (double)st_img.st_size / (1024.0 * 1024.0));
+
+		while (written < st_img.st_size) {
+			size_t chunk = (st_img.st_size - written > (off_t)sizeof(stream_buf)) ?
+			               sizeof(stream_buf) : (size_t)(st_img.st_size - written);
+			nr = full_read(in_fd, stream_buf, chunk);
+			if (nr <= 0) break;
+			nw = full_write(out_fd, stream_buf, nr);
+			if (nw != nr) break;
+			written += nw;
+		}
+		close(in_fd);
+
+		clock_gettime(CLOCK_MONOTONIC, &t_end);
+		elapsed = (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
+		mb_sec = (elapsed > 0.001) ? ((double)written / (1024.0 * 1024.0)) / elapsed : 0.0;
+		printf("[+] Flashed %lld bytes in %.3f seconds (%.2f MB/s)\n",
+		       (long long)written, elapsed, mb_sec);
+
+		fsync(out_fd);
+		close(out_fd);
+		sync();
+		printf("[✓] SUCCESS: Verified %lld bytes committed directly to %s\n", (long long)written, boot_img);
+	} else {
+		printf("[✓] SUCCESS: Hybrid boot image saved to %s\n", repacked_img);
+	}
+
+cleanup:
+	if (target_head) cpio_free_all(target_head);
+	if (rec_head) cpio_free_all(rec_head);
+	chdir(old_cwd);
+	remove_file(tmp_work_dir, FILEUTILS_RECUR | FILEUTILS_FORCE);
+	return ret;
+}
+
+/*
+ * Recovery Extractor Engine
+ * Extracts recovery subsystem components, recovery.cpio, or standalone recovery.img
+ * from target boot image (or live boot partition).
+ */
+static int magiskboot_extract_recovery_op(int argc, char **argv)
+{
+	bool live = false;
+	bool extract_all = false;
+	const char *part_name = NULL;
+	const char *boot_img = NULL;
+	const char *out_target = NULL;
+	char discovered_boot[512];
+	char tmp_work_dir[256];
+	char old_cwd[512];
+	char abs_boot_img[PATH_MAX];
+	char abs_out[PATH_MAX];
+	char target_cpio[PATH_MAX];
+	cpio_node_t *head = NULL;
+	cpio_node_t *rec_head = NULL;
+	cpio_node_t *curr;
+	int count = 0;
+	int total = 0;
+	int i;
+	int ret = 0;
+	bool is_img_out = false;
+	bool is_dir_out = false;
+	size_t olen;
+
+	discovered_boot[0] = '\0';
+	abs_boot_img[0] = '\0';
+	abs_out[0] = '\0';
+
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--live") == 0) {
+			live = true;
+		} else if (strcmp(argv[i], "--all") == 0 || strcmp(argv[i], "-a") == 0) {
+			extract_all = true;
+		} else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+			part_name = argv[++i];
+		} else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+			i++; /* skip device ID */
+		} else if (argv[i][0] == '-') {
+			/* skip unrecognized options */
+		} else {
+			if (!boot_img && !live) {
+				boot_img = argv[i];
+			} else if (!out_target) {
+				out_target = argv[i];
+			}
+		}
+	}
+
+	if (part_name) {
+		char pbuf[PATH_MAX];
+		snprintf(pbuf, sizeof(pbuf), "/dev/block/by-name/%s", part_name);
+		if (access(pbuf, F_OK) == 0) {
+			strncpy(discovered_boot, pbuf, sizeof(discovered_boot) - 1);
+			discovered_boot[sizeof(discovered_boot) - 1] = '\0';
+			boot_img = discovered_boot;
+		} else {
+			snprintf(pbuf, sizeof(pbuf), "/dev/block/bootdevice/by-name/%s", part_name);
+			if (access(pbuf, F_OK) == 0) {
+				strncpy(discovered_boot, pbuf, sizeof(discovered_boot) - 1);
+				discovered_boot[sizeof(discovered_boot) - 1] = '\0';
+				boot_img = discovered_boot;
+			}
+		}
+	}
+
+	if (live || !boot_img) {
+		live = true;
+		if (find_target_boot_image(discovered_boot, sizeof(discovered_boot)) != 0) {
+			bb_error_msg("failed to auto-detect target boot partition");
+			return 1;
+		}
+		boot_img = discovered_boot;
+		printf("[+] Auto-detected live boot target: %s\n", boot_img);
+	}
+
+	if (!out_target) {
+		out_target = "recovery.cpio";
+	}
+
+	if (!realpath(boot_img, abs_boot_img)) {
+		safe_strncpy(abs_boot_img, boot_img, sizeof(abs_boot_img));
+	}
+
+	if (!getcwd(old_cwd, sizeof(old_cwd))) {
+		strcpy(old_cwd, ".");
+	}
+
+	/* Resolve output path */
+	if (out_target[0] == '/') {
+		safe_strncpy(abs_out, out_target, sizeof(abs_out));
+	} else {
+		char *p = concat_path_file(old_cwd, out_target);
+		safe_strncpy(abs_out, p, sizeof(abs_out));
+		free(p);
+	}
+
+	/* Determine target type */
+	olen = strlen(abs_out);
+	if (olen > 4 && strcmp(abs_out + olen - 4, ".img") == 0) {
+		is_img_out = true;
+	} else {
+		struct stat st_o;
+		if (abs_out[olen - 1] == '/' || (stat(abs_out, &st_o) == 0 && S_ISDIR(st_o.st_mode))) {
+			is_dir_out = true;
+		}
+	}
+
+	safe_strncpy(tmp_work_dir, "/tmp/mb_extrec_XXXXXX", sizeof(tmp_work_dir));
+	if (!mkdtemp(tmp_work_dir)) {
+		bb_perror_msg("cannot create temporary directory '%s'", tmp_work_dir);
+		return 1;
+	}
+
+	printf("[*] Unpacking boot image: %s\n", abs_boot_img);
+	chdir(tmp_work_dir);
+	if (magiskboot_unpack(abs_boot_img, true, false, false, false) != 0) {
+		bb_error_msg("failed to unpack boot image '%s'", abs_boot_img);
+		ret = 1;
+		goto cleanup;
+	}
+
+	snprintf(target_cpio, sizeof(target_cpio), "%s/ramdisk.cpio", tmp_work_dir);
+	if (access(target_cpio, F_OK) != 0) {
+		bb_error_msg("boot image has no ramdisk.cpio");
+		ret = 1;
+		goto cleanup;
+	}
+
+	head = cpio_read_all(target_cpio);
+	if (!head) {
+		bb_error_msg("failed to parse ramdisk archive");
+		ret = 1;
+		goto cleanup;
+	}
+
+	for (curr = head; curr; curr = curr->next) {
+		total++;
+		if (extract_all || is_recovery_component_entry(curr->name)) {
+			void *copy_data = NULL;
+			if (curr->data && curr->filesize > 0) {
+				copy_data = xmemdup(curr->data, curr->filesize);
+			}
+			cpio_set_file(&rec_head, curr->name, curr->mode, copy_data, curr->filesize);
+			count++;
+		}
+	}
+
+	if (count == 0) {
+		bb_error_msg("no recovery subsystem components found in '%s'", boot_img);
+		ret = 1;
+		goto cleanup;
+	}
+
+	printf("[+] Identified %d recovery components (out of %d ramdisk entries)\n", count, total);
+
+	if (is_dir_out) {
+		/* Extract recovery files to directory */
+		printf("[*] Extracting recovery files to directory: %s\n", abs_out);
+		bb_make_directory(abs_out, 0755, FILEUTILS_RECUR);
+		for (curr = rec_head; curr; curr = curr->next) {
+			char full_path[PATH_MAX * 2];
+			char *slash;
+			snprintf(full_path, sizeof(full_path), "%s/%s", abs_out, curr->name);
+			slash = strrchr(full_path, '/');
+			if (slash && slash != full_path) {
+				*slash = '\0';
+				bb_make_directory(full_path, 0755, FILEUTILS_RECUR);
+				*slash = '/';
+			}
+			if (S_ISDIR(curr->mode)) {
+				mkdir(full_path, curr->mode & 07777);
+			} else if (S_ISREG(curr->mode)) {
+				int fd = open3_or_warn(full_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, curr->mode & 07777);
+				if (fd >= 0) {
+					if (curr->data && curr->filesize > 0) {
+						full_write(fd, curr->data, curr->filesize);
+					}
+					close(fd);
+				}
+			} else if (S_ISLNK(curr->mode)) {
+				if (curr->data && curr->filesize > 0) {
+					char *target = xstrndup((const char *)curr->data, curr->filesize);
+					unlink(full_path);
+					symlink(target, full_path);
+					free(target);
+				}
+			}
+		}
+		printf("[✓] SUCCESS: Extracted %d recovery components -> %s\n", count, abs_out);
+	} else if (is_img_out) {
+		/* Repack into bootable recovery.img */
+		printf("[*] Packaging bootable standalone recovery image -> %s...\n", abs_out);
+		/* For bootable recovery image, ensure /init is preserved if present in stock ramdisk */
+		for (curr = head; curr; curr = curr->next) {
+			if (strcmp(curr->name, "init") == 0) {
+				void *copy_data = curr->data ? xmemdup(curr->data, curr->filesize) : NULL;
+				cpio_set_file(&rec_head, "init", curr->mode, copy_data, curr->filesize);
+				break;
+			}
+		}
+		if (cpio_write_all(target_cpio, rec_head) != 0) {
+			bb_error_msg("failed to write recovery ramdisk CPIO");
+			ret = 1;
+			goto cleanup;
+		}
+		if (magiskboot_repack(abs_boot_img, abs_out, false) != 0) {
+			bb_error_msg("failed to repack recovery image");
+			ret = 1;
+			goto cleanup;
+		}
+		printf("[✓] SUCCESS: Generated bootable recovery image -> %s\n", abs_out);
+	} else {
+		/* CPIO output */
+		char tmp_cpio[PATH_MAX];
+		snprintf(tmp_cpio, sizeof(tmp_cpio), "%s/extracted_recovery.cpio", tmp_work_dir);
+		printf("[*] Writing recovery CPIO archive -> %s...\n", abs_out);
+		if (cpio_write_all(tmp_cpio, rec_head) != 0) {
+			bb_error_msg("failed to write recovery CPIO");
+			ret = 1;
+			goto cleanup;
+		}
+		if (olen > 3 && strcmp(abs_out + olen - 3, ".gz") == 0) {
+			compress_file_format(tmp_cpio, abs_out, BOOT_FMT_GZIP);
+		} else if (olen > 3 && strcmp(abs_out + olen - 3, ".xz") == 0) {
+			compress_file_format(tmp_cpio, abs_out, BOOT_FMT_XZ);
+		} else if (olen > 4 && strcmp(abs_out + olen - 4, ".lz4") == 0) {
+			compress_file_format(tmp_cpio, abs_out, BOOT_FMT_LZ4);
+		} else {
+			copy_file(tmp_cpio, abs_out, FILEUTILS_FORCE);
+		}
+		printf("[✓] SUCCESS: Extracted %d recovery components -> %s\n", count, abs_out);
+	}
+
+cleanup:
+	chdir(old_cwd);
+	if (head) cpio_free_all(head);
+	if (rec_head) cpio_free_all(rec_head);
 	remove_file(tmp_work_dir, FILEUTILS_RECUR | FILEUTILS_FORCE);
 	return ret;
 }
@@ -5819,10 +6827,9 @@ struct payload_extent {
 	uint64_t num_blocks;
 };
 
-static int payload_extract_partition_ops(int in_fd, off_t data_base, const uint8_t *part_start, const uint8_t *part_end, const char *part_name, const char *out_path, uint64_t part_size) {
+static int payload_extract_partition_ops(int in_fd, off_t data_base, const uint8_t *part_start, const uint8_t *part_end, const char *part_name, const char *out_path, uint64_t part_size, bool silent) {
 	int out_fd;
 	const uint8_t *scan;
-	int op_count = 0;
 
 	out_fd = open3_or_warn(out_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
 	if (out_fd < 0) return 1;
@@ -5936,7 +6943,6 @@ static int payload_extract_partition_ops(int in_fd, off_t data_base, const uint8
 			}
 
 			if (extents != static_extents) free(extents);
-			op_count++;
 		} else {
 			pb_skip_field(pwire, &scan, part_end);
 		}
@@ -5946,12 +6952,14 @@ static int payload_extract_partition_ops(int in_fd, off_t data_base, const uint8
 		ftruncate(out_fd, part_size);
 	}
 	close(out_fd);
-	fprintf(stderr, "[+] Extracted partition '%s' -> [%s] (%"PRIu64" bytes, %d operations)\n",
-	        part_name, out_path, part_size, op_count);
+	if (!silent) {
+		printf("Extracted partition '%s' (%"PRIu64" bytes) -> %s\n",
+		       part_name, part_size, out_path);
+	}
 	return 0;
 }
 
-static int payload_extract_partition(const char *payload_path, const char *target_part, const char *out_path) {
+static int payload_extract_partition(const char *payload_path, const char *target_part, const char *out_path, bool silent) {
 	int in_fd;
 	char magic[4];
 	uint64_t version = 0, manifest_len = 0;
@@ -6045,7 +7053,7 @@ static int payload_extract_partition(const char *payload_path, const char *targe
 					snprintf(auto_out, sizeof(auto_out), "%s.img", part_name);
 					dest = auto_out;
 				}
-				ret = payload_extract_partition_ops(in_fd, data_base, p, part_end, part_name, dest, part_size);
+				ret = payload_extract_partition_ops(in_fd, data_base, p, part_end, part_name, dest, part_size, silent);
 				break;
 			}
 			p = part_end;
@@ -6147,7 +7155,7 @@ static int payload_extract(const char *payload_path, const char *target, const c
 
 	/* 1. Direct partition extraction if payload contains this partition */
 	if (payload_has_partition(payload_path, target)) {
-		return payload_extract_partition(payload_path, target, out_path);
+		return payload_extract_partition(payload_path, target, out_path, false);
 	}
 
 	/* 2. Inner component extraction (kernel, ramdisk, dtb, etc.) */
@@ -6166,9 +7174,7 @@ static int payload_extract(const char *payload_path, const char *target, const c
 			}
 		}
 
-		fprintf(stderr, "[*] Extracting '%s' partition to temporary file for inner component '%s'...\n",
-		        boot_part, target);
-		ret = payload_extract_partition(payload_path, boot_part, tmp_boot);
+		ret = payload_extract_partition(payload_path, boot_part, tmp_boot, true);
 		if (ret != 0) {
 			unlink(tmp_boot);
 			return ret;
@@ -6271,7 +7277,7 @@ static int payload_extract_all(const char *payload_path, const char *out_dir) {
 
 			if (part_name[0]) {
 				snprintf(out_file, sizeof(out_file), "%s/%s.img", out_dir, part_name);
-				if (payload_extract_partition_ops(in_fd, data_base, p, part_end, part_name, out_file, part_size) == 0) {
+				if (payload_extract_partition_ops(in_fd, data_base, p, part_end, part_name, out_file, part_size, false) == 0) {
 					extracted++;
 				}
 			}
@@ -6283,7 +7289,7 @@ static int payload_extract_all(const char *payload_path, const char *out_dir) {
 
 	free(mbuf);
 	close(in_fd);
-	printf("[✓] SUCCESS: Extracted %d partitions to '%s'\n", extracted, out_dir);
+	printf("Extracted %d partitions to '%s'\n", extracted, out_dir);
 	return 0;
 }
 
@@ -6468,6 +7474,14 @@ int aimg_main(int argc, char **argv) {
 		"hexpatch\0"
 		"--decompress\0"
 		"decompress\0"
+		"--set-recovery\0"
+		"set-recovery\0"
+		"--extract-recovery\0"
+		"extract-recovery\0"
+		"--get-recovery\0"
+		"get-recovery\0"
+		"--recovery\0"
+		"recovery\0"
 
 		/* Packaging */
 		"--dist\0"
@@ -6544,6 +7558,14 @@ int aimg_main(int argc, char **argv) {
 		CMD_hexpatch_no_dash,
 		CMD_decompress,
 		CMD_decompress_no_dash,
+		CMD_set_recovery,
+		CMD_set_recovery_no_dash,
+		CMD_extract_recovery,
+		CMD_extract_recovery_no_dash,
+		CMD_get_recovery,
+		CMD_get_recovery_no_dash,
+		CMD_recovery,
+		CMD_recovery_no_dash,
 
 		CMD_dist,
 		CMD_dist_no_dash,
@@ -6807,6 +7829,29 @@ int aimg_main(int argc, char **argv) {
 	case CMD_decompress_no_dash:
 		if (argc < 3) bb_show_usage();
 		return magiskboot_decompress(argv[2], (argc >= 4) ? argv[3] : NULL);
+
+	case CMD_set_recovery:
+	case CMD_set_recovery_no_dash:
+		if (argc < 3 && !strstr(cmd, "live")) bb_show_usage();
+		return magiskboot_set_recovery_op(argc, argv);
+
+	case CMD_extract_recovery:
+	case CMD_extract_recovery_no_dash:
+	case CMD_get_recovery:
+	case CMD_get_recovery_no_dash:
+		if (argc < 3 && !strstr(cmd, "live")) bb_show_usage();
+		return magiskboot_extract_recovery_op(argc, argv);
+
+	case CMD_recovery:
+	case CMD_recovery_no_dash:
+		if (argc >= 3 && (strcmp(argv[2], "extract") == 0 || strcmp(argv[2], "dump") == 0 || strcmp(argv[2], "get") == 0)) {
+			return magiskboot_extract_recovery_op(argc - 1, argv + 1);
+		}
+		if (argc >= 3 && (strcmp(argv[2], "set") == 0 || strcmp(argv[2], "inject") == 0 || strcmp(argv[2], "change") == 0)) {
+			return magiskboot_set_recovery_op(argc - 1, argv + 1);
+		}
+		if (argc < 3 && !strstr(cmd, "live")) bb_show_usage();
+		return magiskboot_set_recovery_op(argc, argv);
 
 	case CMD_dist:
 	case CMD_dist_no_dash:
