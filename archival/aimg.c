@@ -41,6 +41,7 @@
 //usage:     "\n	    -n, --no-comp             Do not compress repacked ramdisk"
 //usage:     "\n	-e, --extract <img|payload> [part|comp] [out] Extract partition or component"
 //usage:     "\n	-c, --cleanup                 Clean up unpacked temporary files"
+//usage:     "\n	-i, --info <file>             Inspect boot image, kernel, ramdisk, DTB, or sparse metrics"
 //usage:     "\n"
 //usage:     "\nKernel Module Toolkit:"
 //usage:     "\n	--mod-info <mod.ko>           Display module vermagic and ELF header info"
@@ -62,6 +63,8 @@
 //usage:     "\n	--decompress <in> [out]       Decompress kernel/ramdisk image"
 //usage:     "\n	--set-recovery <boot> <rec>   Inject custom recovery (TWRP) into boot image (--live, --install)"
 //usage:     "\n	--extract-recovery <boot> [o] Extract recovery subsystem (cpio, img, or dir) from boot image"
+//usage:     "\n	--set-ramdisk <boot> <rd>     Inject/replace ramdisk in boot image (--live, --install)"
+//usage:     "\n	--extract-ramdisk <boot> [o]  Extract ramdisk (auto-decompress to cpio) from boot image"
 //usage:     "\n"
 //usage:     "\nPackaging:"
 //usage:     "\n	--dist <out.zip> [opts]       Create universal AnyKernel3 or Magisk/KSU module ZIP"
@@ -115,6 +118,7 @@ static uint8_t boot_check_fmt(const void *buf, size_t len) {
 	if (len >= 8 && memcmp(b, "ANDROID!", 8) == 0) return BOOT_FMT_AOSP;
 	if (len >= 8 && memcmp(b, "VNDRBOOT", 8) == 0) return BOOT_FMT_AOSP_VENDOR;
 	if ((b[0] == 0x1f && b[1] == 0x8b) || (b[0] == 0x1f && b[1] == 0x9e)) return BOOT_FMT_GZIP;
+	if (len >= 4 && memcmp(b, "\x28\xb5\x2f\xfd", 4) == 0) return BOOT_FMT_ZSTD;
 	if (len >= 4 && memcmp(b, "\x89LZO", 4) == 0) return BOOT_FMT_LZOP;
 	if (len >= 6 && memcmp(b, "\xfd" "7zXZ\x00", 6) == 0) return BOOT_FMT_XZ;
 	if (len >= 3 && memcmp(b, "BZh", 3) == 0) return BOOT_FMT_BZIP2;
@@ -128,10 +132,20 @@ static uint8_t boot_check_fmt(const void *buf, size_t len) {
 		}
 	}
 	if (len >= 4 && memcmp(b, "\xd0\x0d\xfe\xed", 4) == 0) return BOOT_FMT_DTB;
+	if (len >= 4 && memcmp(b, "\xd7\xb7\xab\x1e", 4) == 0) return BOOT_FMT_DTBO;
+	if (len >= 4 && memcmp(b, "\x3a\xff\x26\xed", 4) == 0) return BOOT_FMT_SPARSE;
+	if (len >= 4 && memcmp(b, "AVB0", 4) == 0) return BOOT_FMT_VBMETA;
+	if (len >= 4 && memcmp(b, "CrAU", 4) == 0) return BOOT_FMT_PAYLOAD;
 	if (len >= 8 && memcmp(b, "\x44\x48\x54\x42\x01\x00\x00\x00", 8) == 0) return BOOT_FMT_DHTB;
 	if (len >= 20 && memcmp(b, "-SIGNED-BY-SIGNBLOB-", 20) == 0) return BOOT_FMT_BLOB;
 	if (len >= 4 && memcmp(b, "\x18\x28\x6f\x01", 4) == 0) return BOOT_FMT_ZIMAGE;
-	if (len >= 4 && *(const uint32_t *)b == SWAP_LE32(0x58881688)) return BOOT_FMT_MTK;
+	if (len >= 64 && memcmp(b + 56, "ARM\x64", 4) == 0) return BOOT_FMT_ARM64_IMAGE;
+	if (len >= 6 && (memcmp(b, "070701", 6) == 0 || memcmp(b, "070702", 6) == 0 || memcmp(b, "070707", 6) == 0)) return BOOT_FMT_CPIO;
+	if (len >= 2 && (memcmp(b, "\xc7\x71", 2) == 0 || memcmp(b, "\x71\xc7", 2) == 0)) return BOOT_FMT_CPIO;
+	if (len >= 1024 + 4 && memcmp(b + 1024, "\xe2\xe1\xf5\xe0", 4) == 0) return BOOT_FMT_EROFS;
+	if (len >= 1024 + 4 && memcmp(b + 1024, "\x10\x20\xf5\xf2", 4) == 0) return BOOT_FMT_F2FS;
+	if (len >= 1080 + 2 && memcmp(b + 1080, "\x53\xef", 2) == 0) return BOOT_FMT_EXT4;
+	if (len >= 4 && memcmp(b, "\x88\x16\x88\x58", 4) == 0) return BOOT_FMT_MTK;
 
 	/* LZMA header check */
 	if (len >= 13 && b[0] == 0x5d) {
@@ -164,8 +178,18 @@ static const char *boot_fmt2name(uint8_t fmt) {
 	case BOOT_FMT_LZ4_LEGACY:  return "lz4_legacy";
 	case BOOT_FMT_LZ4_LG:      return "lz4_lg";
 	case BOOT_FMT_LZOP:        return "lzop";
+	case BOOT_FMT_ZSTD:        return "zstd";
 	case BOOT_FMT_DTB:         return "dtb";
+	case BOOT_FMT_DTBO:        return "dtbo";
 	case BOOT_FMT_ZIMAGE:      return "zimage";
+	case BOOT_FMT_ARM64_IMAGE: return "arm64_image";
+	case BOOT_FMT_CPIO:        return "cpio";
+	case BOOT_FMT_SPARSE:      return "sparse";
+	case BOOT_FMT_EROFS:       return "erofs";
+	case BOOT_FMT_F2FS:        return "f2fs";
+	case BOOT_FMT_EXT4:        return "ext4";
+	case BOOT_FMT_VBMETA:      return "vbmeta";
+	case BOOT_FMT_PAYLOAD:     return "payload";
 	case BOOT_FMT_MTK:         return "mtk";
 	default:                   return "raw";
 	}
@@ -182,6 +206,7 @@ static bool boot_fmt_compressed(uint8_t fmt) {
 	case BOOT_FMT_LZ4_LEGACY:
 	case BOOT_FMT_LZ4_LG:
 	case BOOT_FMT_LZOP:
+	case BOOT_FMT_ZSTD:
 		return true;
 	default:
 		return false;
@@ -597,59 +622,8 @@ static int dyn_hdr_load_props(boot_dyn_hdr_t *hdr, const char *path) {
 	return 0;
 }
 
-static void boot_img_print_info(const boot_img_t *img, const char *path) {
-	uint32_t ver;
-	bool is_vnd;
-	uint32_t os_ver = 0;
-
-	if (!img || !img->hdr.raw) return;
-
-	ver = dyn_hdr_version(&img->hdr);
-	is_vnd = dyn_hdr_is_vendor(&img->hdr);
-
-	printf("Image:                %s\n", path);
-	printf("Format:               Android %sBoot Image (v%u)\n", is_vnd ? "Vendor " : "", ver);
-	if (!is_vnd && img->kernel_size > 0) {
-		printf("Kernel size:          %u bytes (%s)\n", img->kernel_size, boot_fmt2name(img->k_fmt));
-	}
-	if (img->kernel_dtb_size > 0) {
-		printf("Kernel DTB size:      %zu bytes\n", img->kernel_dtb_size);
-	}
-	if (img->ramdisk_size > 0) {
-		printf("Ramdisk size:         %u bytes (%s)\n", img->ramdisk_size, boot_fmt2name(img->r_fmt));
-	}
-	if (img->second_size > 0) {
-		printf("Second size:          %u bytes\n", img->second_size);
-	}
-	if (img->recovery_dtbo_size > 0) {
-		printf("Recovery DTBO size:   %u bytes\n", img->recovery_dtbo_size);
-	}
-	if (img->dtb_size > 0) {
-		printf("DTB size:             %u bytes\n", img->dtb_size);
-	}
-	if (img->bootconfig_size > 0) {
-		printf("Bootconfig size:      %u bytes\n", img->bootconfig_size);
-	}
-
-	if (ver < 3) {
-		os_ver = ((struct boot_img_hdr_v0 *)img->hdr.raw)->os_version;
-	} else if (!is_vnd) {
-		os_ver = ((struct boot_img_hdr_v3 *)img->hdr.raw)->os_version;
-	}
-	if (os_ver) {
-		int a = 0, b = 0, c = 0, y = 0, m = 0;
-		boot_hdr_decode_os_version(os_ver, &a, &b, &c, &y, &m);
-		printf("OS version:           %d.%d.%d\n", a, b, c);
-		printf("OS patch level:       %d-%02d\n", y, m);
-	}
-	printf("Page size:            %u bytes\n", dyn_hdr_page_size(&img->hdr));
-	if (img->flags & BOOT_FLAG_AVB) {
-		printf("AVB 2.0 footer:       PRESENT\n");
-	}
-}
-
 /* =========================================================================
- * 3. Streaming Decompression via BusyBox libarchive
+ * 3. Streaming Decompression via BusyBox libarchive & Zstandard
  * ========================================================================= */
 
 static int bb_decompress_data(uint8_t fmt, const void *in, size_t in_sz, int out_fd) {
@@ -674,6 +648,30 @@ static int bb_decompress_data(uint8_t fmt, const void *in, size_t in_sz, int out
 		return -1;
 	}
 	lseek(in_fd, 0, SEEK_SET);
+
+	if (fmt == BOOT_FMT_ZSTD) {
+		pid_t pid = fork();
+		if (pid == 0) {
+			char *args[4];
+			dup2(in_fd, STDIN_FILENO);
+			dup2(out_fd, STDOUT_FILENO);
+			close(in_fd);
+			args[0] = (char *)"zstd";
+			args[1] = (char *)"-dc";
+			args[2] = NULL;
+			BB_EXECVP("zstd", args);
+			_exit(127);
+		}
+		if (pid > 0) {
+			int status;
+			waitpid(pid, &status, 0);
+			ret = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+		} else {
+			ret = -1;
+		}
+		close(in_fd);
+		return ret;
+	}
 
 	init_transformer_state(&xstate);
 	xstate.src_fd = in_fd;
@@ -713,6 +711,528 @@ static int write_to_disk(const char *dest, const void *data, size_t size, uint8_
 	}
 	close(fd);
 	return ret;
+}
+
+/* =========================================================================
+ * 4. Rich Boot Component & Image Inspection Engine
+ * ========================================================================= */
+
+static bool scan_linux_version_banner(const void *buf, size_t len, char *out, size_t out_sz) {
+	static const char needle[] = "Linux version ";
+	const uint8_t *p = (const uint8_t *)buf;
+	const uint8_t *end;
+
+	if (!buf || len < sizeof(needle) || !out || out_sz == 0) return false;
+	out[0] = '\0';
+	end = p + len - sizeof(needle);
+
+	while (p <= end) {
+		if (memcmp(p, needle, sizeof(needle) - 1) == 0) {
+			size_t i = 0;
+			while (i < out_sz - 1 && p[i] != '\0' && p[i] != '\n' && p[i] != '\r') {
+				if (p[i] < 32 || p[i] > 126) break;
+				out[i] = (char)p[i];
+				i++;
+			}
+			out[i] = '\0';
+			if (i > sizeof(needle) && strstr(out, "%s") == NULL) return true;
+		}
+		p++;
+	}
+	return false;
+}
+
+static bool extract_kernel_banner(const void *buf, size_t len, uint8_t fmt, char *out, size_t out_sz) {
+	int fds[2];
+	pid_t pid;
+	char *decomp_buf;
+	ssize_t nr = 0;
+	bool found = false;
+
+	if (!buf || len == 0 || !out || out_sz == 0) return false;
+	if (!boot_fmt_compressed(fmt)) {
+		return scan_linux_version_banner(buf, len, out, out_sz);
+	}
+
+	if (pipe(fds) < 0) return false;
+	pid = fork();
+	if (pid == 0) {
+		close(fds[0]);
+		bb_decompress_data(fmt, buf, len, fds[1]);
+		close(fds[1]);
+		_exit(0);
+	}
+	close(fds[1]);
+
+	decomp_buf = malloc(1048576);
+	if (decomp_buf) {
+		nr = full_read(fds[0], decomp_buf, 1048576);
+	}
+	close(fds[0]);
+	if (pid > 0) {
+		kill(pid, SIGPIPE);
+		waitpid(pid, NULL, 0);
+	}
+
+	if (decomp_buf && nr > 0) {
+		found = scan_linux_version_banner(decomp_buf, (size_t)nr, out, out_sz);
+	}
+	free(decomp_buf);
+	return found;
+}
+
+static void inspect_arm64_image(const void *buf, size_t len, const char *prefix) {
+	const uint8_t *b = (const uint8_t *)buf;
+	uint64_t text_offset, image_size, flags;
+	uint8_t endian, page_sz_code, phys_placement;
+	const char *ps_str = "unspecified";
+
+	if (!buf || len < 64) return;
+	if (memcmp(b + 56, "ARM\x64", 4) != 0) return;
+
+	text_offset = SWAP_LE64(*(const uint64_t *)(b + 8));
+	image_size = SWAP_LE64(*(const uint64_t *)(b + 16));
+	flags = SWAP_LE64(*(const uint64_t *)(b + 24));
+	endian = flags & 1;
+	page_sz_code = (flags >> 1) & 3;
+	phys_placement = (flags >> 3) & 1;
+
+	if (page_sz_code == 1) ps_str = "4KB";
+	else if (page_sz_code == 2) ps_str = "16KB";
+	else if (page_sz_code == 3) ps_str = "64KB";
+
+	printf("%sArch:                 AArch64 (ARM64)\n", prefix);
+	printf("%sText Offset:          0x%016llx\n", prefix, (unsigned long long)text_offset);
+	printf("%sEffective Image Sz:   %llu bytes (0x%llx)\n", prefix, (unsigned long long)image_size, (unsigned long long)image_size);
+	printf("%sEndianness:           %s\n", prefix, endian ? "Big Endian" : "Little Endian");
+	printf("%sPage Size Support:    %s\n", prefix, ps_str);
+	printf("%sPhysical Placement:   %s\n", prefix, phys_placement ? "2MB aligned at DRAM base" : "2MB aligned anywhere in DRAM");
+}
+
+static void inspect_arm32_zimage(const void *buf, size_t len, const char *prefix) {
+	const uint8_t *b = (const uint8_t *)buf;
+	uint32_t start, end;
+
+	if (!buf || len < 48) return;
+	if (memcmp(b + 36, "\x18\x28\x6f\x01", 4) != 0) return;
+
+	start = SWAP_LE32(*(const uint32_t *)(b + 40));
+	end = SWAP_LE32(*(const uint32_t *)(b + 44));
+
+	printf("%sArch:                 ARM 32-bit (zImage)\n", prefix);
+	printf("%szImage Start:         0x%08x\n", prefix, start);
+	printf("%szImage End:           0x%08x\n", prefix, end);
+	if (end > start) {
+		printf("%szImage Raw Size:      %u bytes\n", prefix, end - start);
+	}
+}
+
+static void inspect_fdt_details(const void *buf, size_t len, const char *prefix) {
+	const struct fdt_header *fdt;
+	uint32_t magic, totalsize, off_struct, off_strings, version;
+	const uint8_t *b = (const uint8_t *)buf;
+
+	if (!buf || len < sizeof(struct fdt_header)) return;
+	fdt = (const struct fdt_header *)buf;
+	magic = SWAP_BE32(fdt->magic);
+	if (magic != FDT_MAGIC) return;
+
+	totalsize = SWAP_BE32(fdt->totalsize);
+	off_struct = SWAP_BE32(fdt->off_dt_struct);
+	off_strings = SWAP_BE32(fdt->off_dt_strings);
+	version = SWAP_BE32(fdt->version);
+
+	printf("%sFDT Version:          %u\n", prefix, version);
+	printf("%sFDT Total Size:       %u bytes\n", prefix, totalsize);
+
+	if (off_struct < len && off_strings < len) {
+		const uint32_t *p = (const uint32_t *)(b + off_struct);
+		const uint32_t *end = (const uint32_t *)(b + len);
+		const char *strings = (const char *)(b + off_strings);
+		size_t strings_sz = len - off_strings;
+
+		if (p < end && SWAP_BE32(*p) == 1) {
+			const char *name;
+			size_t nlen;
+			p++;
+			name = (const char *)p;
+			nlen = strlen(name) + 1;
+			p += (nlen + 3) / 4;
+
+			while (p < end) {
+				uint32_t token = SWAP_BE32(*p++);
+				if (token == 3) {
+					uint32_t plen = SWAP_BE32(*p++);
+					uint32_t nameoff = SWAP_BE32(*p++);
+					const char *prop_name = (nameoff < strings_sz) ? (strings + nameoff) : "";
+					const char *prop_data = (const char *)p;
+					p += (plen + 3) / 4;
+
+					if (strcmp(prop_name, "model") == 0 && plen > 0) {
+						char model_buf[256];
+						size_t cpy_sz = plen < sizeof(model_buf) ? plen : sizeof(model_buf) - 1;
+						memcpy(model_buf, prop_data, cpy_sz);
+						model_buf[cpy_sz] = '\0';
+						printf("%sPlatform Model:       %s\n", prefix, model_buf);
+					} else if (strcmp(prop_name, "compatible") == 0 && plen > 0) {
+						char compat_buf[512];
+						size_t ci = 0, di = 0;
+						compat_buf[0] = '\0';
+						while (di < plen && ci < sizeof(compat_buf) - 2) {
+							if (prop_data[di] == '\0') {
+								if (di + 1 < plen && prop_data[di + 1] != '\0') {
+									compat_buf[ci++] = ',';
+									compat_buf[ci++] = ' ';
+								}
+							} else {
+								compat_buf[ci++] = prop_data[di];
+							}
+							di++;
+						}
+						compat_buf[ci] = '\0';
+						printf("%sPlatform Compatible:  %s\n", prefix, compat_buf);
+					}
+				} else if (token == 1 || token == 2 || token == 9) {
+					break;
+				}
+			}
+		}
+	}
+}
+
+static void inspect_dtbo_details(const void *buf, size_t len, const char *prefix) {
+	const struct dt_table_header *dtb_hdr;
+	if (!buf || len < sizeof(struct dt_table_header)) return;
+	dtb_hdr = (const struct dt_table_header *)buf;
+	if (SWAP_BE32(dtb_hdr->magic) == DT_TABLE_MAGIC || SWAP_LE32(dtb_hdr->magic) == DT_TABLE_MAGIC) {
+		uint32_t entries = (dtb_hdr->magic == DT_TABLE_MAGIC) ? dtb_hdr->dt_entry_count : SWAP_BE32(dtb_hdr->dt_entry_count);
+		uint32_t page_sz = (dtb_hdr->magic == DT_TABLE_MAGIC) ? dtb_hdr->page_size : SWAP_BE32(dtb_hdr->page_size);
+		printf("%sFormat:               DTBO Table\n", prefix);
+		printf("%sEntries Count:        %u\n", prefix, entries);
+		if (page_sz) printf("%sPage Size:            %u bytes\n", prefix, page_sz);
+	} else if (len >= 4 && SWAP_BE32(*(const uint32_t *)buf) == FDT_MAGIC) {
+		inspect_fdt_details(buf, len, prefix);
+	}
+}
+
+static void inspect_cpio_buffer(const void *buf, size_t len, const char *prefix) {
+	const char *b = (const char *)buf;
+	const char *fmt_str = "Unknown CPIO";
+	bool is_svr4 = false;
+	bool has_init = false;
+	bool has_recovery = false;
+	bool has_magisk = false;
+	bool has_modules = false;
+	size_t file_count = 0;
+	size_t off = 0;
+
+	if (!buf || len < 6) return;
+
+	if (memcmp(b, "070701", 6) == 0) {
+		fmt_str = "SVR4 new portable format without CRC (070701)";
+		is_svr4 = true;
+	} else if (memcmp(b, "070702", 6) == 0) {
+		fmt_str = "SVR4 new portable format with CRC (070702)";
+		is_svr4 = true;
+	} else if (memcmp(b, "070707", 6) == 0) {
+		fmt_str = "POSIX portable format (070707 odc)";
+	} else if (memcmp(b, "\xc7\x71", 2) == 0 || memcmp(b, "\x71\xc7", 2) == 0) {
+		fmt_str = "CPIO old binary format";
+	}
+
+	printf("%sCPIO Variant:         %s\n", prefix, fmt_str);
+
+	if (is_svr4) {
+		while (off + 110 <= len) {
+			const char *hdr = b + off;
+			char namesize_str[9] = {0};
+			char filesize_str[9] = {0};
+			unsigned long namesize = 0;
+			unsigned long filesize = 0;
+			const char *filename;
+
+			if (memcmp(hdr, "070701", 6) != 0 && memcmp(hdr, "070702", 6) != 0) break;
+
+			memcpy(filesize_str, hdr + 54, 8);
+			memcpy(namesize_str, hdr + 94, 8);
+			filesize = strtoul(filesize_str, NULL, 16);
+			namesize = strtoul(namesize_str, NULL, 16);
+
+			off += 110;
+			if (namesize == 0 || off + namesize > len) break;
+
+			filename = b + off;
+			if (strcmp(filename, "TRAILER!!!") == 0) break;
+
+			file_count++;
+			if (strcmp(filename, "init") == 0 || strcmp(filename, "init.rc") == 0) has_init = true;
+			if (strstr(filename, "recovery") != NULL) has_recovery = true;
+			if (strstr(filename, "magisk") != NULL || strstr(filename, "overlay.d") != NULL) has_magisk = true;
+			if (strstr(filename, ".ko") != NULL || strstr(filename, "modules") != NULL) has_modules = true;
+
+			off += (namesize + 3) / 4 * 4;
+			off += (filesize + 3) / 4 * 4;
+			if (file_count >= 100) break;
+		}
+
+		{
+			const char *role = "Generic Ramdisk";
+			if (has_recovery) role = "Recovery / TWRP Environment";
+			else if (has_magisk) role = "Magisk-Patched Rootfs";
+			else if (has_init) role = "First-Stage Android Rootfs (init)";
+			else if (has_modules) role = "Vendor DLKM / Modules Ramdisk";
+
+			printf("%sRamdisk Role:         %s\n", prefix, role);
+		}
+	}
+}
+
+static void inspect_ramdisk_details(const void *buf, size_t len, uint8_t fmt, const char *prefix) {
+	if (fmt == BOOT_FMT_CPIO) {
+		inspect_cpio_buffer(buf, len, prefix);
+	} else if (boot_fmt_compressed(fmt)) {
+		int fds[2];
+		pid_t pid;
+		char decomp_buf[65536];
+		ssize_t nr = 0;
+
+		if (pipe(fds) < 0) return;
+		pid = fork();
+		if (pid == 0) {
+			close(fds[0]);
+			bb_decompress_data(fmt, buf, len, fds[1]);
+			close(fds[1]);
+			_exit(0);
+		}
+		close(fds[1]);
+		nr = full_read(fds[0], decomp_buf, sizeof(decomp_buf));
+		close(fds[0]);
+		if (pid > 0) {
+			kill(pid, SIGPIPE);
+			waitpid(pid, NULL, 0);
+		}
+		if (nr > 110) {
+			inspect_cpio_buffer(decomp_buf, (size_t)nr, prefix);
+		}
+	}
+}
+
+static void inspect_vendor_ramdisk_table(const void *buf, size_t len, uint32_t entry_num, uint32_t entry_sz, const char *prefix) {
+	const uint8_t *p = (const uint8_t *)buf;
+	uint32_t i;
+	if (!buf || len < entry_sz) return;
+	printf("%sEntries (%u):\n", prefix, entry_num);
+	for (i = 0; i < entry_num && (i + 1) * entry_sz <= len; i++) {
+		const struct vendor_ramdisk_table_entry_v4 *e = (const struct vendor_ramdisk_table_entry_v4 *)(p + i * entry_sz);
+		printf("%s  [%u] Name: %-16s Size: %-8u Offset: 0x%08x Type: %u\n",
+		       prefix, i, e->ramdisk_name, e->ramdisk_size, e->ramdisk_offset, e->ramdisk_type);
+	}
+}
+
+static void print_bootconfig_preview(const void *buf, size_t len, const char *prefix) {
+	const char *b = (const char *)buf;
+	size_t i, start = 0;
+	int line_count = 0, shown = 0;
+	if (!buf || len == 0) return;
+
+	for (i = 0; i < len; i++) {
+		if (b[i] == '\n') line_count++;
+	}
+	printf("%sParameters Count:   %d\n", prefix, line_count);
+	printf("%sPreview (first 5 parameters):\n", prefix);
+	for (i = 0; i <= len && shown < 5; i++) {
+		if (i == len || b[i] == '\n') {
+			size_t llen = i - start;
+			if (llen > 0 && b[start] != '#') {
+				printf("%s  %.*s\n", prefix, (int)llen, b + start);
+				shown++;
+			}
+			start = i + 1;
+		}
+	}
+}
+
+static void boot_img_print_info(const boot_img_t *img, const char *path) {
+	uint32_t ver;
+	bool is_vnd;
+	bool is_init_boot = false;
+	uint32_t page_sz;
+	uint32_t os_ver = 0;
+	char banner[256];
+
+	if (!img || !img->hdr.raw) return;
+
+	ver = dyn_hdr_version(&img->hdr);
+	is_vnd = dyn_hdr_is_vendor(&img->hdr);
+	page_sz = dyn_hdr_page_size(&img->hdr);
+
+	if (!is_vnd && (ver == 3 || ver == 4) && img->kernel_size == 0 && img->ramdisk_size > 0) {
+		is_init_boot = true;
+	}
+
+	printf("====================================================================\n");
+	printf("Image:                %s\n", path);
+	if (is_init_boot) {
+		printf("Format:               Android Generic Ramdisk Image (init_boot.img, v%u)\n", ver);
+	} else if (is_vnd) {
+		printf("Format:               Android Vendor Boot Image (vendor_boot.img, v%u)\n", ver);
+	} else {
+		printf("Format:               Android Boot Image (v%u)\n", ver);
+	}
+
+	if (ver < 3) {
+		os_ver = ((struct boot_img_hdr_v0 *)img->hdr.raw)->os_version;
+	} else if (!is_vnd) {
+		os_ver = ((struct boot_img_hdr_v3 *)img->hdr.raw)->os_version;
+	}
+	if (os_ver) {
+		int a = 0, b = 0, c = 0, y = 0, m = 0;
+		boot_hdr_decode_os_version(os_ver, &a, &b, &c, &y, &m);
+		printf("OS Version:           %d.%d.%d\n", a, b, c);
+		printf("OS Patch Level:       %d-%02d\n", y, m);
+	}
+	printf("Page Size:            %u bytes\n", page_sz);
+
+	if (ver < 3) {
+		struct boot_img_hdr_v0 *h0 = (struct boot_img_hdr_v0 *)img->hdr.raw;
+		printf("Kernel Address:       0x%08x\n", h0->kernel_addr);
+		printf("Ramdisk Address:      0x%08x\n", h0->ramdisk_addr);
+		if (h0->second_size) printf("Second Address:       0x%08x\n", h0->second_addr);
+		printf("Tags Address:         0x%08x\n", h0->tags_addr);
+	} else if (is_vnd) {
+		struct boot_img_hdr_vnd_v3 *hv = (struct boot_img_hdr_vnd_v3 *)img->hdr.raw;
+		printf("Kernel Address:       0x%08x\n", hv->kernel_addr);
+		printf("Ramdisk Address:      0x%08x\n", hv->ramdisk_addr);
+		printf("Tags Address:         0x%08x\n", hv->tags_addr);
+		if (hv->dtb_size) printf("DTB Address:          0x%016llx\n", (unsigned long long)hv->dtb_addr);
+	}
+
+	{
+		const char *name = NULL;
+		if (ver < 3) name = ((struct boot_img_hdr_v0 *)img->hdr.raw)->name;
+		else if (is_vnd) name = ((struct boot_img_hdr_vnd_v3 *)img->hdr.raw)->name;
+		if (name && name[0]) printf("Product Name:         %s\n", name);
+	}
+
+	if (!is_vnd && img->kernel_size > 0) {
+		printf("--------------------------------------------------------------------\n");
+		printf("Kernel:\n");
+		printf("  Size:               %u bytes (%.2f MB)\n", img->kernel_size, (double)img->kernel_size / (1024 * 1024));
+		printf("  Format:             %s\n", boot_fmt2name(img->k_fmt));
+		if (img->k_fmt == BOOT_FMT_ARM64_IMAGE) {
+			inspect_arm64_image(img->kernel, img->kernel_size, "  ");
+		} else if (img->k_fmt == BOOT_FMT_ZIMAGE) {
+			inspect_arm32_zimage(img->kernel, img->kernel_size, "  ");
+		}
+		if (extract_kernel_banner(img->kernel, img->kernel_size, img->k_fmt, banner, sizeof(banner))) {
+			printf("  Banner:             %s\n", banner);
+		}
+	}
+
+	if (img->kernel_dtb_size > 0 && img->kernel_dtb) {
+		printf("--------------------------------------------------------------------\n");
+		printf("Kernel DTB (appended):\n");
+		printf("  Size:               %zu bytes\n", img->kernel_dtb_size);
+		inspect_fdt_details(img->kernel_dtb, img->kernel_dtb_size, "  ");
+	}
+
+	if (img->ramdisk_size > 0 && img->ramdisk) {
+		printf("--------------------------------------------------------------------\n");
+		printf("Ramdisk:\n");
+		printf("  Size:               %u bytes (%.2f MB)\n", img->ramdisk_size, (double)img->ramdisk_size / (1024 * 1024));
+		printf("  Format:             %s\n", boot_fmt2name(img->r_fmt));
+		inspect_ramdisk_details(img->ramdisk, img->ramdisk_size, img->r_fmt, "  ");
+	}
+
+	if (img->second_size > 0) {
+		printf("--------------------------------------------------------------------\n");
+		printf("Second Stage:\n");
+		printf("  Size:               %u bytes\n", img->second_size);
+	}
+
+	if (img->extra_size > 0) {
+		printf("--------------------------------------------------------------------\n");
+		printf("Extra Component:\n");
+		printf("  Size:               %u bytes (%s)\n", img->extra_size, boot_fmt2name(img->e_fmt));
+	}
+
+	if (img->recovery_dtbo_size > 0 && img->recovery_dtbo) {
+		printf("--------------------------------------------------------------------\n");
+		printf("Recovery DTBO:\n");
+		printf("  Size:               %u bytes\n", img->recovery_dtbo_size);
+		if (ver == 1 || ver == 2) {
+			struct boot_img_hdr_v1 *h1 = (struct boot_img_hdr_v1 *)img->hdr.raw;
+			printf("  Offset:             0x%llx\n", (unsigned long long)h1->recovery_dtbo_offset);
+		}
+		inspect_dtbo_details(img->recovery_dtbo, img->recovery_dtbo_size, "  ");
+	}
+
+	if (img->dtb_size > 0 && img->dtb) {
+		printf("--------------------------------------------------------------------\n");
+		printf("DTB (Device Tree):\n");
+		printf("  Size:               %u bytes\n", img->dtb_size);
+		inspect_fdt_details(img->dtb, img->dtb_size, "  ");
+	}
+
+	if (img->vendor_ramdisk_table_size > 0 && img->vendor_ramdisk_table) {
+		printf("--------------------------------------------------------------------\n");
+		printf("Vendor Ramdisk Table (v4):\n");
+		printf("  Size:               %u bytes\n", img->vendor_ramdisk_table_size);
+		if (img->hdr.type == BOOT_HDR_VND_V4) {
+			struct boot_img_hdr_vnd_v4 *v4 = (struct boot_img_hdr_vnd_v4 *)img->hdr.raw;
+			inspect_vendor_ramdisk_table(img->vendor_ramdisk_table, img->vendor_ramdisk_table_size,
+			                             v4->vendor_ramdisk_table_entry_num,
+			                             v4->vendor_ramdisk_table_entry_size, "  ");
+		}
+	}
+
+	if (img->bootconfig_size > 0 && img->bootconfig) {
+		printf("--------------------------------------------------------------------\n");
+		printf("Bootconfig:\n");
+		printf("  Size:               %u bytes\n", img->bootconfig_size);
+		print_bootconfig_preview(img->bootconfig, img->bootconfig_size, "  ");
+	}
+
+	if (img->signature_size > 0) {
+		printf("--------------------------------------------------------------------\n");
+		printf("Boot Signature (v4):  %u bytes\n", img->signature_size);
+	}
+
+	{
+		const char *cmd = NULL;
+		const char *extra = NULL;
+		if (ver < 3) {
+			struct boot_img_hdr_v0 *h0 = (struct boot_img_hdr_v0 *)img->hdr.raw;
+			cmd = h0->cmdline;
+			extra = h0->extra_cmdline;
+		} else if (is_vnd) {
+			cmd = ((struct boot_img_hdr_vnd_v3 *)img->hdr.raw)->cmdline;
+		} else {
+			cmd = ((struct boot_img_hdr_v3 *)img->hdr.raw)->cmdline;
+		}
+		if ((cmd && cmd[0]) || (extra && extra[0])) {
+			printf("--------------------------------------------------------------------\n");
+			printf("Command Line:\n");
+			if (cmd && cmd[0]) printf("  cmdline:            %s\n", cmd);
+			if (extra && extra[0]) printf("  extra_cmdline:      %s\n", extra);
+		}
+	}
+
+	if (img->flags & BOOT_FLAG_AVB) {
+		printf("--------------------------------------------------------------------\n");
+		printf("AVB 2.0:\n");
+		printf("  Footer:             PRESENT\n");
+		if (img->avb_footer) {
+			printf("  Original Image Sz:  %llu bytes (%.2f MB)\n",
+			       (unsigned long long)img->avb_footer->original_image_size,
+			       (double)img->avb_footer->original_image_size / (1024 * 1024));
+			printf("  VBMeta Offset:      0x%llx (%llu)\n",
+			       (unsigned long long)img->avb_footer->vbmeta_offset,
+			       (unsigned long long)img->avb_footer->vbmeta_offset);
+			printf("  VBMeta Size:        %llu bytes\n", (unsigned long long)img->avb_footer->vbmeta_size);
+		}
+	}
+	printf("====================================================================\n");
 }
 
 /* =========================================================================
@@ -765,7 +1285,7 @@ static void *map_or_read_image(int fd, size_t size, bool rw)
 	return MAP_FAILED;
 }
 
-static bool boot_img_parse(boot_img_t *img, const char *path) {
+static bool boot_img_parse_full(boot_img_t *img, const char *path, bool silent) {
 	int fd;
 	struct stat st;
 	off_t real_sz;
@@ -782,14 +1302,14 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 	if (fd < 0) return false;
 
 	if (fstat(fd, &st) < 0) {
-		bb_perror_msg("cannot stat '%s'", path);
+		if (!silent) bb_perror_msg("cannot stat '%s'", path);
 		close(fd);
 		return false;
 	}
 
 	real_sz = get_file_or_bdev_size(fd, &st);
 	if (real_sz < 1024) {
-		bb_error_msg("file '%s' is too small or invalid (%lld bytes)", path, (long long)real_sz);
+		if (!silent) bb_error_msg("file '%s' is too small or invalid (%lld bytes)", path, (long long)real_sz);
 		close(fd);
 		return false;
 	}
@@ -799,7 +1319,7 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 	close(fd);
 
 	if (img->map_ptr == MAP_FAILED || !img->map_ptr) {
-		bb_perror_msg("mmap failed for '%s'", path);
+		if (!silent) bb_perror_msg("mmap failed for '%s'", path);
 		return false;
 	}
 
@@ -824,7 +1344,7 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 	}
 
 	if (!hdr_ptr) {
-		bb_error_msg("no valid boot image header found in '%s'", path);
+		if (!silent) bb_error_msg("no valid boot image header found in '%s'", path);
 		munmap(img->map_ptr, img->map_sz);
 		return false;
 	}
@@ -912,10 +1432,28 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 		off += align_to(img->dtb_size, page_sz);
 	}
 
+	if (img->hdr.type == BOOT_HDR_VND_V4) {
+		struct boot_img_hdr_vnd_v4 *v4 = (struct boot_img_hdr_vnd_v4 *)img->hdr.raw;
+		img->vendor_ramdisk_table_size = v4->vendor_ramdisk_table_size;
+		if (img->vendor_ramdisk_table_size > 0 && hdr_ptr + off + img->vendor_ramdisk_table_size <= end) {
+			img->vendor_ramdisk_table = hdr_ptr + off;
+			off += align_to(img->vendor_ramdisk_table_size, page_sz);
+		}
+	}
+
 	img->bootconfig_size = *dyn_hdr_bootconfig_size(&img->hdr);
 	if (img->bootconfig_size > 0 && hdr_ptr + off + img->bootconfig_size <= end) {
 		img->bootconfig = hdr_ptr + off;
 		off += align_to(img->bootconfig_size, page_sz);
+	}
+
+	if (img->hdr.type == BOOT_HDR_V4) {
+		struct boot_img_hdr_v4 *b4 = (struct boot_img_hdr_v4 *)img->hdr.raw;
+		img->signature_size = b4->signature_size;
+		if (img->signature_size > 0 && hdr_ptr + off + img->signature_size <= end) {
+			img->signature = hdr_ptr + off;
+			off += align_to(img->signature_size, 4096);
+		}
 	}
 
 	/* AVB 2.0 footer check at end of image */
@@ -929,6 +1467,10 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 
 	img->valid = true;
 	return true;
+}
+
+static inline bool boot_img_parse(boot_img_t *img, const char *path) {
+	return boot_img_parse_full(img, path, false);
 }
 
 static void boot_img_free(boot_img_t *img) {
@@ -948,9 +1490,14 @@ static void boot_img_free(boot_img_t *img) {
  * 5. magiskboot unpack, repack, split, hexpatch commands
  * ========================================================================= */
 
+static int magiskboot_info_image(const char *path);
+
 static int magiskboot_unpack(const char *image, bool skip_kernel_decomp, bool skip_ramdisk_decomp, bool hdr_only, bool kernel_only) {
 	boot_img_t boot;
-	if (!boot_img_parse(&boot, image)) return 1;
+	if (!boot_img_parse(&boot, image)) {
+		if (hdr_only) return magiskboot_info_image(image);
+		return 1;
+	}
 
 	if (kernel_only) {
 		if (boot.kernel && boot.kernel_size > 0) {
@@ -995,8 +1542,14 @@ static int magiskboot_unpack(const char *image, bool skip_kernel_decomp, bool sk
 	if (boot.dtb && boot.dtb_size > 0) {
 		write_to_disk(DTB_FILE, boot.dtb, boot.dtb_size, BOOT_FMT_UNKNOWN, true);
 	}
+	if (boot.vendor_ramdisk_table && boot.vendor_ramdisk_table_size > 0) {
+		write_to_disk("vendor_ramdisk_table", boot.vendor_ramdisk_table, boot.vendor_ramdisk_table_size, BOOT_FMT_UNKNOWN, true);
+	}
 	if (boot.bootconfig && boot.bootconfig_size > 0) {
 		write_to_disk(BOOTCONFIG_FILE, boot.bootconfig, boot.bootconfig_size, BOOT_FMT_UNKNOWN, true);
+	}
+	if (boot.signature && boot.signature_size > 0) {
+		write_to_disk("boot_signature", boot.signature, boot.signature_size, BOOT_FMT_UNKNOWN, true);
 	}
 
 	boot_img_free(&boot);
@@ -1062,6 +1615,9 @@ static int compress_file_format(const char *src, const char *dst, uint8_t fmt) {
 	} else if (fmt == BOOT_FMT_BZIP2) {
 		prog = "bzip2";
 		arg = "-c";
+	} else if (fmt == BOOT_FMT_ZSTD) {
+		prog = "zstd";
+		arg = "-19c";
 	}
 
 	out_tfd = open3_or_warn(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -1122,6 +1678,7 @@ static const char *prepare_ramdisk_for_repack(boot_img_t *boot, bool skip_comp, 
 	if (access("ramdisk.cpio.xz", R_OK) == 0) return "ramdisk.cpio.xz";
 	if (access("ramdisk.cpio.lz4", R_OK) == 0) return "ramdisk.cpio.lz4";
 	if (access("ramdisk.cpio.bz2", R_OK) == 0) return "ramdisk.cpio.bz2";
+	if (access("ramdisk.cpio.zst", R_OK) == 0) return "ramdisk.cpio.zst";
 
 	if (!skip_comp && boot_fmt_compressed(boot->r_fmt) && access(RAMDISK_FILE, R_OK) == 0) {
 		int in_fd = open_or_warn(RAMDISK_FILE, O_RDONLY);
@@ -1375,9 +1932,19 @@ static int magiskboot_repack(const char *src_img, const char *out_img, bool skip
 		copy_file_section(out_fd, DTB_FILE, page_sz, &dtb_sz);
 		*dyn_hdr_dtb_size(&boot.hdr) = dtb_sz;
 	}
+	if (boot.hdr.type == BOOT_HDR_VND_V4 && access("vendor_ramdisk_table", R_OK) == 0) {
+		uint32_t table_sz = 0;
+		copy_file_section(out_fd, "vendor_ramdisk_table", page_sz, &table_sz);
+		((struct boot_img_hdr_vnd_v4 *)boot.hdr.raw)->vendor_ramdisk_table_size = table_sz;
+	}
 	if (access(BOOTCONFIG_FILE, R_OK) == 0) {
 		copy_file_section(out_fd, BOOTCONFIG_FILE, page_sz, &bootconfig_sz);
 		*dyn_hdr_bootconfig_size(&boot.hdr) = bootconfig_sz;
+	}
+	if (boot.hdr.type == BOOT_HDR_V4 && access("boot_signature", R_OK) == 0) {
+		uint32_t sig_sz = 0;
+		copy_file_section(out_fd, "boot_signature", 4096, &sig_sz);
+		((struct boot_img_hdr_v4 *)boot.hdr.raw)->signature_size = sig_sz;
 	}
 
 	/* 2. Recalculate header SHA checksum */
@@ -1455,6 +2022,8 @@ static int magiskboot_extract_component(const char *image, const char *comp, con
 		"second\0"
 		"extra\0"
 		"bootconfig\0"
+		"vendor_ramdisk_table\0"
+		"signature\0"
 		"recovery\0";
 	enum {
 		COMP_kernel = 0,
@@ -1465,6 +2034,8 @@ static int magiskboot_extract_component(const char *image, const char *comp, con
 		COMP_second,
 		COMP_extra,
 		COMP_bootconfig,
+		COMP_vendor_ramdisk_table,
+		COMP_signature,
 		COMP_recovery,
 	};
 
@@ -1514,6 +2085,16 @@ static int magiskboot_extract_component(const char *image, const char *comp, con
 		data = boot.bootconfig;
 		sz = boot.bootconfig_size;
 		dest = outfile ? outfile : BOOTCONFIG_FILE;
+		break;
+	case COMP_vendor_ramdisk_table:
+		data = boot.vendor_ramdisk_table;
+		sz = boot.vendor_ramdisk_table_size;
+		dest = outfile ? outfile : "vendor_ramdisk_table";
+		break;
+	case COMP_signature:
+		data = boot.signature;
+		sz = boot.signature_size;
+		dest = outfile ? outfile : "boot_signature";
 		break;
 	case COMP_recovery: {
 		char *rec_argv[5];
@@ -1830,6 +2411,90 @@ static int cpio_write_all(const char *path, cpio_node_t *head) {
 		return -1;
 	}
 	return 0;
+}
+
+static void cpio_add_dir_entries(cpio_node_t ***tail_ptr, const char *base_path, const char *rel_path) {
+	DIR *dir;
+	struct dirent *de;
+	char full_path[PATH_MAX * 2];
+
+	if (rel_path && rel_path[0]) {
+		snprintf(full_path, sizeof(full_path), "%s/%s", base_path, rel_path);
+	} else {
+		safe_strncpy(full_path, base_path, sizeof(full_path));
+	}
+
+	dir = opendir(full_path);
+	if (!dir) return;
+
+	while ((de = readdir(dir)) != NULL) {
+		char entry_rel[PATH_MAX];
+		char entry_full[PATH_MAX * 2];
+		struct stat st;
+		cpio_node_t *node;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+
+		if (rel_path && rel_path[0]) {
+			snprintf(entry_rel, sizeof(entry_rel), "%s/%s", rel_path, de->d_name);
+		} else {
+			safe_strncpy(entry_rel, de->d_name, sizeof(entry_rel));
+		}
+		snprintf(entry_full, sizeof(entry_full), "%s/%s", base_path, entry_rel);
+
+		if (lstat(entry_full, &st) != 0) continue;
+
+		node = xzalloc(sizeof(*node));
+		node->name = xstrdup(entry_rel);
+		node->mode = st.st_mode;
+		node->uid = st.st_uid;
+		node->gid = st.st_gid;
+		node->nlink = st.st_nlink;
+		node->mtime = st.st_mtime;
+
+		if (S_ISDIR(st.st_mode)) {
+			node->filesize = 0;
+			node->data = NULL;
+			**tail_ptr = node;
+			*tail_ptr = &node->next;
+			cpio_add_dir_entries(tail_ptr, base_path, entry_rel);
+		} else if (S_ISLNK(st.st_mode)) {
+			char link_target[PATH_MAX];
+			ssize_t llen = readlink(entry_full, link_target, sizeof(link_target) - 1);
+			if (llen > 0) {
+				link_target[llen] = '\0';
+				node->data = xstrdup(link_target);
+				node->filesize = (uint32_t)llen;
+			}
+			**tail_ptr = node;
+			*tail_ptr = &node->next;
+		} else if (S_ISREG(st.st_mode)) {
+			size_t sz = 0;
+			node->data = magiskboot_read_file(entry_full, &sz);
+			node->filesize = (uint32_t)sz;
+			**tail_ptr = node;
+			*tail_ptr = &node->next;
+		} else {
+			free(node->name);
+			free(node);
+		}
+	}
+	closedir(dir);
+}
+
+static int cpio_pack_from_dir(const char *dir_path, const char *out_cpio) {
+	cpio_node_t *head = NULL;
+	cpio_node_t **tail = &head;
+	int ret;
+
+	cpio_add_dir_entries(&tail, dir_path, "");
+	if (!head) {
+		bb_error_msg("directory '%s' is empty or could not be read", dir_path);
+		return -1;
+	}
+	ret = cpio_write_all(out_cpio, head);
+	cpio_free_all(head);
+	return ret;
 }
 
 static int cpio_exec_cmd(cpio_node_t **head_ptr, int argc, char **argv, bool *modified) {
@@ -4027,6 +4692,302 @@ cleanup:
 	return ret;
 }
 
+/*
+ * Ramdisk Extractor Engine
+ * Extracts ramdisk from target boot image (or live boot partition)
+ * with auto-decompression or raw extraction.
+ */
+static int magiskboot_extract_ramdisk_op(int argc, char **argv)
+{
+	bool live = false;
+	bool raw = false;
+	const char *part_name = NULL;
+	const char *boot_img = NULL;
+	const char *out_target = NULL;
+	char discovered_boot[512];
+	char abs_boot_img[PATH_MAX];
+	boot_img_t boot;
+	int i;
+	int ret = 0;
+
+	discovered_boot[0] = '\0';
+	abs_boot_img[0] = '\0';
+
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--live") == 0) {
+			live = true;
+		} else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-decomp") == 0 || strcmp(argv[i], "--raw") == 0) {
+			raw = true;
+		} else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+			part_name = argv[++i];
+		} else if (argv[i][0] == '-') {
+			/* skip unrecognized options */
+		} else {
+			if (!boot_img && !live) {
+				boot_img = argv[i];
+			} else if (!out_target) {
+				out_target = argv[i];
+			}
+		}
+	}
+
+	if (part_name) {
+		char pbuf[PATH_MAX];
+		snprintf(pbuf, sizeof(pbuf), "/dev/block/by-name/%s", part_name);
+		if (access(pbuf, F_OK) == 0) {
+			safe_strncpy(discovered_boot, pbuf, sizeof(discovered_boot));
+			boot_img = discovered_boot;
+		} else {
+			snprintf(pbuf, sizeof(pbuf), "/dev/block/bootdevice/by-name/%s", part_name);
+			if (access(pbuf, F_OK) == 0) {
+				safe_strncpy(discovered_boot, pbuf, sizeof(discovered_boot));
+				boot_img = discovered_boot;
+			}
+		}
+	}
+
+	if (live || !boot_img) {
+		live = true;
+		if (find_target_boot_image(discovered_boot, sizeof(discovered_boot)) != 0) {
+			bb_error_msg("failed to auto-detect target boot partition");
+			return 1;
+		}
+		boot_img = discovered_boot;
+		printf("[+] Auto-detected live boot target: %s\n", boot_img);
+	}
+
+	if (!realpath(boot_img, abs_boot_img)) {
+		safe_strncpy(abs_boot_img, boot_img, sizeof(abs_boot_img));
+	}
+
+	if (!boot_img_parse(&boot, abs_boot_img)) {
+		bb_error_msg("failed to parse boot image '%s'", abs_boot_img);
+		return 1;
+	}
+
+	if (!boot.ramdisk || boot.ramdisk_size == 0) {
+		bb_error_msg("boot image '%s' contains no ramdisk", abs_boot_img);
+		boot_img_free(&boot);
+		return 1;
+	}
+
+	if (!out_target) {
+		if (raw && boot_fmt_compressed(boot.r_fmt)) {
+			static char default_out[64];
+			snprintf(default_out, sizeof(default_out), "ramdisk.cpio.%s", boot_fmt2name(boot.r_fmt));
+			out_target = default_out;
+		} else {
+			out_target = RAMDISK_FILE;
+		}
+	}
+
+	printf("[*] Extracting ramdisk from %s (%u bytes, %s)...\n",
+	       abs_boot_img, boot.ramdisk_size, boot_fmt2name(boot.r_fmt));
+
+	if (write_to_disk(out_target, boot.ramdisk, boot.ramdisk_size, boot.r_fmt, raw) != 0) {
+		bb_error_msg("failed to write ramdisk to '%s'", out_target);
+		ret = 1;
+	} else {
+		struct stat st;
+		off_t out_sz = 0;
+		if (stat(out_target, &st) == 0) out_sz = st.st_size;
+		printf("[✓] SUCCESS: Extracted ramdisk (%lld bytes) -> %s\n",
+		       (long long)out_sz, out_target);
+	}
+
+	boot_img_free(&boot);
+	return ret;
+}
+
+/*
+ * Ramdisk Setter / Replacer Engine
+ * Injects or replaces the ramdisk in a target boot image (or live boot partition)
+ */
+static int magiskboot_set_ramdisk_op(int argc, char **argv)
+{
+	bool live = false;
+	bool install = false;
+	bool skip_comp = false;
+	const char *part_name = NULL;
+	const char *boot_img = NULL;
+	const char *new_rd = NULL;
+	const char *out_img = NULL;
+	char discovered_boot[512];
+	char tmp_work_dir[256];
+	char old_cwd[512];
+	char abs_boot_img[PATH_MAX];
+	char abs_new_rd[PATH_MAX];
+	char repacked_img[PATH_MAX];
+	struct stat st;
+	int i;
+	int ret = 0;
+
+	discovered_boot[0] = '\0';
+	abs_boot_img[0] = '\0';
+	abs_new_rd[0] = '\0';
+
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--live") == 0) {
+			live = true;
+		} else if (strcmp(argv[i], "--install") == 0) {
+			install = true;
+		} else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-comp") == 0) {
+			skip_comp = true;
+		} else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+			part_name = argv[++i];
+		} else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
+			i++; /* skip device ID */
+		} else if (argv[i][0] == '-') {
+			/* skip unrecognized options */
+		} else {
+			if (!boot_img && !live) {
+				boot_img = argv[i];
+			} else if (!new_rd) {
+				new_rd = argv[i];
+			} else if (!out_img) {
+				out_img = argv[i];
+			}
+		}
+	}
+
+	if (part_name) {
+		char pbuf[PATH_MAX];
+		snprintf(pbuf, sizeof(pbuf), "/dev/block/by-name/%s", part_name);
+		if (access(pbuf, F_OK) == 0) {
+			safe_strncpy(discovered_boot, pbuf, sizeof(discovered_boot));
+			boot_img = discovered_boot;
+		} else {
+			snprintf(pbuf, sizeof(pbuf), "/dev/block/bootdevice/by-name/%s", part_name);
+			if (access(pbuf, F_OK) == 0) {
+				safe_strncpy(discovered_boot, pbuf, sizeof(discovered_boot));
+				boot_img = discovered_boot;
+			}
+		}
+	}
+
+	if (live || !boot_img) {
+		live = true;
+		if (find_target_boot_image(discovered_boot, sizeof(discovered_boot)) != 0) {
+			bb_error_msg("failed to auto-detect target boot partition");
+			return 1;
+		}
+		boot_img = discovered_boot;
+		printf("[+] Auto-detected live boot target: %s\n", boot_img);
+	}
+
+	if (!new_rd) {
+		bb_error_msg("missing new ramdisk file or directory argument");
+		return 1;
+	}
+
+	if (!realpath(boot_img, abs_boot_img)) {
+		safe_strncpy(abs_boot_img, boot_img, sizeof(abs_boot_img));
+	}
+	if (!realpath(new_rd, abs_new_rd)) {
+		safe_strncpy(abs_new_rd, new_rd, sizeof(abs_new_rd));
+	}
+
+	if (stat(abs_new_rd, &st) != 0) {
+		bb_perror_msg("cannot access new ramdisk '%s'", abs_new_rd);
+		return 1;
+	}
+
+	if (!getcwd(old_cwd, sizeof(old_cwd))) {
+		strcpy(old_cwd, ".");
+	}
+
+	safe_strncpy(tmp_work_dir, "/tmp/mb_setrd_XXXXXX", sizeof(tmp_work_dir));
+	if (!mkdtemp(tmp_work_dir)) {
+		bb_perror_msg("cannot create temporary directory '%s'", tmp_work_dir);
+		return 1;
+	}
+
+	printf("[*] Unpacking target boot image: %s\n", abs_boot_img);
+	chdir(tmp_work_dir);
+	if (magiskboot_unpack(abs_boot_img, true, true, false, false) != 0) {
+		bb_error_msg("failed to unpack target boot image '%s'", abs_boot_img);
+		ret = 1;
+		goto cleanup;
+	}
+
+	/* Remove previous ramdisk files in staging directory */
+	unlink("ramdisk.cpio");
+	unlink("ramdisk.cpio.gz");
+	unlink("ramdisk.cpio.xz");
+	unlink("ramdisk.cpio.lz4");
+	unlink("ramdisk.cpio.bz2");
+	unlink("ramdisk.cpio.zst");
+
+	/* Install new ramdisk */
+	if (S_ISDIR(st.st_mode)) {
+		printf("[*] Packing directory %s into ramdisk.cpio...\n", abs_new_rd);
+		if (cpio_pack_from_dir(abs_new_rd, "ramdisk.cpio") != 0) {
+			bb_error_msg("failed to pack directory '%s' into ramdisk", abs_new_rd);
+			ret = 1;
+			goto cleanup;
+		}
+	} else {
+		int in_fd = open_or_warn(abs_new_rd, O_RDONLY | O_CLOEXEC);
+		uint8_t mbuf[32];
+		ssize_t mn = 0;
+		uint8_t fmt = BOOT_FMT_UNKNOWN;
+
+		if (in_fd >= 0) {
+			mn = full_read(in_fd, mbuf, sizeof(mbuf));
+			close(in_fd);
+			if (mn > 0) fmt = boot_check_fmt(mbuf, (size_t)mn);
+		}
+
+		if (fmt == BOOT_FMT_CPIO || fmt == BOOT_FMT_UNKNOWN) {
+			copy_file(abs_new_rd, "ramdisk.cpio", FILEUTILS_FORCE);
+		} else if (fmt == BOOT_FMT_GZIP) {
+			copy_file(abs_new_rd, "ramdisk.cpio.gz", FILEUTILS_FORCE);
+		} else if (fmt == BOOT_FMT_XZ) {
+			copy_file(abs_new_rd, "ramdisk.cpio.xz", FILEUTILS_FORCE);
+		} else if (fmt == BOOT_FMT_LZ4 || fmt == BOOT_FMT_LZ4_LEGACY || fmt == BOOT_FMT_LZ4_LG) {
+			copy_file(abs_new_rd, "ramdisk.cpio.lz4", FILEUTILS_FORCE);
+		} else if (fmt == BOOT_FMT_BZIP2) {
+			copy_file(abs_new_rd, "ramdisk.cpio.bz2", FILEUTILS_FORCE);
+		} else if (fmt == BOOT_FMT_ZSTD) {
+			copy_file(abs_new_rd, "ramdisk.cpio.zst", FILEUTILS_FORCE);
+		} else {
+			copy_file(abs_new_rd, "ramdisk.cpio", FILEUTILS_FORCE);
+		}
+	}
+
+	printf("[*] Repacking boot image with updated ramdisk...\n");
+	snprintf(repacked_img, sizeof(repacked_img), "%s/new-boot.img", tmp_work_dir);
+	if (magiskboot_repack(abs_boot_img, repacked_img, skip_comp) != 0) {
+		bb_error_msg("failed to repack boot image");
+		ret = 1;
+		goto cleanup;
+	}
+
+	if (install) {
+		printf("[*] Flashing updated boot image directly to %s...\n", abs_boot_img);
+		if (flash_partition_image(repacked_img, abs_boot_img, FLASH_OPT_VERIFY_READ) != 0) {
+			bb_error_msg("failed to flash updated boot image to %s", abs_boot_img);
+			ret = 1;
+			goto cleanup;
+		}
+		printf("[✓] SUCCESS: Flashed updated boot image to %s\n", abs_boot_img);
+	} else {
+		const char *dest = out_img ? out_img : "new-boot.img";
+		chdir(old_cwd);
+		if (copy_file(repacked_img, dest, FILEUTILS_FORCE) != 0) {
+			bb_perror_msg("failed to write output image '%s'", dest);
+			ret = 1;
+			goto cleanup;
+		}
+		printf("[✓] SUCCESS: Updated boot image saved to %s\n", dest);
+	}
+
+cleanup:
+	chdir(old_cwd);
+	remove_file(tmp_work_dir, FILEUTILS_RECUR | FILEUTILS_FORCE);
+	return ret;
+}
+
 /* =========================================================================
  * 12. Android OTA Payload (payload.bin / CrAU) Engine
  * ========================================================================= */
@@ -4656,6 +5617,164 @@ static int payload_info(const char *payload_path) {
 }
 
 /* =========================================================================
+ * Universal Image & Component Inspector
+ * ========================================================================= */
+
+static int magiskboot_info_image(const char *path) {
+	boot_img_t boot;
+	int fd;
+	struct stat st;
+	off_t sz;
+	void *map;
+	uint8_t fmt;
+
+	if (!path) return 1;
+
+	/* 1. Try parsing as an Android boot / vendor boot image */
+	if (boot_img_parse_full(&boot, path, true)) {
+		boot_img_print_info(&boot, path);
+		boot_img_free(&boot);
+		return 0;
+	}
+
+	/* 2. Standalone image/component analysis */
+	fd = open_or_warn(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return 1;
+
+	if (fstat(fd, &st) < 0) {
+		close(fd);
+		return 1;
+	}
+
+	sz = get_file_or_bdev_size(fd, &st);
+	if (sz < 4) {
+		close(fd);
+		bb_error_msg("file '%s' is too small (%lld bytes)", path, (long long)sz);
+		return 1;
+	}
+
+	map = map_or_read_image(fd, (size_t)sz, false);
+	close(fd);
+	if (!map || map == MAP_FAILED) return 1;
+
+	fmt = boot_check_fmt(map, (size_t)sz);
+
+	printf("====================================================================\n");
+	printf("Image File:           %s\n", path);
+	printf("Total Size:           %lld bytes (%.2f MB)\n", (long long)sz, (double)sz / (1024 * 1024));
+	printf("Detected Format:      %s\n", boot_fmt2name(fmt));
+	printf("--------------------------------------------------------------------\n");
+
+	switch (fmt) {
+	case BOOT_FMT_ARM64_IMAGE: {
+		char banner[256];
+		printf("Type:                 ARM64 (AArch64) Linux Kernel Image\n");
+		inspect_arm64_image(map, (size_t)sz, "");
+		if (scan_linux_version_banner(map, (size_t)sz, banner, sizeof(banner))) {
+			printf("Linux Banner:         %s\n", banner);
+		}
+		break;
+	}
+
+	case BOOT_FMT_ZIMAGE: {
+		char banner[256];
+		printf("Type:                 ARM 32-bit zImage Kernel\n");
+		inspect_arm32_zimage(map, (size_t)sz, "");
+		if (scan_linux_version_banner(map, (size_t)sz, banner, sizeof(banner))) {
+			printf("Linux Banner:         %s\n", banner);
+		}
+		break;
+	}
+
+	case BOOT_FMT_DTB:
+		printf("Type:                 Flattened Device Tree Blob (DTB)\n");
+		inspect_fdt_details(map, (size_t)sz, "");
+		break;
+
+	case BOOT_FMT_DTBO:
+		printf("Type:                 Device Tree Overlay Table (DTBO)\n");
+		inspect_dtbo_details(map, (size_t)sz, "");
+		break;
+
+	case BOOT_FMT_CPIO:
+		printf("Type:                 CPIO Archive (Ramdisk)\n");
+		inspect_cpio_buffer(map, (size_t)sz, "");
+		break;
+
+	case BOOT_FMT_SPARSE: {
+		const struct sparse_header *sph = (const struct sparse_header *)map;
+		uint64_t unsparse_sz = (uint64_t)sph->total_blks * sph->blk_sz;
+		printf("Type:                 Android Sparse Image\n");
+		printf("Sparse Version:       %u.%u\n", sph->major_version, sph->minor_version);
+		printf("Block Size:           %u bytes\n", sph->blk_sz);
+		printf("Total Blocks:         %u\n", sph->total_blks);
+		printf("Unsparse Raw Size:    %llu bytes (%.2f MB)\n", (unsigned long long)unsparse_sz, (double)unsparse_sz / (1024 * 1024));
+		printf("Total Chunks:         %u\n", sph->total_chunks);
+		if (sph->image_checksum) printf("Checksum:             0x%08x\n", sph->image_checksum);
+		break;
+	}
+
+	case BOOT_FMT_EROFS:
+		printf("Type:                 EROFS (Enhanced Read-Only File System)\n");
+		break;
+
+	case BOOT_FMT_F2FS:
+		printf("Type:                 F2FS (Flash-Friendly File System)\n");
+		break;
+
+	case BOOT_FMT_EXT4:
+		printf("Type:                 EXT4 File System\n");
+		break;
+
+	case BOOT_FMT_VBMETA: {
+		const struct avb_vbmeta_image_header *vbh = (const struct avb_vbmeta_image_header *)map;
+		printf("Type:                 AVB 2.0 VBMeta Image\n");
+		printf("AVB Version:          %u.%u\n", vbh->required_libavb_version_major, vbh->required_libavb_version_minor);
+		printf("Rollback Index:       %llu\n", (unsigned long long)vbh->rollback_index);
+		printf("Release String:       %s\n", vbh->release_string);
+		printf("Flags:                0x%08x\n", vbh->flags);
+		break;
+	}
+
+	case BOOT_FMT_PAYLOAD:
+		printf("Type:                 Android OTA Update Payload (payload.bin)\n");
+		payload_info(path);
+		break;
+
+	case BOOT_FMT_GZIP:
+	case BOOT_FMT_XZ:
+	case BOOT_FMT_LZMA:
+	case BOOT_FMT_BZIP2:
+	case BOOT_FMT_LZ4:
+	case BOOT_FMT_LZ4_LEGACY:
+	case BOOT_FMT_LZ4_LG:
+	case BOOT_FMT_LZOP:
+	case BOOT_FMT_ZSTD: {
+		char banner[256];
+		printf("Type:                 Compressed Archive / Stream (%s)\n", boot_fmt2name(fmt));
+		inspect_ramdisk_details(map, (size_t)sz, fmt, "");
+		if (extract_kernel_banner(map, (size_t)sz, fmt, banner, sizeof(banner))) {
+			printf("Linux Kernel Banner:  %s\n", banner);
+		}
+		break;
+	}
+
+	default: {
+		char banner[256];
+		printf("Type:                 Raw / Unrecognized Binary Image\n");
+		if (scan_linux_version_banner(map, (size_t)sz, banner, sizeof(banner))) {
+			printf("Linux Kernel Banner:  %s\n", banner);
+		}
+		break;
+	}
+	}
+
+	printf("====================================================================\n");
+	munmap(map, (size_t)sz);
+	return 0;
+}
+
+/* =========================================================================
  * 6. BusyBox Applet Entrypoint
  * ========================================================================= */
 
@@ -4689,6 +5808,9 @@ int aimg_main(int argc, char **argv) {
 		"-c\0"
 		"--cleanup\0"
 		"cleanup\0"
+		"-i\0"
+		"--info\0"
+		"info\0"
 
 		/* Kernel Module Toolkit */
 		"--mod-info\0"
@@ -4731,6 +5853,16 @@ int aimg_main(int argc, char **argv) {
 		"get-recovery\0"
 		"--recovery\0"
 		"recovery\0"
+		"--set-ramdisk\0"
+		"set-ramdisk\0"
+		"--replace-ramdisk\0"
+		"replace-ramdisk\0"
+		"--extract-ramdisk\0"
+		"extract-ramdisk\0"
+		"--get-ramdisk\0"
+		"get-ramdisk\0"
+		"--ramdisk\0"
+		"ramdisk\0"
 
 		/* Packaging */
 		"--dist\0"
@@ -4775,6 +5907,9 @@ int aimg_main(int argc, char **argv) {
 		CMD_c,
 		CMD_cleanup,
 		CMD_cleanup_no_dash,
+		CMD_i,
+		CMD_info,
+		CMD_info_no_dash,
 
 		CMD_mod_info,
 		CMD_mod_info_no_dash,
@@ -4815,6 +5950,16 @@ int aimg_main(int argc, char **argv) {
 		CMD_get_recovery_no_dash,
 		CMD_recovery,
 		CMD_recovery_no_dash,
+		CMD_set_ramdisk,
+		CMD_set_ramdisk_no_dash,
+		CMD_replace_ramdisk,
+		CMD_replace_ramdisk_no_dash,
+		CMD_extract_ramdisk,
+		CMD_extract_ramdisk_no_dash,
+		CMD_get_ramdisk,
+		CMD_get_ramdisk_no_dash,
+		CMD_ramdisk,
+		CMD_ramdisk_no_dash,
 
 		CMD_dist,
 		CMD_dist_no_dash,
@@ -4956,6 +6101,12 @@ int aimg_main(int argc, char **argv) {
 	case CMD_cleanup:
 	case CMD_cleanup_no_dash:
 		return magiskboot_cleanup();
+
+	case CMD_i:
+	case CMD_info:
+	case CMD_info_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_info_image(argv[2]);
 
 	case CMD_mod_info:
 	case CMD_mod_info_no_dash:
@@ -5102,6 +6253,31 @@ int aimg_main(int argc, char **argv) {
 		if (argc < 3 && !strstr(cmd, "live")) bb_show_usage();
 		return magiskboot_set_recovery_op(argc, argv);
 
+	case CMD_set_ramdisk:
+	case CMD_set_ramdisk_no_dash:
+	case CMD_replace_ramdisk:
+	case CMD_replace_ramdisk_no_dash:
+		if (argc < 3 && !strstr(cmd, "live")) bb_show_usage();
+		return magiskboot_set_ramdisk_op(argc, argv);
+
+	case CMD_extract_ramdisk:
+	case CMD_extract_ramdisk_no_dash:
+	case CMD_get_ramdisk:
+	case CMD_get_ramdisk_no_dash:
+		if (argc < 3 && !strstr(cmd, "live")) bb_show_usage();
+		return magiskboot_extract_ramdisk_op(argc, argv);
+
+	case CMD_ramdisk:
+	case CMD_ramdisk_no_dash:
+		if (argc >= 3 && (strcmp(argv[2], "extract") == 0 || strcmp(argv[2], "dump") == 0 || strcmp(argv[2], "get") == 0)) {
+			return magiskboot_extract_ramdisk_op(argc - 1, argv + 1);
+		}
+		if (argc >= 3 && (strcmp(argv[2], "set") == 0 || strcmp(argv[2], "replace") == 0 || strcmp(argv[2], "inject") == 0)) {
+			return magiskboot_set_ramdisk_op(argc - 1, argv + 1);
+		}
+		if (argc < 3 && !strstr(cmd, "live")) bb_show_usage();
+		return magiskboot_set_ramdisk_op(argc, argv);
+
 	case CMD_dist:
 	case CMD_dist_no_dash:
 		if (argc < 3) bb_show_usage();
@@ -5131,8 +6307,14 @@ int aimg_main(int argc, char **argv) {
 	case CMD_h:
 	case CMD_help:
 	case CMD_help_no_dash:
+		if (subcmd == CMD_h && argc >= 3 && argv[2][0] != '-') {
+			return magiskboot_info_image(argv[2]);
+		}
+		bb_show_usage();
+		return 1;
 	default:
 		bb_show_usage();
 		return 1;
 	}
+	return 1;
 }

@@ -60,6 +60,11 @@
 #define AVB_FOOTER_MAGIC        "AVBf"
 #define AVB_MAGIC               "AVB0"
 
+#define SPARSE_HEADER_MAGIC     0xed26ff3aU
+#define DT_TABLE_MAGIC          0x1eabb7d7U
+#define FDT_MAGIC               0xd00dfeedU
+#define ZSTD_MAGIC              0xfd2fb528U
+
 #define MTK_HEADER_SIZE         512
 #define DHTB_HEADER_SIZE        512
 #define BLOB_HEADER_SIZE        512
@@ -83,10 +88,65 @@ typedef enum {
     BOOT_FMT_LZ4_LEGACY,
     BOOT_FMT_LZ4_LG,
     BOOT_FMT_LZOP,
+    BOOT_FMT_ZSTD,
     BOOT_FMT_DTB,
+    BOOT_FMT_DTBO,
     BOOT_FMT_ZIMAGE,
+    BOOT_FMT_ARM64_IMAGE,
     BOOT_FMT_MTK,
+    BOOT_FMT_CPIO,
+    BOOT_FMT_SPARSE,
+    BOOT_FMT_EROFS,
+    BOOT_FMT_F2FS,
+    BOOT_FMT_EXT4,
+    BOOT_FMT_VBMETA,
+    BOOT_FMT_PAYLOAD,
 } boot_format_t;
+
+/*
+ * Android Sparse Image Header
+ */
+struct sparse_header {
+    uint32_t magic;          /* 0xed26ff3a */
+    uint16_t major_version;  /* 0x1 */
+    uint16_t minor_version;  /* 0x0 */
+    uint16_t file_hdr_sz;    /* 28 bytes */
+    uint16_t chunk_hdr_sz;   /* 12 bytes */
+    uint32_t blk_sz;         /* typically 4096 */
+    uint32_t total_blks;     /* total blocks in non-sparse image */
+    uint32_t total_chunks;   /* total chunks in sparse image */
+    uint32_t image_checksum; /* CRC32 or 0 */
+} __attribute__((packed));
+
+/*
+ * Device Tree Blob Overlay Table Header (dtbo.img)
+ */
+struct dt_table_header {
+    uint32_t magic;             /* 0x1eabb7d7 */
+    uint32_t total_size;
+    uint32_t header_size;
+    uint32_t dt_entry_size;
+    uint32_t dt_entry_count;
+    uint32_t dt_entries_offset;
+    uint32_t page_size;
+    uint32_t version;
+} __attribute__((packed));
+
+/*
+ * Flattened Device Tree (FDT / DTB) Header
+ */
+struct fdt_header {
+    uint32_t magic;             /* 0xd00dfeed (big endian) */
+    uint32_t totalsize;
+    uint32_t off_dt_struct;
+    uint32_t off_dt_strings;
+    uint32_t off_mem_rsvmap;
+    uint32_t version;
+    uint32_t last_comp_version;
+    uint32_t boot_cpuid_phys;
+    uint32_t size_dt_strings;
+    uint32_t size_dt_struct;
+} __attribute__((packed));
 
 /*
  * Bitflags representing OEM loaders and boot image payload characteristics
