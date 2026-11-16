@@ -179,6 +179,10 @@ ifeq ($(CONFIG_PAM),y)
 LDLIBS += pam pam_misc
 endif
 
+ifeq ($(CONFIG_ADB),y)
+LDLIBS += ssl crypto z
+endif
+
 ifeq ($(CONFIG_SELINUX),y)
 SELINUX_PC_MODULES = libselinux libsepol
 $(eval $(call pkg_check_modules,SELINUX,$(SELINUX_PC_MODULES)))
