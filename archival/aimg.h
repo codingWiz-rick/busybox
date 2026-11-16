@@ -669,6 +669,22 @@ struct dist_package_options {
 	bool patch_vbmeta;
 	size_t num_modules;
 	char **modules;
+
+	/* Magisk / KernelSU / APatch Module Options */
+	bool is_magisk;
+	const char *mod_id;
+	const char *mod_name;
+	const char *mod_version;
+	int mod_version_code;
+	const char *mod_author;
+	const char *mod_description;
+	const char *mod_prop_file;
+	const char *service_script;
+	const char *post_fs_data_script;
+	const char *customize_script;
+	const char *sepolicy_rule_file;
+	const char *action_script;
+	const char *system_dir;
 };
 
 #endif /* AIMG_H */

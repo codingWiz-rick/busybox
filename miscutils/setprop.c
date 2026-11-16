@@ -27,14 +27,9 @@
 //usage:       "Set an Android system property.\n"
 
 #include "libbb.h"
+#include "bb_android.h"
 #include <sys/socket.h>
 #include <sys/un.h>
-
-#define PROP_SERVICE_SOCKET "/dev/socket/property_service"
-#define PROP_MSG_SETPROP    1
-#define PROP_MSG_SETPROP2   0x00020001
-
-#define PROP_SUCCESS        0
 
 static int send_all(int sock, const void *buf, size_t len)
 {
@@ -113,10 +108,10 @@ int setprop_main(int argc, char **argv)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	safe_strncpy(addr.sun_path, PROP_SERVICE_SOCKET, sizeof(addr.sun_path));
+	safe_strncpy(addr.sun_path, ANDROID_PROP_SERVICE_SOCKET, sizeof(addr.sun_path));
 
 	if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-		bb_perror_msg("failed to connect to %s", PROP_SERVICE_SOCKET);
+		bb_perror_msg("failed to connect to %s", ANDROID_PROP_SERVICE_SOCKET);
 		close(sock);
 		return EXIT_FAILURE;
 	}
@@ -132,18 +127,8 @@ int setprop_main(int argc, char **argv)
 		if (read_all(sock, &result, sizeof(result)) == 0) {
 			close(sock);
 			if (result != PROP_SUCCESS) {
-				const char *err_str;
-				switch (result) {
-				case 11: err_str = "read-only property"; break;
-				case 16: err_str = "invalid property name"; break;
-				case 20: err_str = "invalid property value"; break;
-				case 24: err_str = "permission denied (requires root/privilege)"; break;
-				case 32: err_str = "control message failed"; break;
-				case 36: err_str = "internal set failure"; break;
-				default: err_str = "error"; break;
-				}
 				bb_error_msg("failed to set property '%s' to '%s' (%s, status %u)",
-				             name, value, err_str, result);
+				             name, value, android_prop_strerror(result), result);
 				return EXIT_FAILURE;
 			}
 			return EXIT_SUCCESS;

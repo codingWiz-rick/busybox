@@ -725,7 +725,226 @@ static char *generate_universal_update_binary(const char *banner, const char *de
 	return script;
 }
 
-static int package_dist_zip(struct dist_package_options *opts) {
+static char *generate_magisk_module_prop(const struct dist_package_options *opts) {
+	const char *id = (opts->mod_id && opts->mod_id[0]) ? opts->mod_id : "kroot_module";
+	const char *name = (opts->mod_name && opts->mod_name[0]) ? opts->mod_name : "Kroot Module";
+	const char *version = (opts->mod_version && opts->mod_version[0]) ? opts->mod_version : "v1.0.0";
+	int vcode = (opts->mod_version_code > 0) ? opts->mod_version_code : 10000;
+	const char *author = (opts->mod_author && opts->mod_author[0]) ? opts->mod_author : "Root Developer";
+	const char *desc = (opts->mod_description && opts->mod_description[0]) ? opts->mod_description : "Universal Kernel & Root Module Package";
+
+	return xasprintf(
+		"id=%s\n"
+		"name=%s\n"
+		"version=%s\n"
+		"versionCode=%d\n"
+		"author=%s\n"
+		"description=%s\n",
+		id, name, version, vcode, author, desc
+	);
+}
+
+static char *generate_magisk_update_binary(const struct dist_package_options *opts) {
+	char dev_block[1024];
+	char ver_block[1024];
+	char level_block[1024];
+	const char *banner_text;
+	const char *default_id;
+
+	dev_block[0] = '\0';
+	if (opts->device_check && opts->device_check[0]) {
+		snprintf(dev_block, sizeof(dev_block),
+			"\n# Target Device Guardrail Check\n"
+			"CURRENT_DEV=$(getprop ro.product.device 2>/dev/null)\n"
+			"[ -z \"$CURRENT_DEV\" ] && CURRENT_DEV=$(getprop ro.build.product 2>/dev/null)\n"
+			"[ -z \"$CURRENT_DEV\" ] && CURRENT_DEV=$(getprop ro.product.model 2>/dev/null)\n"
+			"ui_print \"- Target device detected: $CURRENT_DEV\"\n"
+			"DEV_MATCH=0\n"
+			"for d in $(echo \"%s\" | tr ',' ' '); do\n"
+			"  if [ \"$CURRENT_DEV\" = \"$d\" ]; then DEV_MATCH=1; break; fi\n"
+			"done\n"
+			"if [ $DEV_MATCH -eq 0 ]; then\n"
+			"  ui_print \"! Error: Unsupported device '$CURRENT_DEV'!\"\n"
+			"  exit 1\n"
+			"fi\n",
+			opts->device_check);
+	}
+
+	ver_block[0] = '\0';
+	if (opts->supported_versions && opts->supported_versions[0]) {
+		snprintf(ver_block, sizeof(ver_block),
+			"\n# Android OS Version Compatibility Gate\n"
+			"CURRENT_VER=$(getprop ro.build.version.release 2>/dev/null)\n"
+			"[ -z \"$CURRENT_VER\" ] && CURRENT_VER=$(getprop ro.build.version.sdk 2>/dev/null)\n"
+			"ui_print \"- Android version detected: $CURRENT_VER\"\n"
+			"VER_MATCH=0\n"
+			"for v in $(echo \"%s\" | tr ',' ' '); do\n"
+			"  if [ \"$CURRENT_VER\" = \"$v\" ]; then VER_MATCH=1; break; fi\n"
+			"done\n"
+			"if [ $VER_MATCH -eq 0 ]; then\n"
+			"  ui_print \"! Error: Unsupported Android version '$CURRENT_VER'! (Supported: %s)\"\n"
+			"  exit 1\n"
+			"fi\n",
+			opts->supported_versions, opts->supported_versions);
+	}
+
+	level_block[0] = '\0';
+	if (opts->supported_patchlevels && opts->supported_patchlevels[0]) {
+		snprintf(level_block, sizeof(level_block),
+			"\n# Security Patch Level Gate\n"
+			"CURRENT_LEVEL=$(getprop ro.build.version.security_patch 2>/dev/null)\n"
+			"ui_print \"- Security patch level detected: $CURRENT_LEVEL\"\n"
+			"if [ \"$CURRENT_LEVEL\" \\< \"%s\" ]; then\n"
+			"  ui_print \"! Error: Patch level $CURRENT_LEVEL older than required %s!\"\n"
+			"  exit 1\n"
+			"fi\n",
+			opts->supported_patchlevels, opts->supported_patchlevels);
+	}
+
+	banner_text = (opts->banner && opts->banner[0]) ? opts->banner :
+		((opts->mod_name && opts->mod_name[0]) ? opts->mod_name : "Magisk / KernelSU / APatch Universal Module Installer");
+	default_id = (opts->mod_id && opts->mod_id[0]) ? opts->mod_id : "kroot_module";
+
+	return xasprintf(
+		"#!/bin/sh\n"
+		"# Universal Magisk / KernelSU / APatch / Recovery Module Installer\n"
+		"[ -z \"$BASH_VERSION\" ] && [ ! -x /bin/sh ] && [ -x /system/bin/sh ] && exec /system/bin/sh \"$0\" \"$@\"\n\n"
+		"umask 022\n\n"
+		"OUTFD=$2\n"
+		"ZIPFILE=$3\n"
+		"if [ -z \"$ZIPFILE\" ] || [ ! -f \"$ZIPFILE\" ]; then\n"
+		"  if [ -f \"$1\" ]; then\n"
+		"    ZIPFILE=\"$1\"\n"
+		"    OUTFD=1\n"
+		"  elif [ -f \"$3\" ]; then\n"
+		"    ZIPFILE=\"$3\"\n"
+		"  fi\n"
+		"fi\n\n"
+		"ui_print() {\n"
+		"  if [ -n \"$OUTFD\" ] && [ \"$OUTFD\" != \"1\" ] && [ -e \"/proc/self/fd/$OUTFD\" ]; then\n"
+		"    echo \"ui_print $1\" > \"/proc/self/fd/$OUTFD\"\n"
+		"    echo \"ui_print\" > \"/proc/self/fd/$OUTFD\"\n"
+		"  else\n"
+		"    echo \"$1\"\n"
+		"  fi\n"
+		"}\n\n"
+		"ui_print \"********************************************************\"\n"
+		"ui_print \"* %s\"\n"
+		"ui_print \"********************************************************\"\n"
+		"%s%s%s\n"
+		"BOOTMODE=false\n"
+		"if [ -d /data/adb ] && [ \"$(getprop sys.boot_completed 2>/dev/null)\" = \"1\" ]; then\n"
+		"  BOOTMODE=true\n"
+		"elif [ -d /data/adb ] && [ -n \"$KSU\" -o -n \"$APATCH\" -o -n \"$MAGISK_VER\" ]; then\n"
+		"  BOOTMODE=true\n"
+		"fi\n\n"
+		"if [ \"$BOOTMODE\" = \"false\" ]; then\n"
+		"  if ! mountpoint -q /data 2>/dev/null; then\n"
+		"    mount /data 2>/dev/null\n"
+		"    if ! mountpoint -q /data 2>/dev/null; then\n"
+		"      mount /dev/block/by-name/userdata /data 2>/dev/null\n"
+		"    fi\n"
+		"  fi\n"
+		"fi\n\n"
+		"if [ ! -d /data ]; then\n"
+		"  ui_print \"! Error: /data is not mounted or not accessible\"\n"
+		"  exit 1\n"
+		"fi\n\n"
+		"ROOT_IMPL=\"Standard\"\n"
+		"if [ -d /data/adb/ksu ] || [ -f /system/bin/ksud ] || [ -n \"$KSU\" ]; then\n"
+		"  ROOT_IMPL=\"KernelSU\"\n"
+		"elif [ -d /data/adb/ap ] || [ -f /system/bin/apd ] || [ -n \"$APATCH\" ]; then\n"
+		"  ROOT_IMPL=\"APatch\"\n"
+		"elif [ -d /data/adb/magisk ] || [ -n \"$MAGISK_VER\" ]; then\n"
+		"  ROOT_IMPL=\"Magisk\"\n"
+		"fi\n"
+		"ui_print \"- Detected Root Environment: $ROOT_IMPL (bootmode: $BOOTMODE)\"\n\n"
+		"TMPDIR=\"/data/local/tmp/mod_install_$$\"\n"
+		"mkdir -p \"$TMPDIR\" 2>/dev/null || TMPDIR=\"/tmp/mod_install_$$\"\n"
+		"mkdir -p \"$TMPDIR\"\n\n"
+		"unzip -o -q \"$ZIPFILE\" \"module.prop\" -d \"$TMPDIR\" 2>/dev/null\n"
+		"MODID=\"\"\n"
+		"if [ -f \"$TMPDIR/module.prop\" ]; then\n"
+		"  MODID=$(grep -E '^id=' \"$TMPDIR/module.prop\" 2>/dev/null | head -n1 | cut -d= -f2 | tr -d '\\r\\n ')\n"
+		"fi\n"
+		"if [ -z \"$MODID\" ]; then\n"
+		"  MODID=\"%s\"\n"
+		"fi\n\n"
+		"MODPATH=\"/data/adb/modules/$MODID\"\n"
+		"ui_print \"- Installing module '$MODID' to: $MODPATH\"\n\n"
+		"mkdir -p /data/adb/modules\n"
+		"rm -rf \"$MODPATH\"\n"
+		"mkdir -p \"$MODPATH\"\n\n"
+		"unzip -o -q \"$ZIPFILE\" -d \"$MODPATH\"\n"
+		"RET=$?\n"
+		"if [ $RET -ne 0 ]; then\n"
+		"  ui_print \"! Failed to extract module archive\"\n"
+		"  rm -rf \"$TMPDIR\"\n"
+		"  exit 1\n"
+		"fi\n\n"
+		"rm -rf \"$MODPATH/META-INF\"\n\n"
+		"if [ -f \"$MODPATH/customize.sh\" ]; then\n"
+		"  ui_print \"- Executing customize.sh...\"\n"
+		"  (\n"
+		"    export MODPATH\n"
+		"    export BOOTMODE\n"
+		"    export TMPDIR\n"
+		"    export ZIPFILE\n"
+		"    export ARCH=$(getprop ro.product.cpu.abi 2>/dev/null)\n"
+		"    export API=$(getprop ro.build.version.sdk 2>/dev/null)\n"
+		"    . \"$MODPATH/customize.sh\"\n"
+		"  )\n"
+		"  RET=$?\n"
+		"  rm -f \"$MODPATH/customize.sh\"\n"
+		"  if [ $RET -ne 0 ]; then\n"
+		"    ui_print \"! customize.sh failed with exit code $RET\"\n"
+		"    rm -rf \"$MODPATH\"\n"
+		"    rm -rf \"$TMPDIR\"\n"
+		"    exit $RET\n"
+		"  fi\n"
+		"fi\n\n"
+		"chmod 755 \"$MODPATH\"\n"
+		"[ -f \"$MODPATH/module.prop\" ] && chmod 644 \"$MODPATH/module.prop\"\n"
+		"[ -f \"$MODPATH/service.sh\" ] && chmod 755 \"$MODPATH/service.sh\"\n"
+		"[ -f \"$MODPATH/post-fs-data.sh\" ] && chmod 755 \"$MODPATH/post-fs-data.sh\"\n"
+		"[ -f \"$MODPATH/action.sh\" ] && chmod 755 \"$MODPATH/action.sh\"\n"
+		"[ -f \"$MODPATH/sepolicy.rule\" ] && chmod 644 \"$MODPATH/sepolicy.rule\"\n"
+		"[ -f \"$MODPATH/auto_mount\" ] && chmod 644 \"$MODPATH/auto_mount\"\n\n"
+		"if [ -d \"$MODPATH/system\" ]; then\n"
+		"  find \"$MODPATH/system\" -type d -exec chmod 755 {} + 2>/dev/null\n"
+		"  find \"$MODPATH/system\" -type f -exec chmod 644 {} + 2>/dev/null\n"
+		"  [ -d \"$MODPATH/system/bin\" ] && chmod 755 \"$MODPATH/system/bin\"/* 2>/dev/null\n"
+		"  [ -d \"$MODPATH/system/xbin\" ] && chmod 755 \"$MODPATH/system/xbin\"/* 2>/dev/null\n"
+		"fi\n\n"
+		"if [ -d \"$MODPATH/app\" ]; then\n"
+		"  for apk in \"$MODPATH/app\"/*.apk; do\n"
+		"    if [ -f \"$apk\" ]; then\n"
+		"      if [ \"$BOOTMODE\" = \"true\" ] && which pm >/dev/null 2>&1; then\n"
+		"        ui_print \"- Installing manager APK: $(basename \"$apk\")...\"\n"
+		"        pm install -g -r \"$apk\" >/dev/null 2>&1\n"
+		"      else\n"
+		"        mkdir -p /data/system/kroot 2>/dev/null\n"
+		"        cp -f \"$apk\" /data/system/kroot/ 2>/dev/null\n"
+		"        chmod 644 /data/system/kroot/* 2>/dev/null\n"
+		"        ui_print \"- Staged manager APK to /data/system/kroot\"\n"
+		"      fi\n"
+		"    fi\n"
+		"  done\n"
+		"fi\n\n"
+		"rm -rf \"$TMPDIR\"\n"
+		"ui_print \"********************************************************\"\n"
+		"ui_print \"* Module installation complete! Reboot to activate.     *\"\n"
+		"ui_print \"********************************************************\"\n"
+		"exit 0\n",
+		banner_text,
+		dev_block,
+		ver_block,
+		level_block,
+		default_id
+	);
+}
+
+static int package_anykernel_dist_zip(struct dist_package_options *opts) {
 	struct zip_writer zw;
 	char *update_bin_script;
 	char *mb_bin;
@@ -874,6 +1093,164 @@ static int package_dist_zip(struct dist_package_options *opts) {
 	return 0;
 }
 
+static int package_magisk_zip(struct dist_package_options *opts) {
+	struct zip_writer zw;
+	char *prop_content = NULL;
+	char *update_bin_script = NULL;
+	char *default_service = NULL;
+	struct stat st;
+	size_t i;
+
+	if (!opts || !opts->out_zip) {
+		bb_error_msg("missing output zip file");
+		return 1;
+	}
+
+	fprintf(stderr, "======================================================================\n");
+	fprintf(stderr, "  Packaging Magisk / KernelSU / APatch Module ZIP: %s\n", opts->out_zip);
+	fprintf(stderr, "======================================================================\n");
+
+	if (!zip_writer_init(&zw, opts->out_zip)) {
+		return 1;
+	}
+
+	/* 1. META-INF/com/google/android/updater-script (#MAGISK) */
+	zip_writer_add_mem(&zw, "META-INF/com/google/android/updater-script", "#MAGISK\n", 8, S_IFREG | 0644);
+
+	/* 2. META-INF/com/google/android/update-binary */
+	if (opts->update_binary_script && access(opts->update_binary_script, R_OK) == 0) {
+		zip_writer_add_file(&zw, "META-INF/com/google/android/update-binary", opts->update_binary_script, S_IFREG | 0755);
+		fprintf(stderr, "[+] Bundled custom update-binary from '%s'\n", opts->update_binary_script);
+	} else {
+		update_bin_script = generate_magisk_update_binary(opts);
+		zip_writer_add_mem(&zw, "META-INF/com/google/android/update-binary", update_bin_script, strlen(update_bin_script), S_IFREG | 0755);
+		free(update_bin_script);
+		fprintf(stderr, "[+] Bundled universal Magisk/KernelSU/APatch update-binary\n");
+	}
+
+	/* 3. module.prop */
+	if (opts->mod_prop_file && access(opts->mod_prop_file, R_OK) == 0) {
+		zip_writer_add_file(&zw, "module.prop", opts->mod_prop_file, S_IFREG | 0644);
+		fprintf(stderr, "[+] Bundled module.prop: '%s'\n", opts->mod_prop_file);
+	} else {
+		prop_content = generate_magisk_module_prop(opts);
+		zip_writer_add_mem(&zw, "module.prop", prop_content, strlen(prop_content), S_IFREG | 0644);
+		free(prop_content);
+		fprintf(stderr, "[+] Generated and bundled module.prop (id=%s)\n", opts->mod_id ? opts->mod_id : "kroot_module");
+	}
+
+	/* 4. service.sh */
+	if (opts->service_script && access(opts->service_script, R_OK) == 0) {
+		zip_writer_add_file(&zw, "service.sh", opts->service_script, S_IFREG | 0755);
+		fprintf(stderr, "[+] Bundled service.sh: '%s'\n", opts->service_script);
+	} else if (opts->num_modules > 0 && !opts->post_fs_data_script) {
+		default_service = xasprintf(
+			"#!/system/bin/sh\n"
+			"# Auto-generated module loader service\n"
+			"MODDIR=${0%%%%/*}\n"
+			"for ko in \"$MODDIR\"/*.ko \"$MODDIR\"/modules/*.ko; do\n"
+			"  if [ -f \"$ko\" ]; then\n"
+			"    insmod \"$ko\" 2>/dev/null\n"
+			"  fi\n"
+			"done\n"
+		);
+		zip_writer_add_mem(&zw, "service.sh", default_service, strlen(default_service), S_IFREG | 0755);
+		free(default_service);
+		fprintf(stderr, "[+] Auto-generated service.sh module loader\n");
+	}
+
+	/* 5. post-fs-data.sh */
+	if (opts->post_fs_data_script && access(opts->post_fs_data_script, R_OK) == 0) {
+		zip_writer_add_file(&zw, "post-fs-data.sh", opts->post_fs_data_script, S_IFREG | 0755);
+		fprintf(stderr, "[+] Bundled post-fs-data.sh: '%s'\n", opts->post_fs_data_script);
+	}
+
+	/* 6. customize.sh */
+	if (opts->customize_script && access(opts->customize_script, R_OK) == 0) {
+		zip_writer_add_file(&zw, "customize.sh", opts->customize_script, S_IFREG | 0755);
+		fprintf(stderr, "[+] Bundled customize.sh: '%s'\n", opts->customize_script);
+	}
+
+	/* 7. sepolicy.rule */
+	if (opts->sepolicy_rule_file && access(opts->sepolicy_rule_file, R_OK) == 0) {
+		zip_writer_add_file(&zw, "sepolicy.rule", opts->sepolicy_rule_file, S_IFREG | 0644);
+		fprintf(stderr, "[+] Bundled sepolicy.rule: '%s'\n", opts->sepolicy_rule_file);
+	}
+
+	/* 8. action.sh */
+	if (opts->action_script && access(opts->action_script, R_OK) == 0) {
+		zip_writer_add_file(&zw, "action.sh", opts->action_script, S_IFREG | 0755);
+		fprintf(stderr, "[+] Bundled action.sh: '%s'\n", opts->action_script);
+	}
+
+	/* 9. system/ tree */
+	if (opts->system_dir && stat(opts->system_dir, &st) == 0 && S_ISDIR(st.st_mode)) {
+		zip_writer_add_dir_recursive(&zw, "system", opts->system_dir);
+		fprintf(stderr, "[+] Bundled system/ overlay from '%s'\n", opts->system_dir);
+	}
+
+	/* 10. Manager APK */
+	if (opts->app_path && access(opts->app_path, R_OK) == 0) {
+		const char *bname = bb_basename(opts->app_path);
+		char *zip_app = concat_path_file("app", bname);
+		zip_writer_add_file(&zw, zip_app, opts->app_path, S_IFREG | 0644);
+		fprintf(stderr, "[+] Bundled manager APK: %s\n", zip_app);
+		free(zip_app);
+	}
+
+	/* 11. Kernel Modules */
+	if (opts->num_modules > 0) {
+		for (i = 0; i < opts->num_modules; i++) {
+			const char *mpath = opts->modules[i];
+			if (stat(mpath, &st) == 0) {
+				if (S_ISDIR(st.st_mode)) {
+					DIR *mdir = opendir(mpath);
+					if (mdir) {
+						struct dirent *de;
+						while ((de = readdir(mdir)) != NULL) {
+							if (strstr(de->d_name, ".ko")) {
+								char *full_ko = concat_path_file(mpath, de->d_name);
+								char *zip_ko = concat_path_file("modules", de->d_name);
+								zip_writer_add_file(&zw, de->d_name, full_ko, S_IFREG | 0644);
+								zip_writer_add_file(&zw, zip_ko, full_ko, S_IFREG | 0644);
+								fprintf(stderr, "[+] Bundled module: %s\n", de->d_name);
+								free(full_ko);
+								free(zip_ko);
+							}
+						}
+						closedir(mdir);
+					}
+				} else if (S_ISREG(st.st_mode)) {
+					const char *bname = bb_basename(mpath);
+					char *zip_ko = concat_path_file("modules", bname);
+					zip_writer_add_file(&zw, bname, mpath, S_IFREG | 0644);
+					zip_writer_add_file(&zw, zip_ko, mpath, S_IFREG | 0644);
+					fprintf(stderr, "[+] Bundled module: %s\n", bname);
+					free(zip_ko);
+				}
+			}
+		}
+	}
+
+	if (!zip_writer_finish(&zw)) {
+		bb_error_msg("failed to finalize zip archive");
+		return 1;
+	}
+
+	if (stat(opts->out_zip, &st) == 0) {
+		fprintf(stderr, "[✓] SUCCESS: Magisk / KernelSU / APatch module ZIP generated: '%s' (%zu bytes)\n",
+		        opts->out_zip, (size_t)st.st_size);
+	}
+	fprintf(stderr, "======================================================================\n");
+	return 0;
+}
+
+static int package_dist_zip(struct dist_package_options *opts) {
+	if (opts->is_magisk)
+		return package_magisk_zip(opts);
+	return package_anykernel_dist_zip(opts);
+}
+
 static int run_busybox_applet(const char *name, char **argv) {
 	int a = find_applet_by_name(name);
 	pid_t pid;
@@ -1006,30 +1383,87 @@ static int magiskboot_dist_op(int argc, char **argv) {
 			opts.target_init_boot = true;
 		} else if (strcmp(argv[i], "--update-binary") == 0) {
 			if (++i < argc) opts.update_binary_script = argv[i];
+		} else if (strcmp(argv[i], "--magisk") == 0 || strcmp(argv[i], "--ksu") == 0 || strcmp(argv[i], "--apatch") == 0) {
+			opts.is_magisk = true;
+		} else if (strcmp(argv[i], "--id") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.mod_id = argv[i];
+		} else if (strcmp(argv[i], "--name") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.mod_name = argv[i];
+		} else if (strcmp(argv[i], "--version") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.mod_version = argv[i];
+		} else if (strcmp(argv[i], "--version-code") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.mod_version_code = atoi(argv[i]);
+		} else if (strcmp(argv[i], "--author") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.mod_author = argv[i];
+		} else if (strcmp(argv[i], "--description") == 0 || strcmp(argv[i], "--desc") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.mod_description = argv[i];
+		} else if (strcmp(argv[i], "--prop") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.mod_prop_file = argv[i];
+		} else if (strcmp(argv[i], "--service") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.service_script = argv[i];
+		} else if (strcmp(argv[i], "--post-fs-data") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.post_fs_data_script = argv[i];
+		} else if (strcmp(argv[i], "--customize") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.customize_script = argv[i];
+		} else if (strcmp(argv[i], "--sepolicy") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.sepolicy_rule_file = argv[i];
+		} else if (strcmp(argv[i], "--action") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.action_script = argv[i];
+		} else if (strcmp(argv[i], "--system") == 0) {
+			opts.is_magisk = true;
+			if (++i < argc) opts.system_dir = argv[i];
 		} else if (argv[i][0] != '-') {
 			opts.out_zip = argv[i];
 		}
 	}
 
 	if (!opts.out_zip) {
-		bb_error_msg("usage: magiskboot dist [options...] <output.zip>\n"
-		             "  -m, --module <ko|dir>   Bundle kernel module(s)\n"
-		             "  -k, --kernel <image>    Bundle kernel image\n"
-		             "  -d, --dtb <dtb>         Bundle DTB image\n"
-		             "  --dtbo <dtbo>           Bundle DTBO image\n"
-		             "  -a, --app <apk>         Bundle Manager APK\n"
-		             "  -o, --overlay <dir>     Bundle overlay.d/ directory\n"
-		             "  --vendor-boot <image>   Bundle vendor_boot image\n"
-		             "  --vendor-dlkm <img|dir> Bundle vendor_dlkm payload\n"
-		             "  --system-dlkm <img|dir> Bundle system_dlkm payload\n"
-		             "  --vbmeta-patch          Neutralize AVB/dm-verity on top-level vbmeta\n"
-		             "  --magiskboot <bin>      Embed specific target magiskboot\n"
-		             "  --banner <text>         Custom recovery installer banner\n"
-		             "  --device <dev1,dev2>    Device check guardrails\n"
-		             "  --android-version <ver> Supported Android version(s)\n"
-		             "  --patch-level <date>    Supported security patch level\n"
-		             "  --init-boot             Target init_boot partition (GKI 2.0)\n"
-		             "  --update-binary <sh>    Custom update-binary script");
+		bb_error_msg("usage: aimg --dist [options...] <output.zip>\n"
+		             "  AnyKernel3 Options:\n"
+		             "    -k, --kernel <image>    Bundle kernel image\n"
+		             "    -d, --dtb <dtb>         Bundle DTB image\n"
+		             "    --dtbo <dtbo>           Bundle DTBO image\n"
+		             "    -m, --module <ko|dir>   Bundle kernel module(s)\n"
+		             "    -o, --overlay <dir>     Bundle overlay.d/ directory\n"
+		             "    -a, --app <apk>         Bundle Manager APK\n"
+		             "    --vendor-boot <image>   Bundle vendor_boot image\n"
+		             "    --vendor-dlkm <img|dir> Bundle vendor_dlkm payload\n"
+		             "    --system-dlkm <img|dir> Bundle system_dlkm payload\n"
+		             "    --vbmeta-patch          Neutralize AVB/dm-verity on top-level vbmeta\n"
+		             "    --init-boot             Target init_boot partition (GKI 2.0)\n"
+		             "  Magisk / KernelSU / APatch Module Options:\n"
+		             "    --magisk, --ksu, --apatch Package as root manager module ZIP\n"
+		             "    --id <mod_id>           Module ID (e.g. kroot)\n"
+		             "    --name <mod_name>       Module display name\n"
+		             "    --version <ver>         Module version string (e.g. v1.0.0)\n"
+		             "    --version-code <code>   Module integer version code (e.g. 100)\n"
+		             "    --author <name>         Module author\n"
+		             "    --description <desc>    Module description\n"
+		             "    --prop <file>           Use existing module.prop\n"
+		             "    --service <script.sh>   Late-start service.sh\n"
+		             "    --post-fs-data <sh>     Early boot post-fs-data.sh\n"
+		             "    --customize <script.sh> Custom installation customize.sh\n"
+		             "    --sepolicy <rule_file>  SELinux sepolicy.rule\n"
+		             "    --action <script.sh>    WebUI / Manager action.sh\n"
+		             "    --system <dir>          System overlay directory\n"
+		             "  Common Options:\n"
+		             "    --banner <text>         Custom installer banner\n"
+		             "    --device <dev1,dev2>    Device check guardrails\n"
+		             "    --android-version <ver> Supported Android version(s)\n"
+		             "    --patch-level <date>    Supported security patch level\n"
+		             "    --update-binary <sh>    Custom update-binary script");
 		free(opts.modules);
 		return 1;
 	}

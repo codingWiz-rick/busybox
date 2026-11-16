@@ -26,45 +26,9 @@
 //usage:     "\n	-Z	Show property SELinux security contexts instead of values"
 
 #include "libbb.h"
+#include "bb_android.h"
 #include <sys/mman.h>
 #include <dirent.h>
-
-#define PROP_AREA_HEADER_SIZE 128
-#define PROP_VALUE_MAX        92
-#define PROP_FLAG_LONG        (1U << 16)
-
-/* Android prop_trie_node / prop_bt structure in shared memory */
-struct prop_trie_node {
-	uint32_t namelen;
-	uint32_t prop;     /* offset relative to data_ (byte 128) to prop_info, or 0 */
-	uint32_t left;     /* offset relative to data_ to left sibling BST, or 0 */
-	uint32_t right;    /* offset relative to data_ to right sibling BST, or 0 */
-	uint32_t children; /* offset relative to data_ to children sub-trie, or 0 */
-	char name[0];      /* flexible array member */
-};
-
-/* Android prop_info structure in shared memory */
-struct prop_info {
-	uint32_t serial;
-	union {
-		char value[PROP_VALUE_MAX];
-		struct {
-			char error_message[56];
-			uint32_t offset; /* relative to start of this prop_info struct */
-		} long_property;
-	};
-	char name[0];      /* full null-terminated property name */
-};
-
-/* Android property_info serialization header (/dev/__properties__/property_info) */
-struct property_info_area_header {
-	uint32_t current_version;
-	uint32_t minimum_supported_version;
-	uint32_t size;
-	uint32_t contexts_offset;
-	uint32_t types_offset;
-	uint32_t root_offset;
-};
 
 /* Internal property entry for sorting / storage */
 struct prop_entry {
@@ -302,7 +266,7 @@ int getprop_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int getprop_main(int argc, char **argv)
 {
 	struct prop_collector col;
-	const char *prop_dir = "/dev/__properties__";
+	const char *prop_dir = ANDROID_PROP_DIR;
 	const char *target = NULL;
 	const char *def_val = "";
 	DIR *dir;
