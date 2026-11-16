@@ -32,14 +32,14 @@
 //usage:     "\n	--disable-rkp <img|rec> [out] Disable Samsung RKP / KNOX protections"
 //usage:     "\n	--kernel-status <img|rec>     Inspect kernel security features & CFI jump tables"
 //usage:     "\n"
-//usage:     "\nBoot Image Operations:"
-//usage:     "\n	-u, --unpack [dir] <boot.img> Unpack boot/recovery image components"
-//usage:     "\n	    -k, --kernel-only         Extract kernel only"
+//usage:     "\nImage & OTA Payload Operations:"
+//usage:     "\n	-u, --unpack [dir] <img|payload> Unpack boot components or payload.bin partitions"
+//usage:     "\n	    -k, --kernel-only         Extract kernel only (boot.img or payload.bin)"
 //usage:     "\n	    -s, --split               Split image without decompressing ramdisk"
-//usage:     "\n	    -h, --header-only         Parse and print header information"
+//usage:     "\n	    -h, --header-only         Parse and print header / payload manifest info"
 //usage:     "\n	-r, --repack [out] <boot.img> Repack components into new boot image"
 //usage:     "\n	    -n, --no-comp             Do not compress repacked ramdisk"
-//usage:     "\n	-e, --extract <comp> [out]    Extract component (kernel, ramdisk, dtb, extra)"
+//usage:     "\n	-e, --extract <img|payload> [part|comp] [out] Extract partition or component"
 //usage:     "\n	-c, --cleanup                 Clean up unpacked temporary files"
 //usage:     "\n"
 //usage:     "\nKernel Module Toolkit:"
@@ -73,6 +73,15 @@
 #include <sys/sendfile.h>
 #include <sys/utsname.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+
+#ifndef BLKGETSIZE64
+#define BLKGETSIZE64 _IOR(0x12, 114, size_t)
+#endif
+#ifndef BLKROSET
+#define BLKROSET _IO(0x12, 93)
+#endif
 
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic ignored "-Waddress-of-packed-member"
@@ -675,9 +684,56 @@ static int write_to_disk(const char *dest, const void *data, size_t size, uint8_
  * 4. Image Parsing & Unpacking Core
  * ========================================================================= */
 
+static off_t get_file_or_bdev_size(int fd, const struct stat *st)
+{
+	off_t sz = st->st_size;
+	if (S_ISBLK(st->st_mode) || sz == 0) {
+#ifdef BLKGETSIZE64
+		uint64_t bsize = 0;
+		if (ioctl(fd, BLKGETSIZE64, &bsize) == 0 && bsize > 0)
+			return (off_t)bsize;
+#endif
+		{
+			off_t end_off = lseek(fd, 0, SEEK_END);
+			if (end_off > 0) {
+				lseek(fd, 0, SEEK_SET);
+				return end_off;
+			}
+		}
+	}
+	return sz;
+}
+
+static void *map_or_read_image(int fd, size_t size, bool rw)
+{
+	int prot = PROT_READ | (rw ? PROT_WRITE : 0);
+	int flags = MAP_SHARED;
+	void *ptr;
+
+	/* 1. Attempt zero-copy direct mmap */
+	ptr = mmap(NULL, size, prot, flags, fd, 0);
+	if (ptr != MAP_FAILED && ptr != NULL)
+		return ptr;
+
+	/* 2. Resilient fallback for Android block devices where mmap(MAP_SHARED)
+	 * fails with ENODEV, EACCES, or EINVAL due to block-level VFS driver constraints */
+	ptr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (ptr != MAP_FAILED && ptr != NULL) {
+		lseek(fd, 0, SEEK_SET);
+		if (full_read(fd, ptr, size) < 1024) {
+			munmap(ptr, size);
+			return MAP_FAILED;
+		}
+		return ptr;
+	}
+
+	return MAP_FAILED;
+}
+
 static bool boot_img_parse(boot_img_t *img, const char *path) {
 	int fd;
 	struct stat st;
+	off_t real_sz;
 	const uint8_t *start;
 	const uint8_t *end;
 	const uint8_t *hdr_ptr = NULL;
@@ -690,14 +746,21 @@ static bool boot_img_parse(boot_img_t *img, const char *path) {
 	fd = open_or_warn(path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) return false;
 
-	if (fstat(fd, &st) < 0 || st.st_size < 1024) {
-		bb_error_msg("file '%s' is too small or invalid", path);
+	if (fstat(fd, &st) < 0) {
+		bb_perror_msg("cannot stat '%s'", path);
 		close(fd);
 		return false;
 	}
 
-	img->map_sz = st.st_size;
-	img->map_ptr = mmap(NULL, img->map_sz, PROT_READ, MAP_SHARED, fd, 0);
+	real_sz = get_file_or_bdev_size(fd, &st);
+	if (real_sz < 1024) {
+		bb_error_msg("file '%s' is too small or invalid (%lld bytes)", path, (long long)real_sz);
+		close(fd);
+		return false;
+	}
+
+	img->map_sz = (size_t)real_sz;
+	img->map_ptr = map_or_read_image(fd, img->map_sz, false);
 	close(fd);
 
 	if (img->map_ptr == MAP_FAILED || !img->map_ptr) {
@@ -860,13 +923,13 @@ static void boot_img_free(boot_img_t *img) {
  * 5. magiskboot unpack, repack, split, hexpatch commands
  * ========================================================================= */
 
-static int magiskboot_unpack(const char *image, bool skip_decomp, bool hdr_only, bool kernel_only) {
+static int magiskboot_unpack(const char *image, bool skip_kernel_decomp, bool skip_ramdisk_decomp, bool hdr_only, bool kernel_only) {
 	boot_img_t boot;
 	if (!boot_img_parse(&boot, image)) return 1;
 
 	if (kernel_only) {
 		if (boot.kernel && boot.kernel_size > 0) {
-			write_to_disk(KERNEL_FILE, boot.kernel, boot.kernel_size, boot.k_fmt, skip_decomp);
+			write_to_disk(KERNEL_FILE, boot.kernel, boot.kernel_size, boot.k_fmt, skip_kernel_decomp);
 			fprintf(stderr, "[+] Extracted kernel -> [%s]\n", KERNEL_FILE);
 		}
 		if (boot.kernel_dtb && boot.kernel_dtb_size > 0) {
@@ -884,19 +947,19 @@ static int magiskboot_unpack(const char *image, bool skip_decomp, bool hdr_only,
 	}
 
 	if (boot.kernel && boot.kernel_size > 0) {
-		write_to_disk(KERNEL_FILE, boot.kernel, boot.kernel_size, boot.k_fmt, skip_decomp);
+		write_to_disk(KERNEL_FILE, boot.kernel, boot.kernel_size, boot.k_fmt, skip_kernel_decomp);
 	}
 	if (boot.kernel_dtb && boot.kernel_dtb_size > 0) {
 		write_to_disk(KER_DTB_FILE, boot.kernel_dtb, boot.kernel_dtb_size, BOOT_FMT_UNKNOWN, true);
 	}
 	if (boot.ramdisk && boot.ramdisk_size > 0) {
-		write_to_disk(RAMDISK_FILE, boot.ramdisk, boot.ramdisk_size, boot.r_fmt, skip_decomp);
+		write_to_disk(RAMDISK_FILE, boot.ramdisk, boot.ramdisk_size, boot.r_fmt, skip_ramdisk_decomp);
 	}
 	if (boot.second && boot.second_size > 0) {
 		write_to_disk(SECOND_FILE, boot.second, boot.second_size, BOOT_FMT_UNKNOWN, true);
 	}
 	if (boot.extra && boot.extra_size > 0) {
-		write_to_disk(EXTRA_FILE, boot.extra, boot.extra_size, boot.e_fmt, skip_decomp);
+		write_to_disk(EXTRA_FILE, boot.extra, boot.extra_size, boot.e_fmt, skip_ramdisk_decomp);
 	}
 	if (boot.recovery_dtbo && boot.recovery_dtbo_size > 0) {
 		write_to_disk(RECV_DTBO_FILE, boot.recovery_dtbo, boot.recovery_dtbo_size, BOOT_FMT_UNKNOWN, true);
@@ -996,6 +1059,28 @@ static int compress_file_format(const char *src, const char *dst, uint8_t fmt) {
 	}
 	unlink(dst);
 	return -1;
+}
+
+static const char *prepare_kernel_for_repack(boot_img_t *boot, bool skip_comp, char *tmp_buf, size_t tmp_sz) {
+	if (access(KERNEL_FILE, R_OK) != 0) return KERNEL_FILE;
+
+	if (!skip_comp && boot_fmt_compressed(boot->k_fmt)) {
+		int in_fd = open_or_warn(KERNEL_FILE, O_RDONLY);
+		if (in_fd >= 0) {
+			uint8_t magic[16];
+			ssize_t n = full_read(in_fd, magic, sizeof(magic));
+			close(in_fd);
+			if (n >= 2 && boot_check_fmt(magic, n) == boot->k_fmt) {
+				return KERNEL_FILE;
+			}
+		}
+		safe_strncpy(tmp_buf, "/tmp/mb_kernel_XXXXXX", tmp_sz);
+		close(xmkstemp(tmp_buf));
+		if (compress_file_format(KERNEL_FILE, tmp_buf, boot->k_fmt) == 0) {
+			return tmp_buf;
+		}
+	}
+	return KERNEL_FILE;
 }
 
 static const char *prepare_ramdisk_for_repack(boot_img_t *boot, bool skip_comp, char *tmp_buf, size_t tmp_sz) {
@@ -1187,7 +1272,14 @@ static int magiskboot_repack(const char *src_img, const char *out_img, bool skip
 				copy_file_section(out_fd, KERNEL_FILE, page_sz, &kernel_sz);
 			}
 		} else {
-			copy_file_section(out_fd, KERNEL_FILE, page_sz, &kernel_sz);
+			char tmp_kernel[PATH_MAX];
+			const char *kernel_path;
+			tmp_kernel[0] = '\0';
+			kernel_path = prepare_kernel_for_repack(&boot, skip_comp, tmp_kernel, sizeof(tmp_kernel));
+			copy_file_section(out_fd, kernel_path, page_sz, &kernel_sz);
+			if (tmp_kernel[0] != '\0') {
+				unlink(tmp_kernel);
+			}
 		}
 		if (access(KER_DTB_FILE, R_OK) == 0) {
 			uint32_t dtb_part = 0;
@@ -3311,95 +3403,183 @@ static int probe_module_layout_from_buffer(const uint8_t *map, size_t size, stru
 	return res;
 }
 
+/* Recursively find the active 'by-name' partition directory under /dev/block dynamically */
+static int find_by_name_dir(const char *base, int depth, char *out_dir, size_t max_len)
+{
+	DIR *d;
+	struct dirent *de;
+
+	if (depth <= 0) return -1;
+	d = opendir(base);
+	if (!d) return -1;
+
+	while ((de = readdir(d)) != NULL) {
+		char subpath[PATH_MAX];
+		struct stat st;
+
+		if (de->d_name[0] == '.') continue;
+		snprintf(subpath, sizeof(subpath), "%s/%s", base, de->d_name);
+
+		if (strcmp(de->d_name, "by-name") == 0) {
+			if (stat(subpath, &st) == 0 && S_ISDIR(st.st_mode)) {
+				char test_boot[PATH_MAX];
+				/* Verify this by-name directory actually contains boot or boot_a */
+				snprintf(test_boot, sizeof(test_boot), "%s/boot", subpath);
+				if (access(test_boot, F_OK) == 0) {
+					safe_strncpy(out_dir, subpath, max_len);
+					closedir(d);
+					return 0;
+				}
+				snprintf(test_boot, sizeof(test_boot), "%s/boot_a", subpath);
+				if (access(test_boot, F_OK) == 0) {
+					safe_strncpy(out_dir, subpath, max_len);
+					closedir(d);
+					return 0;
+				}
+			}
+		}
+
+		if (lstat(subpath, &st) == 0 && S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode)) {
+			if (find_by_name_dir(subpath, depth - 1, out_dir, max_len) == 0) {
+				closedir(d);
+				return 0;
+			}
+		}
+	}
+	closedir(d);
+	return -1;
+}
+
+static int get_active_slot_suffix(char *slot_suffix, size_t max_len)
+{
+	int fd;
+	char buf[2048];
+	ssize_t n;
+	char *p;
+	char *eq;
+	const char *env_slot;
+
+	slot_suffix[0] = '\0';
+
+	/* 1. Parse /proc/cmdline in-memory */
+	fd = open("/proc/cmdline", O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		n = full_read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n > 0) {
+			buf[n] = '\0';
+			p = strstr(buf, "androidboot.slot_suffix=");
+			if (p) {
+				sscanf(p + 24, "%15s", slot_suffix);
+			} else {
+				p = strstr(buf, "androidboot.slot=");
+				if (p) {
+					char sname[16] = {0};
+					if (sscanf(p + 17, "%15s", sname) == 1) {
+						snprintf(slot_suffix, max_len, "_%s", sname);
+					}
+				}
+			}
+		}
+	}
+	if (slot_suffix[0] != '\0') return 0;
+
+	/* 2. Parse /proc/bootconfig in-memory (Android 12+ GKI) */
+	fd = open("/proc/bootconfig", O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		n = full_read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n > 0) {
+			buf[n] = '\0';
+			p = strstr(buf, "androidboot.slot_suffix");
+			if (p) {
+				eq = strchr(p, '=');
+				if (eq) {
+					while (*++eq == ' ' || *eq == '"');
+					sscanf(eq, "%15[^\" \t\r\n]", slot_suffix);
+				}
+			}
+		}
+	}
+	if (slot_suffix[0] != '\0') return 0;
+
+	/* 3. Recovery environment variables */
+	env_slot = getenv("SLOT");
+	if (!env_slot) env_slot = getenv("BOOT_SLOT");
+	if (env_slot && env_slot[0] != '\0') {
+		if (env_slot[0] == '_') {
+			safe_strncpy(slot_suffix, env_slot, max_len);
+		} else {
+			snprintf(slot_suffix, max_len, "_%s", env_slot);
+		}
+		return 0;
+	}
+
+	/* 4. Parse active /proc/mounts */
+	fd = open("/proc/mounts", O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		n = full_read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (n > 0) {
+			buf[n] = '\0';
+			if (strstr(buf, "_a ") || strstr(buf, "_a/")) {
+				strcpy(slot_suffix, "_a");
+				return 0;
+			} else if (strstr(buf, "_b ") || strstr(buf, "_b/")) {
+				strcpy(slot_suffix, "_b");
+				return 0;
+			}
+		}
+	}
+
+	return -1;
+}
+
 static int find_target_boot_image(char *out_path, size_t max_len)
 {
-	char slot_suffix[48] = {0};
-	char *cmdline;
-	int d, i;
-
-	static const char *const by_name_dirs[] = {
-		"/dev/block/bootdevice/by-name",
-		"/dev/block/by-name",
-		"/dev/block/platform/soc/by-name",
-		NULL
-	};
-
-	static const char *const fallback_imgs[] = {
-		"/Image",
-		"/boot/Image",
-		"/data/local/tmp/Image",
-		"/data/local/tmp/boot.img",
-		"/data/adb/Image",
-		NULL
-	};
+	char by_name_dir[PATH_MAX];
+	char slot_suffix[16];
+	char test_path[PATH_MAX];
+	bool is_ab = false;
 
 	if (!out_path || max_len < 16)
 		return -1;
 
-	cmdline = (char *)xmalloc_open_read_close("/proc/cmdline", NULL);
-	if (cmdline) {
-		char *slot_p = strstr(cmdline, "androidboot.slot_suffix=");
-		if (slot_p) {
-			sscanf(slot_p + 24, "%31s", slot_suffix);
-		} else {
-			slot_p = strstr(cmdline, "androidboot.slot=");
-			if (slot_p) {
-				char sname[32] = {0};
-				if (sscanf(slot_p + 17, "%31s", sname) == 1) {
-					snprintf(slot_suffix, sizeof(slot_suffix), "_%s", sname);
-				}
-			}
-		}
-		free(cmdline);
+	/* Dynamically discover the platform's 'by-name' directory under /dev/block */
+	if (find_by_name_dir("/dev/block", 4, by_name_dir, sizeof(by_name_dir)) != 0) {
+		bb_error_msg("failed to locate 'by-name' partition directory under /dev/block");
+		return -1;
 	}
 
-	for (d = 0; by_name_dirs[d]; d++) {
-		DIR *dir = opendir(by_name_dirs[d]);
-		struct dirent *de;
-		if (!dir)
-			continue;
-
-		while ((de = readdir(dir)) != NULL) {
-			bool match = false;
-			if (de->d_name[0] == '.')
-				continue;
-
-			if (slot_suffix[0] != '\0') {
-				char expected[64];
-				snprintf(expected, sizeof(expected), "boot%s", slot_suffix);
-				if (strcmp(de->d_name, expected) == 0)
-					match = true;
-			} else if (strcmp(de->d_name, "boot") == 0 ||
-			           strcmp(de->d_name, "boot_a") == 0 ||
-			           strcmp(de->d_name, "boot_b") == 0) {
-				match = true;
-			}
-
-			if (match) {
-				char *candidate = concat_path_file(by_name_dirs[d], de->d_name);
-				int fd = open_or_warn(candidate, O_RDONLY);
-				if (fd >= 0) {
-					close(fd);
-					safe_strncpy(out_path, candidate, max_len);
-					free(candidate);
-					closedir(dir);
-					return 0;
-				}
-				free(candidate);
-			}
-		}
-		closedir(dir);
+	/* Dynamically determine if the device is A/B by inspecting the partition table */
+	snprintf(test_path, sizeof(test_path), "%s/boot_a", by_name_dir);
+	if (access(test_path, F_OK) == 0) {
+		is_ab = true;
 	}
 
-	for (i = 0; fallback_imgs[i]; i++) {
-		int fd = open_or_warn(fallback_imgs[i], O_RDONLY);
-		if (fd >= 0) {
-			close(fd);
-			snprintf(out_path, max_len, "%s", fallback_imgs[i]);
-			return 0;
-		}
+	get_active_slot_suffix(slot_suffix, sizeof(slot_suffix));
+	if (is_ab && slot_suffix[0] == '\0') {
+		strcpy(slot_suffix, "_a");
 	}
 
+	printf("[*] Dynamic partition topology: %s%s%s%s\n",
+	       is_ab ? "A/B" : "A-only",
+	       slot_suffix[0] ? " (active slot: " : "",
+	       slot_suffix[0] ? slot_suffix : "",
+	       slot_suffix[0] ? ")" : "");
+
+	if (is_ab && slot_suffix[0] != '\0') {
+		snprintf(out_path, max_len, "%s/boot%s", by_name_dir, slot_suffix);
+	} else {
+		snprintf(out_path, max_len, "%s/boot", by_name_dir);
+	}
+
+	if (access(out_path, F_OK) == 0) {
+		printf("[+] Active boot partition resolved: %s\n", out_path);
+		return 0;
+	}
+
+	bb_error_msg("target boot partition '%s' does not exist", out_path);
 	return -1;
 }
 
@@ -3462,6 +3642,7 @@ static int detect_vermagic_from_boot_image(const char *boot_path, char *out_magi
 {
 	int fd;
 	struct stat st;
+	off_t real_sz;
 	uint8_t *map;
 	const uint8_t *k_data;
 	size_t k_size;
@@ -3469,18 +3650,24 @@ static int detect_vermagic_from_boot_image(const char *boot_path, char *out_magi
 	int ret;
 
 	if (!boot_path || !out_magic) return -1;
-	fd = open(boot_path, O_RDONLY);
-	if (fd < 0 || fstat(fd, &st) < 0 || st.st_size < 4096) {
+	fd = open(boot_path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &st) < 0) {
 		if (fd >= 0) close(fd);
 		return -1;
 	}
 
-	map = (uint8_t *)mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	real_sz = get_file_or_bdev_size(fd, &st);
+	if (real_sz < 4096) {
+		close(fd);
+		return -1;
+	}
+
+	map = (uint8_t *)map_or_read_image(fd, (size_t)real_sz, false);
 	close(fd);
 	if (map == MAP_FAILED) return -1;
 
 	k_data = map;
-	k_size = st.st_size;
+	k_size = (size_t)real_sz;
 
 	if (k_size > 4096 && memcmp(map, "ANDROID!", 8) == 0) {
 		uint32_t hdr_ver = *(const uint32_t *)(map + 40);
@@ -3503,7 +3690,7 @@ static int detect_vermagic_from_boot_image(const char *boot_path, char *out_magi
 
 	ret = extract_vermagic_from_buffer(k_data, k_size, out_magic, max_len);
 	if (decompressed) free(decompressed);
-	munmap(map, st.st_size);
+	munmap(map, (size_t)real_sz);
 
 	if (ret == 0) {
 		printf("[+] Dynamically extracted vermagic from image '%s': '%s'\n", boot_path, out_magic);
@@ -3522,11 +3709,11 @@ static int probe_target_module_layout(const char *boot_img_path, const char *tar
 	discovered_boot[0] = '\0';
 
 	/* 1. Try reading live kernel BTF from /sys/kernel/btf/vmlinux */
-	fd = open("/sys/kernel/btf/vmlinux", O_RDONLY);
+	fd = open("/sys/kernel/btf/vmlinux", O_RDONLY | O_CLOEXEC);
 	if (fd >= 0) {
 		struct stat st;
 		if (fstat(fd, &st) == 0 && st.st_size > 4096) {
-			uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+			uint8_t *map = (uint8_t *)mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
 			if (map != MAP_FAILED) {
 				const uint8_t *btf = find_btf_header(map, st.st_size);
 				if (btf) {
@@ -3553,19 +3740,22 @@ static int probe_target_module_layout(const char *boot_img_path, const char *tar
 	}
 
 	if (boot_img_path && boot_img_path[0] != '\0') {
-		fd = open(boot_img_path, O_RDONLY);
+		fd = open(boot_img_path, O_RDONLY | O_CLOEXEC);
 		if (fd >= 0) {
 			struct stat st;
-			if (fstat(fd, &st) == 0 && st.st_size > 4096) {
-				uint8_t *map = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-				if (map != MAP_FAILED) {
-					if (probe_module_layout_from_buffer(map, st.st_size, out) == 0) {
-						munmap(map, st.st_size);
-						close(fd);
-						printf("[+] Dynamically introspected struct module from image: %s\n", boot_img_path);
-						return 0;
+			if (fstat(fd, &st) == 0) {
+				off_t real_sz = get_file_or_bdev_size(fd, &st);
+				if (real_sz > 4096) {
+					uint8_t *map = (uint8_t *)map_or_read_image(fd, (size_t)real_sz, false);
+					if (map != MAP_FAILED) {
+						if (probe_module_layout_from_buffer(map, (size_t)real_sz, out) == 0) {
+							munmap(map, (size_t)real_sz);
+							close(fd);
+							printf("[+] Dynamically introspected struct module from image: %s\n", boot_img_path);
+							return 0;
+						}
+						munmap(map, (size_t)real_sz);
 					}
-					munmap(map, st.st_size);
 				}
 			}
 			close(fd);
@@ -5450,41 +5640,21 @@ static int magiskboot_add_module_op(int argc, char **argv)
 		return 1;
 	}
 
-	/* 1. Unpack boot image using existing battle-tested magiskboot_unpack */
+	/* 1. Unpack boot image keeping kernel untouched and compressed */
 	printf("[*] Unpacking boot image: %s\n", boot_img);
-	if (magiskboot_unpack(boot_img, false, false, false) != 0) {
+	if (magiskboot_unpack(boot_img, true, false, false, false) != 0) {
 		bb_error_msg("failed to unpack boot image '%s'", boot_img);
 		chdir(old_cwd);
 		remove_file(tmp_work_dir, FILEUTILS_RECUR | FILEUTILS_FORCE);
 		return 1;
 	}
 
-	/* 2. De-enforce kernel signature & CFI if kernel was unpacked */
-	if (access("kernel", F_OK) == 0) {
-		int chks = 0, sets = 0;
-		int kfd = open_or_warn("kernel", O_RDWR | O_CLOEXEC);
-		if (kfd >= 0) {
-			struct stat kst;
-			if (fstat(kfd, &kst) == 0 && kst.st_size > 64) {
-				uint8_t *kmap = mmap(NULL, kst.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, kfd, 0);
-				if (kmap != MAP_FAILED) {
-					if (patch_sigenforce_buf(kmap, kst.st_size, &chks, &sets)) {
-						printf("[+] Neutralized signature enforcement in kernel (%d checks, %d setters)\n",
-						       chks, sets);
-					}
-					munmap(kmap, kst.st_size);
-				}
-			}
-			close(kfd);
-		}
-	}
-
-	/* 3. Patch module vermagic and relocations to align with boot kernel */
+	/* 2. Patch module vermagic and relocations to align with boot kernel */
 	snprintf(staged_module, sizeof(staged_module), "%s/kroot.ko", tmp_work_dir);
 	copy_file(abs_module_ko, staged_module, FILEUTILS_FORCE);
 	module_patch_file(staged_module, staged_module, NULL, boot_img);
 
-	/* 4. Inject module into ramdisk.cpio */
+	/* 3. Inject module into ramdisk.cpio */
 	if (access("ramdisk.cpio", F_OK) == 0) {
 		printf("[*] Injecting module into ramdisk.cpio...\n");
 		snprintf(cpio_cmd1, sizeof(cpio_cmd1), "add 0644 lib/modules/kroot.ko %s", staged_module);
@@ -5503,7 +5673,7 @@ static int magiskboot_add_module_op(int argc, char **argv)
 		goto cleanup;
 	}
 
-	/* 5. Repack boot image using existing battle-tested magiskboot_repack */
+	/* 4. Repack boot image using existing battle-tested magiskboot_repack */
 	if (out_img && !install) {
 		if (out_img[0] == '/') {
 			safe_strncpy(repacked_img, out_img, sizeof(repacked_img));
@@ -5525,7 +5695,7 @@ static int magiskboot_add_module_op(int argc, char **argv)
 		goto cleanup;
 	}
 
-	/* 6. If --install is specified, flash directly to target block device */
+	/* 5. If --install is specified, flash directly to target block device */
 	if (install) {
 		printf("[*] Flashing patched boot image directly to %s...\n", boot_img);
 		in_fd = open_or_warn(repacked_img, O_RDONLY | O_CLOEXEC);
@@ -5556,18 +5726,40 @@ static int magiskboot_add_module_op(int argc, char **argv)
 		/* Stream exact byte count directly using BusyBox libbb (battle-tested dd engine) */
 		written = bb_copyfd_size(in_fd, out_fd, st_img.st_size);
 		close(in_fd);
+
+		if (written != st_img.st_size) {
+			bb_error_msg("flashing incomplete: wrote %lld of %lld bytes",
+			             (long long)written, (long long)st_img.st_size);
+			close(out_fd);
+			ret = 1;
+			goto cleanup;
+		}
+
+		/* Zero-pad remainder of partition matching AnyKernel3 (`cat boot-new.img /dev/zero > $BLOCK`) */
+		{
+			struct stat st_out;
+			if (fstat(out_fd, &st_out) == 0 && S_ISBLK(st_out.st_mode)) {
+				off_t bdev_sz = get_file_or_bdev_size(out_fd, &st_out);
+				if (bdev_sz > written) {
+					off_t pad_remain = bdev_sz - written;
+					static const char zero_buf[65536] = {0};
+					printf("[*] Zero-padding remainder of partition (%lld bytes) matching AnyKernel3...\n",
+					       (long long)pad_remain);
+					while (pad_remain > 0) {
+						size_t chunk = (pad_remain > (off_t)sizeof(zero_buf)) ? sizeof(zero_buf) : (size_t)pad_remain;
+						ssize_t nw = full_write(out_fd, zero_buf, chunk);
+						if (nw <= 0) break;
+						pad_remain -= nw;
+					}
+				}
+			}
+		}
+
 		fsync(out_fd);
 		close(out_fd);
 		sync();
 
-		if (written == st_img.st_size) {
-			printf("[✓] SUCCESS: Flashed %lld bytes to %s\n", (long long)written, boot_img);
-		} else {
-			bb_error_msg("flashing incomplete: wrote %lld of %lld bytes",
-			             (long long)written, (long long)st_img.st_size);
-			ret = 1;
-			goto cleanup;
-		}
+		printf("[✓] SUCCESS: Flashed %lld bytes to %s\n", (long long)written, boot_img);
 	} else {
 		printf("[✓] SUCCESS: Patched boot image saved to %s\n", repacked_img);
 	}
@@ -5576,6 +5768,636 @@ cleanup:
 	chdir(old_cwd);
 	remove_file(tmp_work_dir, FILEUTILS_RECUR | FILEUTILS_FORCE);
 	return ret;
+}
+
+/* =========================================================================
+ * 12. Android OTA Payload (payload.bin / CrAU) Engine
+ * ========================================================================= */
+
+#define PAYLOAD_MAGIC "CrAU"
+
+static bool is_payload_bin(const char *path) {
+	int fd;
+	char magic[4];
+	ssize_t n;
+
+	if (!path) return false;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) return false;
+	n = full_read(fd, magic, 4);
+	close(fd);
+	return (n == 4 && memcmp(magic, PAYLOAD_MAGIC, 4) == 0);
+}
+
+static uint64_t pb_read_varint(const uint8_t **p, const uint8_t *end) {
+	uint64_t val = 0;
+	int shift = 0;
+	while (*p < end && shift < 64) {
+		uint8_t b = *(*p)++;
+		val |= ((uint64_t)(b & 0x7f)) << shift;
+		if ((b & 0x80) == 0) break;
+		shift += 7;
+	}
+	return val;
+}
+
+static void pb_skip_field(uint32_t wire_type, const uint8_t **p, const uint8_t *end) {
+	if (wire_type == 0) {
+		pb_read_varint(p, end);
+	} else if (wire_type == 1) {
+		if (*p + 8 <= end) *p += 8; else *p = end;
+	} else if (wire_type == 2) {
+		uint64_t len = pb_read_varint(p, end);
+		if (*p + len <= end) *p += len; else *p = end;
+	} else if (wire_type == 5) {
+		if (*p + 4 <= end) *p += 4; else *p = end;
+	}
+}
+
+struct payload_extent {
+	uint64_t start_block;
+	uint64_t num_blocks;
+};
+
+static int payload_extract_partition_ops(int in_fd, off_t data_base, const uint8_t *part_start, const uint8_t *part_end, const char *part_name, const char *out_path, uint64_t part_size) {
+	int out_fd;
+	const uint8_t *scan;
+	int op_count = 0;
+
+	out_fd = open3_or_warn(out_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (out_fd < 0) return 1;
+
+	scan = part_start;
+	while (scan < part_end) {
+		uint64_t ptag = pb_read_varint(&scan, part_end);
+		uint32_t pfield = ptag >> 3;
+		uint32_t pwire = ptag & 7;
+
+		if (pfield == 8 && pwire == 2) {
+			uint64_t oplen = pb_read_varint(&scan, part_end);
+			const uint8_t *op_end = scan + oplen;
+			uint32_t type = 0;
+			uint64_t data_offset = 0, data_length = 0;
+			struct payload_extent static_extents[16];
+			struct payload_extent *extents = static_extents;
+			size_t num_extents = 0;
+			size_t extents_cap = 16;
+			size_t i;
+
+			while (scan < op_end) {
+				uint64_t otag = pb_read_varint(&scan, op_end);
+				uint32_t ofield = otag >> 3;
+				uint32_t owire = otag & 7;
+
+				if (ofield == 1 && owire == 0) {
+					type = (uint32_t)pb_read_varint(&scan, op_end);
+				} else if (ofield == 2 && owire == 0) {
+					data_offset = pb_read_varint(&scan, op_end);
+				} else if (ofield == 3 && owire == 0) {
+					data_length = pb_read_varint(&scan, op_end);
+				} else if (ofield == 6 && owire == 2) {
+					uint64_t elen = pb_read_varint(&scan, op_end);
+					const uint8_t *eend = scan + elen;
+					uint64_t start_block = 0, num_blocks = 0;
+
+					while (scan < eend) {
+						uint64_t etag = pb_read_varint(&scan, eend);
+						uint32_t efield = etag >> 3;
+						uint32_t ewire = etag & 7;
+
+						if (efield == 1 && ewire == 0) start_block = pb_read_varint(&scan, eend);
+						else if (efield == 2 && ewire == 0) num_blocks = pb_read_varint(&scan, eend);
+						else pb_skip_field(ewire, &scan, eend);
+					}
+
+					if (num_extents >= extents_cap) {
+						extents_cap *= 2;
+						if (extents == static_extents) {
+							extents = xmalloc(extents_cap * sizeof(struct payload_extent));
+							memcpy(extents, static_extents, num_extents * sizeof(struct payload_extent));
+						} else {
+							extents = xrealloc(extents, extents_cap * sizeof(struct payload_extent));
+						}
+					}
+					extents[num_extents].start_block = start_block;
+					extents[num_extents].num_blocks = num_blocks;
+					num_extents++;
+				} else {
+					pb_skip_field(owire, &scan, op_end);
+				}
+			}
+
+			if (num_extents > 0) {
+				if (type == 6) { /* ZERO */
+					static const char zero_buf[65536] = {0};
+					for (i = 0; i < num_extents; i++) {
+						uint64_t rem = extents[i].num_blocks * 4096;
+						xlseek(out_fd, extents[i].start_block * 4096, SEEK_SET);
+						while (rem > 0) {
+							size_t chunk = (rem > sizeof(zero_buf)) ? sizeof(zero_buf) : (size_t)rem;
+							full_write(out_fd, zero_buf, chunk);
+							rem -= chunk;
+						}
+					}
+				} else if (type == 0) { /* REPLACE */
+					xlseek(in_fd, data_base + data_offset, SEEK_SET);
+					if (num_extents == 1) {
+						xlseek(out_fd, extents[0].start_block * 4096, SEEK_SET);
+						bb_copyfd_size(in_fd, out_fd, data_length);
+					} else {
+						for (i = 0; i < num_extents; i++) {
+							xlseek(out_fd, extents[i].start_block * 4096, SEEK_SET);
+							bb_copyfd_size(in_fd, out_fd, extents[i].num_blocks * 4096);
+						}
+					}
+				} else if (type == 8 || type == 1) { /* REPLACE_XZ or REPLACE_BZ */
+					uint8_t fmt = (type == 8) ? BOOT_FMT_XZ : BOOT_FMT_BZIP2;
+					void *cbuf = xmalloc(data_length);
+					xlseek(in_fd, data_base + data_offset, SEEK_SET);
+					xread(in_fd, cbuf, data_length);
+
+					if (num_extents == 1) {
+						xlseek(out_fd, extents[0].start_block * 4096, SEEK_SET);
+						bb_decompress_data(fmt, cbuf, data_length, out_fd);
+					} else {
+						char tmp_path[] = "/tmp/mb_op_XXXXXX";
+						int tmp_fd = xmkstemp(tmp_path);
+						unlink(tmp_path);
+						bb_decompress_data(fmt, cbuf, data_length, tmp_fd);
+						for (i = 0; i < num_extents; i++) {
+							xlseek(tmp_fd, 0, SEEK_SET);
+							xlseek(out_fd, extents[i].start_block * 4096, SEEK_SET);
+							bb_copyfd_size(tmp_fd, out_fd, extents[i].num_blocks * 4096);
+						}
+						close(tmp_fd);
+					}
+					free(cbuf);
+				}
+			}
+
+			if (extents != static_extents) free(extents);
+			op_count++;
+		} else {
+			pb_skip_field(pwire, &scan, part_end);
+		}
+	}
+
+	if (part_size > 0) {
+		ftruncate(out_fd, part_size);
+	}
+	close(out_fd);
+	fprintf(stderr, "[+] Extracted partition '%s' -> [%s] (%"PRIu64" bytes, %d operations)\n",
+	        part_name, out_path, part_size, op_count);
+	return 0;
+}
+
+static int payload_extract_partition(const char *payload_path, const char *target_part, const char *out_path) {
+	int in_fd;
+	char magic[4];
+	uint64_t version = 0, manifest_len = 0;
+	uint32_t sig_len = 0;
+	off_t data_base;
+	uint8_t *mbuf;
+	const uint8_t *p, *end;
+	int ret = 1;
+
+	if (!payload_path || !target_part) return 1;
+
+	in_fd = open_or_warn(payload_path, O_RDONLY | O_CLOEXEC);
+	if (in_fd < 0) return 1;
+
+	if (full_read(in_fd, magic, 4) != 4 || memcmp(magic, PAYLOAD_MAGIC, 4) != 0) {
+		bb_error_msg("'%s' is not a valid Android OTA payload", payload_path);
+		close(in_fd);
+		return 1;
+	}
+
+	if (full_read(in_fd, &version, 8) != 8 || full_read(in_fd, &manifest_len, 8) != 8) {
+		bb_error_msg("truncated payload header in '%s'", payload_path);
+		close(in_fd);
+		return 1;
+	}
+	version = SWAP_BE64(version);
+	manifest_len = SWAP_BE64(manifest_len);
+
+	if (version >= 2) {
+		if (full_read(in_fd, &sig_len, 4) != 4) {
+			bb_error_msg("truncated payload header in '%s'", payload_path);
+			close(in_fd);
+			return 1;
+		}
+		sig_len = SWAP_BE32(sig_len);
+	}
+
+	data_base = (version >= 2 ? 24 : 20) + manifest_len + sig_len;
+
+	mbuf = xmalloc(manifest_len);
+	if (full_read(in_fd, mbuf, manifest_len) != (ssize_t)manifest_len) {
+		bb_error_msg("failed to read payload manifest from '%s'", payload_path);
+		free(mbuf);
+		close(in_fd);
+		return 1;
+	}
+
+	p = mbuf;
+	end = mbuf + manifest_len;
+
+	while (p < end) {
+		uint64_t tag = pb_read_varint(&p, end);
+		uint32_t field = tag >> 3;
+		uint32_t wire = tag & 7;
+
+		if (field == 13 && wire == 2) {
+			uint64_t part_len = pb_read_varint(&p, end);
+			const uint8_t *part_end = p + part_len;
+			char part_name[64] = {0};
+			uint64_t part_size = 0;
+			const uint8_t *scan = p;
+
+			while (scan < part_end) {
+				uint64_t ptag = pb_read_varint(&scan, part_end);
+				uint32_t pfield = ptag >> 3;
+				uint32_t pwire = ptag & 7;
+
+				if (pfield == 1 && pwire == 2) {
+					uint64_t nlen = pb_read_varint(&scan, part_end);
+					size_t cp = (nlen < sizeof(part_name) - 1) ? nlen : (sizeof(part_name) - 1);
+					memcpy(part_name, scan, cp);
+					part_name[cp] = '\0';
+					scan += nlen;
+				} else if (pfield == 7 && pwire == 2) {
+					uint64_t ilen = pb_read_varint(&scan, part_end);
+					const uint8_t *iend = scan + ilen;
+					while (scan < iend) {
+						uint64_t itag = pb_read_varint(&scan, iend);
+						if ((itag >> 3) == 1 && (itag & 7) == 0) part_size = pb_read_varint(&scan, iend);
+						else pb_skip_field(itag & 7, &scan, iend);
+					}
+				} else {
+					pb_skip_field(pwire, &scan, part_end);
+				}
+			}
+
+			if (strcmp(part_name, target_part) == 0) {
+				char auto_out[PATH_MAX];
+				const char *dest = out_path;
+				if (!dest) {
+					snprintf(auto_out, sizeof(auto_out), "%s.img", part_name);
+					dest = auto_out;
+				}
+				ret = payload_extract_partition_ops(in_fd, data_base, p, part_end, part_name, dest, part_size);
+				break;
+			}
+			p = part_end;
+		} else {
+			pb_skip_field(wire, &p, end);
+		}
+	}
+
+	if (ret != 0 && p >= end) {
+		bb_error_msg("partition '%s' not found in payload '%s'", target_part, payload_path);
+	}
+
+	free(mbuf);
+	close(in_fd);
+	return ret;
+}
+
+static bool is_inner_boot_component(const char *name) {
+	if (!name) return false;
+	return (strcmp(name, "kernel") == 0 ||
+	        strcmp(name, "ramdisk") == 0 ||
+	        strcmp(name, "dtb") == 0 ||
+	        strcmp(name, "kernel_dtb") == 0 ||
+	        strcmp(name, "recovery_dtbo") == 0 ||
+	        strcmp(name, "second") == 0 ||
+	        strcmp(name, "extra") == 0 ||
+	        strcmp(name, "bootconfig") == 0 ||
+	        strcmp(name, "zImage") == 0 ||
+	        strcmp(name, "Image") == 0 ||
+	        strcmp(name, "initrd") == 0);
+}
+
+static bool payload_has_partition(const char *payload_path, const char *part_name) {
+	int in_fd;
+	char magic[4];
+	uint64_t version = 0, manifest_len = 0;
+	off_t off;
+	uint8_t *mbuf;
+	const uint8_t *p, *end;
+	bool found = false;
+
+	if (!payload_path || !part_name) return false;
+	in_fd = open_or_warn(payload_path, O_RDONLY | O_CLOEXEC);
+	if (in_fd < 0) return false;
+	if (full_read(in_fd, magic, 4) != 4 || memcmp(magic, PAYLOAD_MAGIC, 4) != 0) {
+		close(in_fd);
+		return false;
+	}
+	if (full_read(in_fd, &version, 8) != 8 || full_read(in_fd, &manifest_len, 8) != 8) {
+		close(in_fd);
+		return false;
+	}
+	version = SWAP_BE64(version);
+	manifest_len = SWAP_BE64(manifest_len);
+	off = (version >= 2) ? 24 : 20;
+	xlseek(in_fd, off, SEEK_SET);
+
+	mbuf = xmalloc(manifest_len);
+	if (full_read(in_fd, mbuf, manifest_len) != (ssize_t)manifest_len) {
+		free(mbuf);
+		close(in_fd);
+		return false;
+	}
+	close(in_fd);
+
+	p = mbuf;
+	end = mbuf + manifest_len;
+	while (p < end) {
+		uint64_t tag = pb_read_varint(&p, end);
+		if ((tag >> 3) == 13 && (tag & 7) == 2) {
+			uint64_t part_len = pb_read_varint(&p, end);
+			const uint8_t *part_end = p + part_len;
+			const uint8_t *scan = p;
+			while (scan < part_end) {
+				uint64_t ptag = pb_read_varint(&scan, part_end);
+				if ((ptag >> 3) == 1 && (ptag & 7) == 2) {
+					uint64_t nlen = pb_read_varint(&scan, part_end);
+					if (nlen == strlen(part_name) && memcmp(scan, part_name, nlen) == 0) {
+						found = true;
+						break;
+					}
+					scan += nlen;
+				} else {
+					pb_skip_field(ptag & 7, &scan, part_end);
+				}
+			}
+			if (found) break;
+			p = part_end;
+		} else {
+			pb_skip_field(tag & 7, &p, end);
+		}
+	}
+	free(mbuf);
+	return found;
+}
+
+static int payload_extract(const char *payload_path, const char *target, const char *out_path) {
+	if (!target) target = "boot";
+
+	/* 1. Direct partition extraction if payload contains this partition */
+	if (payload_has_partition(payload_path, target)) {
+		return payload_extract_partition(payload_path, target, out_path);
+	}
+
+	/* 2. Inner component extraction (kernel, ramdisk, dtb, etc.) */
+	if (is_inner_boot_component(target)) {
+		char tmp_boot[] = "/tmp/mb_payload_boot_XXXXXX";
+		int fd = xmkstemp(tmp_boot);
+		const char *boot_part = "boot";
+		int ret;
+
+		close(fd);
+		if (!payload_has_partition(payload_path, "boot")) {
+			if (payload_has_partition(payload_path, "init_boot")) {
+				boot_part = "init_boot";
+			} else if (payload_has_partition(payload_path, "vendor_boot")) {
+				boot_part = "vendor_boot";
+			}
+		}
+
+		fprintf(stderr, "[*] Extracting '%s' partition to temporary file for inner component '%s'...\n",
+		        boot_part, target);
+		ret = payload_extract_partition(payload_path, boot_part, tmp_boot);
+		if (ret != 0) {
+			unlink(tmp_boot);
+			return ret;
+		}
+
+		ret = magiskboot_extract_component(tmp_boot, target, out_path, false);
+		unlink(tmp_boot);
+		return ret;
+	}
+
+	bb_error_msg("target '%s' is neither a partition nor an inner component in '%s'", target, payload_path);
+	return 1;
+}
+
+static int payload_extract_all(const char *payload_path, const char *out_dir) {
+	int in_fd;
+	char magic[4];
+	uint64_t version = 0, manifest_len = 0;
+	uint32_t sig_len = 0;
+	off_t data_base;
+	uint8_t *mbuf;
+	const uint8_t *p, *end;
+	int extracted = 0;
+
+	if (!out_dir) out_dir = ".";
+	bb_make_directory((char *)out_dir, 0755, FILEUTILS_RECUR);
+
+	in_fd = open_or_warn(payload_path, O_RDONLY | O_CLOEXEC);
+	if (in_fd < 0) return 1;
+
+	if (full_read(in_fd, magic, 4) != 4 || memcmp(magic, PAYLOAD_MAGIC, 4) != 0) {
+		bb_error_msg("'%s' is not a valid Android OTA payload", payload_path);
+		close(in_fd);
+		return 1;
+	}
+
+	if (full_read(in_fd, &version, 8) != 8 || full_read(in_fd, &manifest_len, 8) != 8) {
+		bb_error_msg("truncated payload header in '%s'", payload_path);
+		close(in_fd);
+		return 1;
+	}
+	version = SWAP_BE64(version);
+	manifest_len = SWAP_BE64(manifest_len);
+
+	if (version >= 2) {
+		if (full_read(in_fd, &sig_len, 4) != 4) {
+			bb_error_msg("truncated payload header in '%s'", payload_path);
+			close(in_fd);
+			return 1;
+		}
+		sig_len = SWAP_BE32(sig_len);
+	}
+
+	data_base = (version >= 2 ? 24 : 20) + manifest_len + sig_len;
+
+	mbuf = xmalloc(manifest_len);
+	if (full_read(in_fd, mbuf, manifest_len) != (ssize_t)manifest_len) {
+		bb_error_msg("failed to read payload manifest from '%s'", payload_path);
+		free(mbuf);
+		close(in_fd);
+		return 1;
+	}
+
+	p = mbuf;
+	end = mbuf + manifest_len;
+
+	while (p < end) {
+		uint64_t tag = pb_read_varint(&p, end);
+		if ((tag >> 3) == 13 && (tag & 7) == 2) {
+			uint64_t part_len = pb_read_varint(&p, end);
+			const uint8_t *part_end = p + part_len;
+			char part_name[64] = {0};
+			uint64_t part_size = 0;
+			char out_file[PATH_MAX];
+			const uint8_t *scan = p;
+
+			while (scan < part_end) {
+				uint64_t ptag = pb_read_varint(&scan, part_end);
+				uint32_t pfield = ptag >> 3;
+				uint32_t pwire = ptag & 7;
+
+				if (pfield == 1 && pwire == 2) {
+					uint64_t nlen = pb_read_varint(&scan, part_end);
+					size_t cp = (nlen < sizeof(part_name) - 1) ? nlen : (sizeof(part_name) - 1);
+					memcpy(part_name, scan, cp);
+					part_name[cp] = '\0';
+					scan += nlen;
+				} else if (pfield == 7 && pwire == 2) {
+					uint64_t ilen = pb_read_varint(&scan, part_end);
+					const uint8_t *iend = scan + ilen;
+					while (scan < iend) {
+						uint64_t itag = pb_read_varint(&scan, iend);
+						if ((itag >> 3) == 1 && (itag & 7) == 0) part_size = pb_read_varint(&scan, iend);
+						else pb_skip_field(itag & 7, &scan, iend);
+					}
+				} else {
+					pb_skip_field(pwire, &scan, part_end);
+				}
+			}
+
+			if (part_name[0]) {
+				snprintf(out_file, sizeof(out_file), "%s/%s.img", out_dir, part_name);
+				if (payload_extract_partition_ops(in_fd, data_base, p, part_end, part_name, out_file, part_size) == 0) {
+					extracted++;
+				}
+			}
+			p = part_end;
+		} else {
+			pb_skip_field(tag & 7, &p, end);
+		}
+	}
+
+	free(mbuf);
+	close(in_fd);
+	printf("[✓] SUCCESS: Extracted %d partitions to '%s'\n", extracted, out_dir);
+	return 0;
+}
+
+static int payload_info(const char *payload_path) {
+	int in_fd;
+	char magic[4];
+	uint64_t version = 0, manifest_len = 0;
+	uint32_t sig_len = 0;
+	off_t data_base;
+	uint8_t *mbuf;
+	const uint8_t *p, *end;
+	int part_count = 0;
+
+	in_fd = open_or_warn(payload_path, O_RDONLY | O_CLOEXEC);
+	if (in_fd < 0) return 1;
+
+	if (full_read(in_fd, magic, 4) != 4 || memcmp(magic, PAYLOAD_MAGIC, 4) != 0) {
+		bb_error_msg("'%s' is not a valid Android OTA payload", payload_path);
+		close(in_fd);
+		return 1;
+	}
+
+	if (full_read(in_fd, &version, 8) != 8 || full_read(in_fd, &manifest_len, 8) != 8) {
+		bb_error_msg("truncated payload header in '%s'", payload_path);
+		close(in_fd);
+		return 1;
+	}
+	version = SWAP_BE64(version);
+	manifest_len = SWAP_BE64(manifest_len);
+
+	if (version >= 2) {
+		if (full_read(in_fd, &sig_len, 4) != 4) {
+			bb_error_msg("truncated payload header in '%s'", payload_path);
+			close(in_fd);
+			return 1;
+		}
+		sig_len = SWAP_BE32(sig_len);
+	}
+
+	data_base = (version >= 2 ? 24 : 20) + manifest_len + sig_len;
+
+	mbuf = xmalloc(manifest_len);
+	if (full_read(in_fd, mbuf, manifest_len) != (ssize_t)manifest_len) {
+		bb_error_msg("failed to read payload manifest from '%s'", payload_path);
+		free(mbuf);
+		close(in_fd);
+		return 1;
+	}
+	close(in_fd);
+
+	printf("Payload Format:       Android OTA Payload (CrAU v%"PRIu64")\n", version);
+	printf("Manifest Size:        %"PRIu64" bytes\n", manifest_len);
+	printf("Signature Size:       %u bytes\n", sig_len);
+	printf("Data Base Offset:     %lld (0x%llx)\n", (long long)data_base, (unsigned long long)data_base);
+	printf("\nPartitions:\n");
+	printf("  %-20s %-16s %-12s\n", "Partition", "Size (Bytes)", "Operations");
+	printf("  --------------------------------------------------\n");
+
+	p = mbuf;
+	end = mbuf + manifest_len;
+
+	while (p < end) {
+		uint64_t tag = pb_read_varint(&p, end);
+		if ((tag >> 3) == 13 && (tag & 7) == 2) {
+			uint64_t part_len = pb_read_varint(&p, end);
+			const uint8_t *part_end = p + part_len;
+			char part_name[64] = {0};
+			uint64_t part_size = 0;
+			int op_count = 0;
+			const uint8_t *scan = p;
+
+			while (scan < part_end) {
+				uint64_t ptag = pb_read_varint(&scan, part_end);
+				uint32_t pfield = ptag >> 3;
+				uint32_t pwire = ptag & 7;
+
+				if (pfield == 1 && pwire == 2) {
+					uint64_t nlen = pb_read_varint(&scan, part_end);
+					size_t cp = (nlen < sizeof(part_name) - 1) ? nlen : (sizeof(part_name) - 1);
+					memcpy(part_name, scan, cp);
+					part_name[cp] = '\0';
+					scan += nlen;
+				} else if (pfield == 7 && pwire == 2) {
+					uint64_t ilen = pb_read_varint(&scan, part_end);
+					const uint8_t *iend = scan + ilen;
+					while (scan < iend) {
+						uint64_t itag = pb_read_varint(&scan, iend);
+						if ((itag >> 3) == 1 && (itag & 7) == 0) part_size = pb_read_varint(&scan, iend);
+						else pb_skip_field(itag & 7, &scan, iend);
+					}
+				} else if (pfield == 8 && pwire == 2) {
+					uint64_t oplen = pb_read_varint(&scan, part_end);
+					scan += oplen;
+					op_count++;
+				} else {
+					pb_skip_field(pwire, &scan, part_end);
+				}
+			}
+
+			if (part_name[0]) {
+				printf("  %-20s %-16"PRIu64" %-12d\n", part_name, part_size, op_count);
+				part_count++;
+			}
+			p = part_end;
+		} else {
+			pb_skip_field(tag & 7, &p, end);
+		}
+	}
+
+	printf("  --------------------------------------------------\n");
+	printf("Total Partitions:     %d\n", part_count);
+
+	free(mbuf);
+	return 0;
 }
 
 /* =========================================================================
@@ -5786,6 +6608,7 @@ int aimg_main(int argc, char **argv) {
 		bool kernel_only = false;
 		bool skip_decomp = false;
 		const char *img;
+		const char *extra_arg = NULL;
 		int idx = 2;
 		if (argc < 3) bb_show_usage();
 		while (idx < argc && argv[idx][0] == '-') {
@@ -5795,8 +6618,19 @@ int aimg_main(int argc, char **argv) {
 			idx++;
 		}
 		if (idx >= argc) bb_show_usage();
-		img = argv[idx];
-		return magiskboot_unpack(img, skip_decomp, hdr_only, kernel_only);
+		img = argv[idx++];
+		if (idx < argc) extra_arg = argv[idx++];
+		if (extra_arg && is_payload_bin(extra_arg) && !is_payload_bin(img)) {
+			const char *tmp = img;
+			img = extra_arg;
+			extra_arg = tmp;
+		}
+		if (is_payload_bin(img)) {
+			if (hdr_only) return payload_info(img);
+			if (kernel_only) return payload_extract(img, "kernel", extra_arg ? extra_arg : KERNEL_FILE);
+			return payload_extract_all(img, extra_arg ? extra_arg : ".");
+		}
+		return magiskboot_unpack(img, skip_decomp, skip_decomp, hdr_only, kernel_only);
 	}
 
 	case CMD_r:
@@ -5822,19 +6656,28 @@ int aimg_main(int argc, char **argv) {
 	case CMD_extract:
 	case CMD_extract_no_dash: {
 		const char *img;
-		const char *comp;
+		const char *comp = NULL;
 		const char *out = NULL;
 		bool skip_decomp = false;
 		int idx = 2;
-		if (argc < 4) bb_show_usage();
+		if (argc < 3) bb_show_usage();
 		if (strcmp(argv[idx], "-n") == 0 || strcmp(argv[idx], "--no-decomp") == 0) {
 			skip_decomp = true;
 			idx++;
 			if (idx >= argc) bb_show_usage();
 		}
 		img = argv[idx++];
-		comp = argv[idx++];
+		if (idx < argc) comp = argv[idx++];
 		if (idx < argc) out = argv[idx];
+		if (is_inner_boot_component(img) && comp && !is_inner_boot_component(comp)) {
+			const char *tmp = img;
+			img = comp;
+			comp = tmp;
+		}
+		if (is_payload_bin(img)) {
+			return payload_extract(img, comp, out);
+		}
+		if (!comp) bb_show_usage();
 		return magiskboot_extract_component(img, comp, out, skip_decomp);
 	}
 
