@@ -150,6 +150,40 @@ fi
 # Sanitize lib list (dups, extra spaces etc)
 LDLIBS=`echo "$LDLIBS" | xargs -n1 | sort | uniq | xargs`
 
+# Prepare stripped and pruned external archives before trial linking
+if test "$LDLIBS"; then
+    STRIP_TOOL="`echo "$CC" | sed 's/gcc$/strip/'`"
+    test -x "$STRIP_TOOL" || STRIP_TOOL="${STRIP:-strip}"
+    AR_TOOL="`echo "$CC" | sed 's/gcc$/ar/'`"
+    test -x "$AR_TOOL" || AR_TOOL="${AR:-ar}"
+    mkdir -p .lib_stripped
+    for one in $LDLIBS; do
+	case "$one" in
+	    c|m|rt|resolv|crypt|dl|pthread)
+		continue
+		;;
+	esac
+	libpath=`$CC $CFLAGS $LDFLAGS -print-file-name="lib${one}.a" 2>/dev/null`
+	if test -f "$libpath"; then
+	    cp -f "$libpath" ".lib_stripped/lib${one}.a"
+	    if test "$one" = "crypto"; then
+		$AR_TOOL d ".lib_stripped/libcrypto.a" \
+		    libcrypto-lib-ecp_sm2p256_table.o 2>/dev/null || true
+	    fi
+	    $STRIP_TOOL --strip-unneeded \
+		--remove-section=.note \
+		--remove-section=.comment \
+		--remove-section=.eh_frame \
+		--remove-section=.eh_frame_hdr \
+		--remove-section=.ARM.attributes \
+		".lib_stripped/lib${one}.a" 2>/dev/null
+	fi
+    done
+    if [ -n "$(ls -A .lib_stripped 2>/dev/null)" ]; then
+	LDFLAGS="-L.lib_stripped $LDFLAGS"
+    fi
+fi
+
 # First link with all libs. If it fails, bail out
 echo "Trying libraries: $LDLIBS"
 # "lib1 lib2 lib3" -> "-llib1 -llib2 -llib3"
@@ -207,26 +241,6 @@ done
 
 # Make the binary with final, minimal list of libs
 echo "Final link with: ${LDLIBS:-<none>}"
-
-# Strip unneeded and unwind sections (.eh_frame, .comment, .note) from external archives
-if test "$LDLIBS"; then
-    STRIP_TOOL="`echo "$CC" | sed 's/gcc$/strip/'`"
-    test -x "$STRIP_TOOL" || STRIP_TOOL="${STRIP:-strip}"
-    mkdir -p .lib_stripped
-    for one in $LDLIBS; do
-	libpath=`$CC $CFLAGS $LDFLAGS -print-file-name="lib${one}.a" 2>/dev/null`
-	if test -f "$libpath"; then
-	    cp -f "$libpath" ".lib_stripped/lib${one}.a"
-	    $STRIP_TOOL --strip-unneeded \
-		--remove-section=.note \
-		--remove-section=.comment \
-		--remove-section=.eh_frame \
-		--remove-section=.eh_frame_hdr \
-		".lib_stripped/lib${one}.a" 2>/dev/null
-	fi
-    done
-    LDFLAGS="-L.lib_stripped $LDFLAGS"
-fi
 l_list=`echo " $LDLIBS $CONFIG_EXTRA_LDLIBS " | sed -e 's: \([^- ][^ ]*\): -l\1:g' -e 's/^ *//'`
 test x"$l_list" != x"" && l_list="$START_GROUP $l_list $END_GROUP"
 # --verbose gives us gobs of info to stdout (e.g. linker script used)

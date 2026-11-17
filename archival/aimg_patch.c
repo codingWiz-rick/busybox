@@ -858,6 +858,31 @@ static void kernel_status_buf(const uint8_t *buf, size_t size, const char *name)
 	if (rkp_patched) {
 		printf("Samsung RKP:         NEUTRALIZED (rkp_skip)\n");
 	}
+
+	{
+		char vermagic[256];
+		struct module_layout_probe probe;
+		vermagic[0] = '\0';
+		extract_vermagic_from_buffer(buf, size, vermagic, sizeof(vermagic));
+		if (vermagic[0]) {
+			printf("Kernel Vermagic:     %s\n", vermagic);
+		}
+
+		memset(&probe, 0, sizeof(probe));
+		if (probe_module_layout_from_buffer(buf, size, &probe) == 0 && probe.found) {
+			printf("Module ABI Engine:   %s\n", probe.has_btf ? "BTF Introspected" : "Silicon Disassembly / Invariant");
+			if (probe.mod_size > 0)
+				printf("  • sizeof(struct module) : %zu bytes (0x%zx)\n", probe.mod_size, probe.mod_size);
+			if (probe.init_off > 0)
+				printf("  • offsetof(init)        : 0x%zx (%zu bytes)\n", probe.init_off, probe.init_off);
+			if (probe.exit_off > 0)
+				printf("  • offsetof(exit)        : 0x%zx (%zu bytes)\n", probe.exit_off, probe.exit_off);
+			if (probe.core_layout_off > 0)
+				printf("  • offsetof(%s) : 0x%zx (%zu bytes)\n",
+				       probe.has_mod_memory ? "mem (Linux 6.4+)" : "core_layout",
+				       probe.core_layout_off, probe.core_layout_off);
+		}
+	}
 	printf("====================================================\n");
 }
 

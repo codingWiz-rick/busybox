@@ -2,10 +2,12 @@
 /*
  * OpenSSL 3.x algorithm pruning stubs for static BusyBox builds
  *
- * Eliminates large precomputed curve tables and unneeded standalone hashes:
+ * Eliminates large precomputed curve tables, unneeded standalone hashes,
+ * and legacy registration lists:
  * - ecp_sm2p256_table.o (524 KB) via EC_GFp_sm2p256_method stub
  * - sm3.o and sm3_prov.o via ossl_sm3_functions stub
  * - ripemd.o and ripemd_prov.o via ossl_ripemd160_functions stub
+ * - c_allc.o and c_alld.o via openssl_add_all_* stubs
  *
  * Licensed under GPLv2 or later.
  */
@@ -36,3 +38,18 @@ const void *EC_GFp_sm2p256_method(void)
  */
 const void *const ossl_sm3_functions = dummy_dispatch;
 const void *const ossl_ripemd160_functions = dummy_dispatch;
+
+/*
+ * 3. Stub out legacy OpenSSL 1.x algorithm registration tables.
+ * Eliminates c_allc.o (DES, RC2, RC4, Camellia, ARIA, Blowfish, CAST, IDEA)
+ * and c_alld.o (MD4, MD5, RIPEMD160, Whirlpool, SM3, BLAKE2).
+ */
+void openssl_add_all_ciphers_int(void);
+void openssl_add_all_ciphers_int(void)
+{
+}
+
+void openssl_add_all_digests_int(void);
+void openssl_add_all_digests_int(void)
+{
+}

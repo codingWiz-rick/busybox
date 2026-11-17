@@ -1435,7 +1435,7 @@ int adb_main(int argc, char **argv)
 	const char *arg;
 	const char *ep;
 	const char *code;
-	char *col;
+	const char *col;
 	size_t hlen;
 	const char *lpath;
 	const char *rpath;

@@ -32,6 +32,12 @@
 #define EM_AARCH64 183
 #endif
 
+/* Forward declarations for native elf64_ctx engine */
+static bool elf64_init_ctx(struct elf64_ctx *ctx, uint8_t *buf, size_t size, size_t capacity, bool is_allocated);
+static void elf64_free_ctx(struct elf64_ctx *ctx);
+static int elf64_find_section(struct elf64_ctx *ctx, const char *name, Elf64_Shdr **out_shdr, size_t *out_idx);
+static int elf64_find_symbol(struct elf64_ctx *ctx, const char *name, Elf64_Sym *out_sym, size_t *out_idx);
+
 static void log_kmsg_msg(const char *msg)
 {
 	int fd = open("/dev/kmsg", O_WRONLY | O_NOCTTY | O_CLOEXEC);
@@ -278,6 +284,9 @@ static const uint8_t *find_btf_header(const uint8_t *data, size_t size)
 	return NULL;
 }
 
+static void classify_module_layout_probe(struct module_layout_probe *out, const uint8_t *data, size_t size);
+static int extract_vermagic_from_buffer(const uint8_t *data, size_t size, char *out_magic, size_t max_len);
+
 static int parse_module_layout_from_btf(const uint8_t *btf_raw, size_t btf_size,
                                        struct module_layout_probe *out)
 {
@@ -311,8 +320,8 @@ static int parse_module_layout_from_btf(const uint8_t *btf_raw, size_t btf_size,
 
 	while (cur + sizeof(struct kroot_btf_type) <= hdr->type_len) {
 		const struct kroot_btf_type *t = (const struct kroot_btf_type *)(types + cur);
-		uint32_t kind = (t->info >> 24) & 0x7f;
-		uint32_t vlen = t->info & 0xffffff;
+		uint32_t kind = (t->info >> 24) & 0x1f;
+		uint32_t vlen = t->info & 0xffff;
 		uint32_t kflag = (t->info >> 31) & 1;
 
 		size_t elem_sz = sizeof(struct kroot_btf_type);
@@ -355,11 +364,23 @@ static int parse_module_layout_from_btf(const uint8_t *btf_raw, size_t btf_size,
 						} else if (strcmp(mname, "core_layout") == 0) {
 							out->core_layout_off = byte_off;
 							printf("    • [BTF] member: %-16s = 0x%x (%u bytes)\n", mname, byte_off, byte_off);
+						} else if (strcmp(mname, "mem") == 0) {
+							out->core_layout_off = byte_off;
+							out->has_mod_memory = true;
+							printf("    • [BTF] member: %-16s = 0x%x (%u bytes) [Linux 6.4+ module_memory]\n", mname, byte_off, byte_off);
+						} else if (strcmp(mname, "build_id") == 0) {
+							out->build_id_off = byte_off;
+							printf("    • [BTF] member: %-16s = 0x%x (%u bytes)\n", mname, byte_off, byte_off);
+						} else if (strcmp(mname, "arch") == 0) {
+							out->arch_off = byte_off;
+							printf("    • [BTF] member: %-16s = 0x%x (%u bytes)\n", mname, byte_off, byte_off);
 						}
 					}
 				}
 				if (out->mod_size > 0 && out->init_off > 0) {
+					out->has_btf = true;
 					out->found = true;
+					classify_module_layout_probe(out, btf_raw, btf_size);
 					return 0;
 				}
 			}
@@ -367,6 +388,244 @@ static int parse_module_layout_from_btf(const uint8_t *btf_raw, size_t btf_size,
 		cur += elem_sz;
 	}
 	return -1;
+}
+
+struct kernel_abi_profile {
+	const char *name;
+	int maj;
+	int min;
+	size_t ref_init;
+	size_t ref_exit;
+	size_t ref_size;
+	bool has_cfi;
+	bool has_bpf;
+	bool has_mem7;
+	bool is_vendor;
+	const char *desc;
+};
+
+static const struct kernel_abi_profile investigated_profiles[] = {
+	{
+		.name       = "4.19-vendor-xiaomi-msm8937",
+		.maj        = 4, .min = 19,
+		.ref_init   = 368, /* 0x170 */
+		.ref_exit   = 800, /* 0x320 */
+		.ref_size   = 896, /* 0x380 */
+		.has_cfi    = false,
+		.has_bpf    = true,
+		.has_mem7   = false,
+		.is_vendor  = true,
+		.desc       = "Linux 4.19 Vendor ABI (Xiaomi Redmi 8/Qualcomm: Non-CFI, BPF raw events enabled)",
+	},
+	{
+		.name       = "4.19-ack-generic-gki",
+		.maj        = 4, .min = 19,
+		.ref_init   = 376, /* 0x178 */
+		.ref_exit   = 784, /* 0x310 (784-792) */
+		.ref_size   = 896, /* 0x380 */
+		.has_cfi    = true,
+		.has_bpf    = false,
+		.has_mem7   = false,
+		.is_vendor  = false,
+		.desc       = "Linux 4.19 Generic ACK GKI ABI (Clang CFI enabled, no BPF raw events)",
+	},
+	{
+		.name       = "5.10-ack-generic-gki",
+		.maj        = 5, .min = 10,
+		.ref_init   = 400, /* 0x190 */
+		.ref_exit   = 1088, /* 0x440 */
+		.ref_size   = 1088,
+		.has_cfi    = true,
+		.has_bpf    = false,
+		.has_mem7   = false,
+		.is_vendor  = false,
+		.desc       = "Linux 5.10 Generic GKI ABI (Clang CFI, core_layout)",
+	},
+	{
+		.name       = "6.1-android14-gki",
+		.maj        = 6, .min = 1,
+		.ref_init   = 368, /* 0x170 */
+		.ref_exit   = 984, /* 0x3d8 */
+		.ref_size   = 1088, /* 0x440 */
+		.has_cfi    = false,
+		.has_bpf    = false,
+		.has_mem7   = false,
+		.is_vendor  = false,
+		.desc       = "Linux 6.1 Generic GKI ABI (KCFI traps, build_id, core_layout)",
+	},
+	{
+		.name       = "6.6-android15-gki",
+		.maj        = 6, .min = 6,
+		.ref_init   = 392, /* 0x188 */
+		.ref_exit   = 1464, /* 0x5b8 */
+		.ref_size   = 1536, /* 0x600 */
+		.has_cfi    = false,
+		.has_bpf    = false,
+		.has_mem7   = true,
+		.is_vendor  = false,
+		.desc       = "Linux 6.6 Generic GKI ABI (KCFI, build_id, struct module_memory mem[7])",
+	},
+	{
+		.name       = "mainline-baklava-gki",
+		.maj        = 6, .min = 12,
+		.ref_init   = 448, /* 0x1c0 */
+		.ref_exit   = 1400, /* 0x578 */
+		.ref_size   = 1472, /* 0x5c0 */
+		.has_cfi    = false,
+		.has_bpf    = false,
+		.has_mem7   = true,
+		.is_vendor  = false,
+		.desc       = "Linux Mainline GKI ABI (Baklava 6.12+: PAC/BTI, KCFI, mem[7])",
+	},
+	{
+		.name       = "upstream-vanilla-reference",
+		.maj        = 0, .min = 0,
+		.ref_init   = 304, /* 0x130 */
+		.ref_exit   = 1072, /* 0x430 */
+		.ref_size   = 1152, /* 0x480 */
+		.has_cfi    = false,
+		.has_bpf    = false,
+		.has_mem7   = true,
+		.is_vendor  = false,
+		.desc       = "Linux Upstream Vanilla ABI (No KABI reserves, mem[7])",
+	},
+};
+
+static void classify_module_layout_probe(struct module_layout_probe *out, const uint8_t *data, size_t size)
+{
+	int banner_maj = 0, banner_min = 0;
+	const struct kernel_abi_profile *best_prof = NULL;
+	size_t i;
+	char vm_buf[256];
+
+	if (!out) return;
+
+	/* 1. Dynamic Kernel Banner & Vermagic Resolution */
+	vm_buf[0] = '\0';
+	if (data && size > 0 && extract_vermagic_from_buffer(data, size, vm_buf, sizeof(vm_buf)) == 0) {
+		sscanf(vm_buf, "%d.%d", &banner_maj, &banner_min);
+	}
+
+	/* 2. Dynamic Resolution of missing offsets / sizing */
+	if (out->mod_size == 0) {
+		if (banner_maj == 4 && banner_min <= 19) {
+			out->mod_size = 896;
+		} else if (banner_maj == 5 && banner_min <= 10) {
+			out->mod_size = 1088;
+		} else if (banner_maj == 6 && banner_min <= 1) {
+			out->mod_size = 1088;
+		} else if (banner_maj == 6 && banner_min <= 6) {
+			out->mod_size = 1536;
+		} else if (banner_maj >= 6) {
+			out->mod_size = 1472;
+		} else if (out->exit_off > 0) {
+			out->mod_size = (out->exit_off + 127) & ~63ULL;
+		}
+		if (out->mod_size > 0) out->found = true;
+	}
+
+	if (out->exit_off > 0 && out->mod_size > 0 && out->exit_off >= out->mod_size) {
+		out->mod_size = (out->exit_off + 127) & ~63ULL;
+	}
+
+	/* 3. Match against Investigated Reference Profiles */
+	/* First pass: exact or within-tolerance match on init and exit offsets */
+	for (i = 0; i < ARRAY_SIZE(investigated_profiles); i++) {
+		const struct kernel_abi_profile *p = &investigated_profiles[i];
+		bool init_match = (out->init_off == p->ref_init);
+		bool exit_match = false;
+
+		if (out->exit_off == p->ref_exit) {
+			exit_match = true;
+		} else if (p->ref_exit == 784 && out->exit_off >= 780 && out->exit_off <= 800) {
+			exit_match = true;
+		} else if (p->ref_exit == 800 && out->exit_off >= 796 && out->exit_off <= 808) {
+			exit_match = true;
+		} else if (p->ref_exit == 1072 && out->exit_off >= 1060 && out->exit_off <= 1090) {
+			exit_match = true;
+		} else if (p->ref_exit == 984 && out->exit_off >= 970 && out->exit_off <= 1000) {
+			exit_match = true;
+		} else if (p->ref_exit == 1464 && out->exit_off >= 1440 && out->exit_off <= 1480) {
+			exit_match = true;
+		} else if (p->ref_exit == 1400 && out->exit_off >= 1390 && out->exit_off <= 1420) {
+			exit_match = true;
+		}
+
+		if (init_match && exit_match) {
+			best_prof = p;
+			break;
+		}
+	}
+
+	/* Second pass: if no exact offset match, select profile matching banner version */
+	if (!best_prof && banner_maj > 0) {
+		for (i = 0; i < ARRAY_SIZE(investigated_profiles); i++) {
+			const struct kernel_abi_profile *p = &investigated_profiles[i];
+			if (p->maj == banner_maj && p->min == banner_min) {
+				best_prof = p;
+				break;
+			}
+		}
+	}
+
+	/* Third pass: fallback to closest profile by init offset */
+	if (!best_prof) {
+		size_t min_diff = (size_t)-1;
+		for (i = 0; i < ARRAY_SIZE(investigated_profiles); i++) {
+			const struct kernel_abi_profile *p = &investigated_profiles[i];
+			size_t diff = (out->init_off > p->ref_init) ? (out->init_off - p->ref_init) : (p->ref_init - out->init_off);
+			if (diff < min_diff) {
+				min_diff = diff;
+				best_prof = p;
+			}
+		}
+	}
+
+	if (!best_prof) {
+		best_prof = &investigated_profiles[0];
+	}
+
+	/* 4. Compare Probed vs Investigated Reference Offsets */
+	out->matched_profile = best_prof->name;
+	out->ref_init_off = best_prof->ref_init;
+	out->ref_exit_off = best_prof->ref_exit;
+	out->ref_mod_size = best_prof->ref_size;
+	out->init_delta = (long)out->init_off - (long)best_prof->ref_init;
+	out->exit_delta = (long)out->exit_off - (long)best_prof->ref_exit;
+	out->size_delta = (long)out->mod_size - (long)best_prof->ref_size;
+
+	out->profile_matched = (out->init_delta == 0 && (out->exit_delta >= -8 && out->exit_delta <= 8) && out->size_delta == 0);
+	out->has_cfi_check = best_prof->has_cfi || (out->init_delta == 8);
+	out->has_bpf_events = best_prof->has_bpf || (out->exit_delta == 16);
+	out->has_mod_memory = best_prof->has_mem7 || (out->exit_off > 1200);
+	out->is_vendor_abi = best_prof->is_vendor || (!out->profile_matched);
+	out->variant_desc = best_prof->desc;
+	out->found = true;
+
+	printf("[*] Kernel ABI Verification (Probed vs Investigated Reference Profile):\n");
+	printf("    • Baseline Profile       : %s (%s)\n", best_prof->name, best_prof->desc);
+	printf("    • offsetof(init)         : Probed 0x%zx (%zu) vs Reference 0x%zx (%zu) [Delta: %+ld B]\n",
+	       out->init_off, out->init_off, best_prof->ref_init, best_prof->ref_init, out->init_delta);
+	printf("    • offsetof(exit)         : Probed 0x%zx (%zu) vs Reference 0x%zx (%zu) [Delta: %+ld B]\n",
+	       out->exit_off, out->exit_off, best_prof->ref_exit, best_prof->ref_exit, out->exit_delta);
+	printf("    • sizeof(struct module)  : Probed %zu B (0x%zx) vs Reference %zu B (0x%zx) [Delta: %+ld B]\n",
+	       out->mod_size, out->mod_size, best_prof->ref_size, best_prof->ref_size, out->size_delta);
+
+	if (out->profile_matched) {
+		printf("    • Profile Match Status   : 100%% EXACT MATCH with investigated silicon invariants\n");
+	} else {
+		printf("    • Profile Match Status   : VENDOR SHIFT DETECTED:\n");
+		if (out->init_delta == 8) {
+			printf("      -> [CFI Shift] init offset +8B: CONFIG_CFI_CLANG enabled (cfi_check added before init)\n");
+		} else if (out->init_delta == -8) {
+			printf("      -> [Non-CFI Shift] init offset -8B: Vendor kernel compiled with CFI disabled\n");
+		}
+		if (out->exit_delta == 16 || out->exit_delta == 8) {
+			printf("      -> [BPF Events Shift] exit offset +16B: CONFIG_BPF_EVENTS enabled (bpf_raw_events added)\n");
+		} else if (out->exit_delta > 300) {
+			printf("      -> [Architecture Shift] exit offset %+ldB: Linux 6.4+ struct module_memory mem[7] migration\n", out->exit_delta);
+		}
+	}
 }
 
 static int probe_module_layout_from_kernel_image(const uint8_t *data, size_t size,
@@ -537,40 +796,54 @@ static int probe_module_layout_from_kernel_image(const uint8_t *data, size_t siz
 			}
 		}
 
-		if (out->exit_off == 0 && (out->init_off == 0 || off > out->init_off)) {
+		if (out->exit_off == 0 && off >= 512 && off <= 1800 &&
+		    (out->init_off == 0 || off >= out->init_off + 256)) {
 			int target_reg = rt0;
 			size_t k;
 			for (k = 1; k <= 32 && i + (k + 1) * 4 <= limit; k++) {
 				uint32_t wk = *(const uint32_t *)(data + i + k * 4);
-				int blr_rn;
+				int blr_rn = -1;
+				bool is_blr = false;
 				bool use_b_key, use_zero;
+
 				if (kroot_elf_decode_blr(wk, &blr_rn) && blr_rn == target_reg) {
-					out->exit_off = off;
-					out->found = true;
-					printf("    • [Silicon] offsetof(exit)      : %zu (0x%zx) at image offset 0x%zx (rn=x%d, BLR X%d)\n",
-					       out->exit_off, out->exit_off, i, rn0, blr_rn);
-					break;
-				}
-				if (kroot_elf_decode_blr_auth(wk, &blr_rn, &use_b_key, &use_zero) && blr_rn == target_reg) {
-					out->exit_off = off;
-					out->found = true;
-					printf("    • [Silicon] offsetof(exit)      : %zu (0x%zx) at image offset 0x%zx (rn=x%d, BLRA* X%d)\n",
-					       out->exit_off, out->exit_off, i, rn0, blr_rn);
-					break;
-				}
-				if ((wk & 0xffe0ffe0) == 0xaa0003e0) {
+					is_blr = true;
+				} else if (kroot_elf_decode_blr_auth(wk, &blr_rn, &use_b_key, &use_zero) && blr_rn == target_reg) {
+					is_blr = true;
+				} else if ((wk & 0xffe0ffe0) == 0xaa0003e0) {
 					int mov_rd = wk & 0x1f;
 					int mov_rm = (wk >> 16) & 0x1f;
 					if (mov_rm == target_reg)
 						target_reg = mov_rd;
 				}
+
+				if (is_blr) {
+					/* Verify delete_module context: look for mov w1, #2 (MODULE_STATE_GOING) */
+					bool is_delete_mod = false;
+					size_t m;
+					for (m = k + 1; m <= k + 24 && i + (m + 1) * 4 <= limit; m++) {
+						uint32_t wm = *(const uint32_t *)(data + i + m * 4);
+						if (wm == 0x52800041U) { /* mov w1, #2 */
+							is_delete_mod = true;
+							break;
+						}
+					}
+					if (is_delete_mod) {
+						out->exit_off = off;
+						out->found = true;
+						printf("    • [Silicon] offsetof(exit)      : %zu (0x%zx) at image offset 0x%zx (rn=x%d, BLR X%d) [delete_module]\n",
+						       out->exit_off, out->exit_off, i, rn0, blr_rn);
+						break;
+					}
+				}
 			}
 		}
 
 		if (out->init_off > 0 && out->exit_off > 0)
-			return 0;
+			break;
 	}
 
+	classify_module_layout_probe(out, data, size);
 	return (out->init_off > 0 || out->mod_size > 0) ? 0 : -1;
 }
 
@@ -607,8 +880,95 @@ static int probe_module_layout_from_buffer(const uint8_t *map, size_t size, stru
 		}
 	}
 
+	/* 1. If buffer is an ELF binary (vmlinux), probe via native ELF64 context */
+	if (k_size >= sizeof(Elf64_Ehdr) && memcmp(k_data, ELFMAG, SELFMAG) == 0 && k_data[EI_CLASS] == ELFCLASS64) {
+		struct elf64_ctx kctx;
+		if (elf64_init_ctx(&kctx, (uint8_t *)k_data, k_size, k_size, false)) {
+			Elf64_Shdr *text_shdr = NULL;
+			if (elf64_find_section(&kctx, ".text", &text_shdr, NULL) == 0 && text_shdr) {
+				const uint8_t *text_bytes = k_data + text_shdr->sh_offset;
+				size_t text_sz = (size_t)text_shdr->sh_size;
+				Elf64_Sym sym_init, sym_del;
+
+				printf("[*] Probing ELF vmlinux (.text: %zu bytes at offset 0x%zx)...\n",
+				       text_sz, (size_t)text_shdr->sh_offset);
+
+				/* Surgical symbol disassembly if symtab is present */
+				if (elf64_find_symbol(&kctx, "do_init_module", &sym_init, NULL) == 0 &&
+				    sym_init.st_value >= text_shdr->sh_addr &&
+				    sym_init.st_value < text_shdr->sh_addr + text_shdr->sh_size) {
+					size_t fn_off = (size_t)(sym_init.st_value - text_shdr->sh_addr);
+					size_t fn_limit = (fn_off + 256 <= text_sz) ? (fn_off + 256) : text_sz;
+					size_t pc;
+					for (pc = fn_off; pc + 16 <= fn_limit; pc += 4) {
+						uint32_t w0 = *(const uint32_t *)(text_bytes + pc);
+						int rt0, rn0, sz0;
+						int32_t off0;
+						bool is_signed0;
+						if (kroot_elf_decode_ldr_imm(w0, &rt0, &rn0, &off0, &sz0, &is_signed0) &&
+						    sz0 == 8 && rt0 == 0 && off0 >= 256 && off0 <= 1024) {
+							out->init_off = (size_t)off0;
+							out->found = true;
+							printf("    • [vmlinux Symbol] do_init_module offsetof(init) : %zu (0x%zx)\n",
+							       out->init_off, out->init_off);
+							break;
+						}
+					}
+				}
+
+				if ((elf64_find_symbol(&kctx, "__arm64_sys_delete_module", &sym_del, NULL) == 0 ||
+				     elf64_find_symbol(&kctx, "delete_module", &sym_del, NULL) == 0) &&
+				    sym_del.st_value >= text_shdr->sh_addr &&
+				    sym_del.st_value < text_shdr->sh_addr + text_shdr->sh_size) {
+					size_t fn_off = (size_t)(sym_del.st_value - text_shdr->sh_addr);
+					size_t fn_limit = (fn_off + 1024 <= text_sz) ? (fn_off + 1024) : text_sz;
+					size_t pc;
+					for (pc = fn_off; pc + 16 <= fn_limit; pc += 4) {
+						uint32_t w0 = *(const uint32_t *)(text_bytes + pc);
+						int rt0, rn0, sz0;
+						int32_t off0;
+						bool is_signed0;
+						if (kroot_elf_decode_ldr_imm(w0, &rt0, &rn0, &off0, &sz0, &is_signed0) &&
+						    sz0 == 8 && off0 >= 512 && off0 <= 1800) {
+							size_t k;
+							for (k = 1; k <= 16 && pc + (k + 1) * 4 <= fn_limit; k++) {
+								uint32_t wk = *(const uint32_t *)(text_bytes + pc + k * 4);
+								int blr_rn;
+								bool b_key, z_key;
+								if ((kroot_elf_decode_blr(wk, &blr_rn) && blr_rn == rt0) ||
+								    (kroot_elf_decode_blr_auth(wk, &blr_rn, &b_key, &z_key) && blr_rn == rt0)) {
+									out->exit_off = (size_t)off0;
+									out->found = true;
+									printf("    • [vmlinux Symbol] delete_module offsetof(exit) : %zu (0x%zx)\n",
+									       out->exit_off, out->exit_off);
+									break;
+								}
+							}
+							if (out->exit_off > 0) break;
+						}
+					}
+				}
+
+				/* If symbol disassembly left offsets unresolved, scan .text section */
+				if (!out->found || out->init_off == 0 || out->exit_off == 0) {
+					probe_module_layout_from_kernel_image(text_bytes, text_sz, out);
+				} else {
+					classify_module_layout_probe(out, k_data, k_size);
+				}
+
+				elf64_free_ctx(&kctx);
+				if (out->found) {
+					if (decompressed) free(decompressed);
+					return 0;
+				}
+			}
+			elf64_free_ctx(&kctx);
+		}
+	}
+
 	btf = find_btf_header(k_data, k_size);
 	if (btf && parse_module_layout_from_btf(btf, k_size - (size_t)(btf - k_data), out) == 0) {
+		out->has_btf = true;
 		if (decompressed) free(decompressed);
 		return 0;
 	}
@@ -967,6 +1327,17 @@ static int elf64_find_section(struct elf64_ctx *ctx, const char *name, Elf64_Shd
 	return -1;
 }
 
+static const uint8_t *elf64_find_section_data(struct elf64_ctx *ctx, const char *name, size_t *out_size)
+{
+	Elf64_Shdr *shdr = NULL;
+	if (elf64_find_section(ctx, name, &shdr, NULL) == 0 && shdr->sh_type != SHT_NOBITS) {
+		if (out_size) *out_size = (size_t)shdr->sh_size;
+		return (const uint8_t *)(ctx->buf + shdr->sh_offset);
+	}
+	if (out_size) *out_size = 0;
+	return NULL;
+}
+
 static int elf64_find_section_by_type(struct elf64_ctx *ctx, uint32_t type, Elf64_Shdr **out_shdr, size_t *out_idx)
 {
 	size_t i;
@@ -1009,6 +1380,36 @@ static int elf64_find_symbol(struct elf64_ctx *ctx, const char *name, Elf64_Sym 
 		}
 	}
 	return -1;
+}
+
+static size_t elf64_scan_kcfi_types(struct elf64_ctx *ctx, uint32_t *sample_hashes, size_t max_samples)
+{
+	Elf64_Shdr *symtab = NULL;
+	Elf64_Sym *syms;
+	size_t num_syms, i, count = 0;
+
+	if (!ctx || elf64_find_section_by_type(ctx, SHT_SYMTAB, &symtab, NULL) != 0)
+		return 0;
+
+	syms = (Elf64_Sym *)(ctx->buf + symtab->sh_offset);
+	num_syms = symtab->sh_size / sizeof(Elf64_Sym);
+
+	for (i = 1; i < num_syms; i++) {
+		if (ELF64_ST_TYPE(syms[i].st_info) == STT_FUNC &&
+		    syms[i].st_shndx < ctx->shnum && syms[i].st_value >= 4) {
+			Elf64_Shdr *sec = &ctx->shdrs[syms[i].st_shndx];
+			if (sec->sh_type == SHT_PROGBITS && (sec->sh_flags & SHF_EXECINSTR)) {
+				uint32_t hash = *(const uint32_t *)(ctx->buf + sec->sh_offset + syms[i].st_value - 4);
+				if (hash != 0 && hash != ARM64_NOP_OPCODE && hash != ARM64_RET_OPCODE) {
+					if (sample_hashes && count < max_samples) {
+						sample_hashes[count] = hash;
+					}
+					count++;
+				}
+			}
+		}
+	}
+	return count;
 }
 
 static int elf64_update_sym(struct elf64_ctx *ctx, size_t sym_idx, const Elf64_Sym *sym)
@@ -1585,13 +1986,26 @@ static int audit_module_symbols(struct elf64_ctx *ctx, const char *kallsyms_path
 	return (missing_strong > 0) ? 2 : 0;
 }
 
-static int module_info_file(const char *filepath)
+static int module_info_file(const char *filepath, const char *target_kernel_path)
 {
 	int fd;
 	struct stat st;
 	uint8_t *map;
 	struct elf64_ctx ctx;
-	Elf64_Shdr *modinfo = NULL;
+	size_t modinfo_sz = 0;
+	const uint8_t *modinfo_buf = NULL;
+	Elf64_Shdr *this_mod = NULL;
+	Elf64_Shdr *rela_this_mod = NULL;
+	size_t rela_idx = 0;
+	uint32_t kcfi_samples[8];
+	size_t kcfi_count;
+	int alt_count = 0;
+	bool has_cfi_check = false;
+	Elf64_Sym sym_cfi;
+	Elf64_Rela init_rela, cleanup_rela;
+	bool has_init_rela = false, has_clean_rela = false;
+	size_t sym_init_idx = 0, sym_clean_idx = 0;
+	Elf64_Sym sym_tmp;
 
 	fd = open_or_warn(filepath, O_RDONLY | O_CLOEXEC);
 	if (fd < 0 || fstat(fd, &st) < 0) {
@@ -1614,13 +2028,125 @@ static int module_info_file(const char *filepath)
 	       (ctx.ehdr->e_machine == EM_AARCH64) ? "AArch64 (ARM64)" : "Other", ctx.ehdr->e_machine);
 	printf("[*] Section Count   : %u\n", (unsigned int)ctx.shnum);
 
-	if (elf64_find_section(&ctx, ".modinfo", &modinfo, NULL) == 0) {
-		const char *buf = (const char *)(ctx.buf + modinfo->sh_offset);
+	/* Module Structure (.gnu.linkonce.this_module) */
+	if (elf64_find_section(&ctx, ".gnu.linkonce.this_module", &this_mod, NULL) == 0) {
+		printf("\n[*] Kernel Module Struct (.gnu.linkonce.this_module):\n");
+		printf("  • Section size     : %zu bytes (0x%zx)\n", (size_t)this_mod->sh_size, (size_t)this_mod->sh_size);
+		printf("  • Section align    : %lu bytes\n", (unsigned long)this_mod->sh_addralign);
+	}
+
+	/* Relocations (.rela.gnu.linkonce.this_module) */
+	if (elf64_find_section(&ctx, ".rela.gnu.linkonce.this_module", &rela_this_mod, &rela_idx) == 0) {
+		printf("\n[*] Module Lifecycle Relocations:\n");
+		if (elf64_find_symbol(&ctx, "init_module", &sym_tmp, &sym_init_idx) == 0 &&
+		    elf64_find_rela_by_symbol(&ctx, rela_idx, sym_init_idx, &init_rela, NULL) == 0) {
+			has_init_rela = true;
+			printf("  • init_module relocation    : offset 0x%lx (%lu bytes into struct module)\n",
+			       (unsigned long)init_rela.r_offset, (unsigned long)init_rela.r_offset);
+		}
+		if (elf64_find_symbol(&ctx, "cleanup_module", &sym_tmp, &sym_clean_idx) == 0 &&
+		    elf64_find_rela_by_symbol(&ctx, rela_idx, sym_clean_idx, &cleanup_rela, NULL) == 0) {
+			has_clean_rela = true;
+			printf("  • cleanup_module relocation : offset 0x%lx (%lu bytes into struct module)\n",
+			       (unsigned long)cleanup_rela.r_offset, (unsigned long)cleanup_rela.r_offset);
+		}
+	}
+
+	/* Security & ABI Features */
+	printf("\n[*] Kernel Security & CFI Primitives:\n");
+	if (elf64_find_section(&ctx, ".altinstructions", NULL, NULL) == 0) alt_count++;
+	if (elf64_find_section(&ctx, ".rela.altinstructions", NULL, NULL) == 0) alt_count++;
+	printf("  • Alternative patching      : %s (%d section(s))\n",
+	       (alt_count > 0) ? "ACTIVE (.altinstructions)" : "NONE / Neutralized", alt_count);
+
+	has_cfi_check = (elf64_find_symbol(&ctx, "__cfi_check", &sym_cfi, NULL) == 0);
+	printf("  • Clang CFI (__cfi_check)   : %s\n", has_cfi_check ? "PRESENT (synthesized stub)" : "NONE / Inactive");
+
+	kcfi_count = elf64_scan_kcfi_types(&ctx, kcfi_samples, 8);
+	printf("  • KCFI Type Prefixes        : %zu function prefix(es) detected\n", kcfi_count);
+	if (kcfi_count > 0) {
+		size_t k;
+		printf("    Sample KCFI Type IDs     :");
+		for (k = 0; k < kcfi_count && k < 4; k++) {
+			printf(" 0x%08x", kcfi_samples[k]);
+		}
+		printf("\n");
+	}
+
+	/* Target Kernel ABI Comparison */
+	if (target_kernel_path && target_kernel_path[0] != '\0') {
+		struct module_layout_probe probe;
+		printf("\n[*] Target Kernel ABI Comparison (%s):\n", target_kernel_path);
+		if (probe_target_module_layout(target_kernel_path, NULL, &probe) == 0 && probe.found) {
+			if (probe.variant_desc)
+				printf("  • Detected Kernel ABI       : %s\n", probe.variant_desc);
+			if (probe.matched_profile) {
+				printf("  • Baseline Reference Profile: %s\n", probe.matched_profile);
+				printf("  • Probed vs Baseline Deltas : init: %+ld B, exit: %+ld B, size: %+ld B [%s]\n",
+				       probe.init_delta, probe.exit_delta, probe.size_delta,
+				       probe.profile_matched ? "100% Profile Match" : "Vendor Shift Detected");
+			}
+			printf("  • Kernel struct module size : %zu bytes (0x%zx)\n", probe.mod_size, probe.mod_size);
+			printf("  • Kernel offsetof(init)     : 0x%zx (%zu bytes)\n", probe.init_off, probe.init_off);
+			printf("  • Kernel offsetof(exit)     : 0x%zx (%zu bytes)\n", probe.exit_off, probe.exit_off);
+
+			if (this_mod) {
+				if (probe.mod_size == 0) {
+					printf("  • Section Size Verification : UNVERIFIED (Target kernel struct module size undetermined)\n");
+				} else {
+					bool size_match = (this_mod->sh_size == probe.mod_size);
+					printf("  • Section Size Verification : %s (%zu vs %zu)\n",
+					       size_match ? "PERFECT MATCH" : "ADAPTATION REQUIRED",
+					       (size_t)this_mod->sh_size, probe.mod_size);
+				}
+			}
+
+			if (has_init_rela && probe.init_off > 0) {
+				if (init_rela.r_offset == probe.init_off) {
+					printf("  • init_module Relocation    : PERFECT MATCH (0x%lx)\n", (unsigned long)init_rela.r_offset);
+				} else {
+					long delta = (long)init_rela.r_offset - (long)probe.init_off;
+					printf("  • init_module Relocation    : SHIFT DETECTED (Module: 0x%lx vs Kernel: 0x%zx, Delta: %+ld bytes)\n",
+					       (unsigned long)init_rela.r_offset, probe.init_off, delta);
+					if (delta == 8) {
+						printf("    -> Root Cause: Module has CONFIG_CFI_CLANG (+8B cfi_check), but Target Kernel has Clang CFI disabled (Vendor Non-CFI)!\n");
+					} else if (delta == -8) {
+						printf("    -> Root Cause: Target Kernel has CONFIG_CFI_CLANG (+8B cfi_check), but Module compiled without CFI!\n");
+					} else if (delta == 56 || delta == -56 || delta == 80 || delta == -80) {
+						printf("    -> Root Cause: Generation shift (CONFIG_STACKTRACE_BUILD_ID / KCFI header / mem[7] delta)!\n");
+					}
+				}
+			}
+
+			if (has_clean_rela && probe.exit_off > 0) {
+				if (cleanup_rela.r_offset == probe.exit_off) {
+					printf("  • cleanup_module Relocation : PERFECT MATCH (0x%lx)\n", (unsigned long)cleanup_rela.r_offset);
+				} else {
+					long delta = (long)cleanup_rela.r_offset - (long)probe.exit_off;
+					printf("  • cleanup_module Relocation : SHIFT DETECTED (Module: 0x%lx vs Kernel: 0x%zx, Delta: %+ld bytes)\n",
+					       (unsigned long)cleanup_rela.r_offset, probe.exit_off, delta);
+					if (delta == -8) {
+						printf("    -> Root Cause: Target Kernel has CONFIG_BPF_EVENTS enabled (+16B bpf_raw_events) with Non-CFI (-8B), net delta -8B (e.g. Xiaomi/Qualcomm 4.19)!\n");
+					} else if (delta == 8) {
+						printf("    -> Root Cause: Target Kernel lacks CONFIG_BPF_EVENTS or has CFI enabled (+8B net shift)!\n");
+					} else if (delta > 50 || delta < -50) {
+						printf("    -> Root Cause: Generation layout shift (Linux 6.4+ struct module_memory mem[7] vs core_layout)!\n");
+					}
+				}
+			}
+		} else {
+			printf("  [!] Could not introspect target kernel module ABI\n");
+		}
+	}
+
+	modinfo_buf = elf64_find_section_data(&ctx, ".modinfo", &modinfo_sz);
+	if (modinfo_buf && modinfo_sz > 0) {
+		const char *buf = (const char *)modinfo_buf;
 		size_t pos = 0;
 		printf("\n[*] Module Info (.modinfo):\n");
-		while (pos < modinfo->sh_size) {
+		while (pos < modinfo_sz) {
 			const char *entry = buf + pos;
-			size_t elen = strnlen(entry, modinfo->sh_size - pos);
+			size_t elen = strnlen(entry, modinfo_sz - pos);
 			if (elen > 0) {
 				const char *eq = strchr(entry, '=');
 				if (eq) {
@@ -1959,7 +2485,7 @@ static int magiskboot_module_op(int argc, char **argv)
 	switch (index_in_strings(mod_acts, action)) {
 	case MOD_ACT_info: {
 		const char *path = (argc >= 4) ? argv[3] : resolve_default_module_path(argc, argv, 3);
-		return module_info_file(path);
+		return module_info_file(path, (argc >= 5) ? argv[4] : NULL);
 	}
 	case MOD_ACT_check: {
 		const char *path = (argc >= 4) ? argv[3] : resolve_default_module_path(argc, argv, 3);

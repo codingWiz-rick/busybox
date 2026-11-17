@@ -732,7 +732,26 @@ struct module_layout_probe {
 	size_t init_off;
 	size_t exit_off;
 	size_t core_layout_off;
+	size_t arch_off;
+	size_t build_id_off;
 	size_t header_len;
+	bool   has_btf;
+	bool   has_mod_memory; /* Linux 6.4+ struct module_memory mem[7] */
+	bool   has_cfi_check;  /* CONFIG_CFI_CLANG (+8 bytes before init) */
+	bool   has_bpf_events; /* CONFIG_BPF_EVENTS (+16 bytes before exit) */
+	bool   is_vendor_abi;  /* Detected vendor configuration variant */
+	const char *variant_desc; /* Detailed vendor/config classification */
+
+	/* Dynamic Probed vs Reference Baseline Comparison */
+	const char *matched_profile;  /* Name of investigated baseline profile */
+	size_t ref_init_off;          /* Investigated reference baseline init offset */
+	size_t ref_exit_off;          /* Investigated reference baseline exit offset */
+	size_t ref_mod_size;          /* Investigated reference baseline module size */
+	long   init_delta;            /* Probed init - Reference init delta */
+	long   exit_delta;            /* Probed exit - Reference exit delta */
+	long   size_delta;            /* Probed size - Reference size delta */
+	bool   profile_matched;       /* True if probed offsets match investigated baseline */
+
 	bool   found;
 };
 

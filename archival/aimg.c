@@ -6353,7 +6353,7 @@ static int magiskboot_patch_cmdline_op(int argc, char **argv) {
 				cmdline_modify(target, "rm", expr + 1, NULL);
 			} else {
 				const char *arg_str = (expr[0] == '+') ? expr + 1 : expr;
-				char *eq = strchr(arg_str, '=');
+				const char *eq = strchr(arg_str, '=');
 				if (eq) {
 					char *k = xstrndup(arg_str, eq - arg_str);
 					cmdline_modify(target, "patch", k, eq + 1);
@@ -6430,7 +6430,7 @@ static int magiskboot_patch_cmdline_op(int argc, char **argv) {
 			}
 		} else {
 			const char *arg_str = (expr[0] == '+') ? expr + 1 : expr;
-			char *eq = strchr(arg_str, '=');
+			const char *eq = strchr(arg_str, '=');
 			char *key;
 			size_t klen;
 			bool found = false;
@@ -7863,7 +7863,8 @@ int aimg_main(int argc, char **argv) {
 
 	case CMD_mod_info:
 	case CMD_mod_info_no_dash:
-		return module_info_file((argc >= 3) ? argv[2] : resolve_default_module_path(argc, argv, 2));
+		return module_info_file((argc >= 3) ? argv[2] : resolve_default_module_path(argc, argv, 2),
+		                        (argc >= 4) ? argv[3] : NULL);
 
 	case CMD_mod_audit:
 	case CMD_mod_audit_no_dash: {

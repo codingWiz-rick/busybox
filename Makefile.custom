@@ -228,7 +228,7 @@ $(1):
 	@if [ -z "$$(TARGET)" ] || [ "$$(TARGET)" = "busybox" ]; then \
 		mkdir -p $(BIN_DIR); \
 		cp -f $$(if $$(srctree),$$(srctree),.)/busybox $(BIN_DIR)/busybox-$(5); \
-		$$(if $(3),$(3)strip,strip) -s -R .note -R .comment -R .eh_frame -R .eh_frame_hdr $(BIN_DIR)/busybox-$(5) 2>/dev/null || true; \
+		$$(if $(3),$(3)strip,strip) -s -R .note -R .note.gnu.build-id -R .note.ABI-tag -R .comment -R .eh_frame -R .eh_frame_hdr -R .ARM.attributes $(BIN_DIR)/busybox-$(5) 2>/dev/null || true; \
 		sz=`stat -c '%s' $(BIN_DIR)/busybox-$(5)`; \
 		sz_fmt=`awk -v b="$$$$sz" 'BEGIN { printf "%d bytes (%.2f KB / %.2f MB)", b, b/1024, b/1048576 }'`; \
 		mach=`readelf -h $(BIN_DIR)/busybox-$(5) 2>/dev/null | awk -F: '/Machine:/ {gsub(/^[ \t]+/, "", $$$$2); print $$$$2}'`; \
