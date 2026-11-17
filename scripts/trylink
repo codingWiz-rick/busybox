@@ -76,6 +76,12 @@ EXE="$1"
 CC="$2"
 CFLAGS="$3"
 LDFLAGS="$4"
+
+# Dynamic LLD detection: Use LLD_BIN if configured by Makefile/environment, or check system ld.lld
+if test -n "$LLD_BIN" && test -x "$LLD_BIN/ld.lld"; then
+    LDFLAGS="-static -fuse-ld=lld -B$LLD_BIN -Wl,--icf=all -Wl,-O2 -Wl,--no-eh-frame-hdr -Wl,-z,max-page-size=4096 $LDFLAGS"
+fi
+
 O_FILES="$5"
 A_FILES="$6"
 # We try to drop libraries from LDLIBS if build works without them,

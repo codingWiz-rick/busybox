@@ -98,5 +98,6 @@ ramdisk*
 .config
 .config.old
 .version
+Makefile.local
 *.ko
 *.so

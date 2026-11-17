@@ -199,137 +199,161 @@ html: $(syn)
 	synopsis -f HTML -Wf,title="'BusyBox Documentation'" -o $@ $^
 
 # ==========================================================================
-# Cross-compilation delegation targets & GNU Make define rules
+# Architecture-Aware Toolchain & Sysroot Discovery
 # ==========================================================================
-
-NPROC ?= $(shell nproc 2>/dev/null || echo 4)
-BUILDROOT_MUSL_AARCH64 ?= /home/rick/open-source/buildroot/output/host/bin/aarch64-buildroot-linux-musl-
-BUILDROOT_GLIBC_AARCH64 ?= /home/rick/open-source/buildroot-glibc/output/host/bin/aarch64-buildroot-linux-gnu-
+NPROC    ?= $(shell nproc 2>/dev/null || echo 4)
 HOST_GCC ?= gcc
+BIN_DIR  := $(if $(srctree),$(srctree),.)/bin
 
-BIN_DIR := $(if $(srctree),$(srctree),.)/bin
+# Detect and normalize host architecture & OS
+HOST_ARCH := $(shell uname -m 2>/dev/null || echo "unknown")
+HOST_OS   := $(shell uname -s 2>/dev/null || echo "Linux")
 
-# GNU Make define rule to generate delegation targets
-# Arguments:
-#   $(1): Target rule prefix (e.g. cross-arm64, native-x86_64)
-#   $(2): Architecture (ARCH)
-#   $(3): CROSS_COMPILE prefix
-#   $(4): CC override
-#   $(5): Architecture output tag (e.g. arm64, x86_64, arm64-glibc)
-#   $(6): Description
-define DEFINE_CROSS_TARGET
-.PHONY: $(1) $(1)-busybox $(1)-clean $(1)-menuconfig $(1)-defconfig $(1)-%
-$(1):
-	@echo "========================================================================"
-	@echo "  [Cross-Compile] Delegating build for $(6)"
-	@echo "  ARCH=$(2) CROSS_COMPILE=$(3) CC=$(4) -j$$(NPROC) $$(if $$(TARGET),TARGET=$$(TARGET),busybox)"
-	@echo "========================================================================"
-	env -u CFLAGS -u AFLAGS -u LDFLAGS $$(MAKE) -C $$(if $$(srctree),$$(srctree),.) ARCH=$(2) $$(if $(3),CROSS_COMPILE=$(3)) $$(if $(4),CC=$(4)) -j$$(NPROC) $$(if $$(TARGET),$$(TARGET),busybox)
-	@if [ -z "$$(TARGET)" ] || [ "$$(TARGET)" = "busybox" ]; then \
-		mkdir -p $(BIN_DIR); \
-		cp -f $$(if $$(srctree),$$(srctree),.)/busybox $(BIN_DIR)/busybox-$(5); \
-		$$(if $(3),$(3)strip,strip) -s -R .note -R .note.gnu.build-id -R .note.ABI-tag -R .comment -R .eh_frame -R .eh_frame_hdr -R .ARM.attributes $(BIN_DIR)/busybox-$(5) 2>/dev/null || true; \
-		sz=`stat -c '%s' $(BIN_DIR)/busybox-$(5)`; \
-		sz_fmt=`awk -v b="$$$$sz" 'BEGIN { printf "%d bytes (%.2f KB / %.2f MB)", b, b/1024, b/1048576 }'`; \
-		mach=`readelf -h $(BIN_DIR)/busybox-$(5) 2>/dev/null | awk -F: '/Machine:/ {gsub(/^[ \t]+/, "", $$$$2); print $$$$2}'`; \
-		class=`readelf -h $(BIN_DIR)/busybox-$(5) 2>/dev/null | awk -F: '/Class:/ {gsub(/^[ \t]+/, "", $$$$2); print $$$$2}'`; \
-		entry=`readelf -h $(BIN_DIR)/busybox-$(5) 2>/dev/null | awk -F: '/Entry point/ {gsub(/^[ \t]+/, "", $$$$2); print $$$$2}'`; \
-		nsecs=`readelf -h $(BIN_DIR)/busybox-$(5) 2>/dev/null | awk -F: '/Number of section headers:/ {gsub(/^[ \t]+/, "", $$$$2); print $$$$2}'`; \
-		secs=`size $(BIN_DIR)/busybox-$(5) 2>/dev/null | tail -n 1 | awk '{printf "text: %s | data: %s | bss: %s | dec: %s (%s hex)", $$$$1, $$$$2, $$$$3, $$$$4, $$$$5}'`; \
-		bin_type=`file -b $(BIN_DIR)/busybox-$(5)`; \
-		bin_mode=`stat -c '%A (%a)' $(BIN_DIR)/busybox-$(5)`; \
-		bin_built=`date '+%Y-%m-%d %H:%M:%S %Z'`; \
-		bin_mod=`date -r $(BIN_DIR)/busybox-$(5) '+%Y-%m-%d %H:%M:%S %Z'`; \
-		echo "[✓] Successfully built and saved:"; \
-		echo "    -> Binary:   $(BIN_DIR)/busybox-$(5)"; \
-		echo "    -> Type:     $$$$bin_type"; \
-		echo "    -> Size:     $$$$sz_fmt"; \
-		echo "    -> Mode:     $$$$bin_mode"; \
-		echo "    -> Built:    $$$$bin_built"; \
-		echo "    -> Modified: $$$$bin_mod"; \
-		echo "    -> ELF Info: $$$$class, $$$$mach (Entry: $$$$entry, $$$$nsecs sections)"; \
-		echo "    -> Sections: $$$$secs"; \
-	fi
-
-$(1)-busybox:
-	$$(MAKE) $(1) TARGET=busybox
-
-$(1)-clean:
-	@echo "[-] Cleaning build artifacts for $(6)..."
-	env -u CFLAGS -u AFLAGS -u LDFLAGS $$(MAKE) -C $$(if $$(srctree),$$(srctree),.) ARCH=$(2) $$(if $(3),CROSS_COMPILE=$(3)) $$(if $(4),CC=$(4)) clean
-	@rm -f $$(if $$(srctree),$$(srctree),.)/busybox $$(if $$(srctree),$$(srctree),.)/busybox_unstripped
-	@echo "[✓] Cleaned $(6) in-tree objects."
-
-$(1)-menuconfig:
-	env -u CFLAGS -u AFLAGS -u LDFLAGS $$(MAKE) -C $$(if $$(srctree),$$(srctree),.) ARCH=$(2) $$(if $(3),CROSS_COMPILE=$(3)) $$(if $(4),CC=$(4)) menuconfig
-
-$(1)-defconfig:
-	env -u CFLAGS -u AFLAGS -u LDFLAGS $$(MAKE) -C $$(if $$(srctree),$$(srctree),.) ARCH=$(2) $$(if $(3),CROSS_COMPILE=$(3)) $$(if $(4),CC=$(4)) defconfig
-
-$(1)-%:
-	@echo "========================================================================"
-	@echo "  [Cross-Compile] Delegating target '$$*' for $(6)"
-	@echo "  ARCH=$(2) CROSS_COMPILE=$(3) CC=$(4) -j$$(NPROC)"
-	@echo "========================================================================"
-	env -u CFLAGS -u AFLAGS -u LDFLAGS $$(MAKE) -C $$(if $$(srctree),$$(srctree),.) ARCH=$(2) $$(if $(3),CROSS_COMPILE=$(3)) $$(if $(4),CC=$(4)) -j$$(NPROC) $$*
-endef
-
-# Global clean & distclean targets
-.PHONY: cross-clean clean-cross cross-distclean distclean-cross clean-all cross-clean-all distclean-all
-cross-clean clean-cross:
-	@echo "[-] Cleaning all BusyBox objects and root binaries..."
-	@$(MAKE) clean
-	@rm -f $(if $(srctree),$(srctree),.)/busybox $(if $(srctree),$(srctree),.)/busybox_unstripped
-	@rm -rf $(if $(srctree),$(srctree),.)/.lib_stripped
-	@echo "[✓] Cleaned root build objects successfully."
-
-clean-all cross-clean-all: cross-clean
-	@echo "[-] Cleaning saved architecture binaries in $(BIN_DIR)..."
-	@rm -rf $(BIN_DIR)
-	@echo "[✓] Full clean-all completed."
-
-cross-distclean distclean-cross distclean-all:
-	@echo "[-] Distcleaning all configurations, objects, and $(BIN_DIR)..."
-	@$(MAKE) distclean
-	@rm -rf $(BIN_DIR) $(if $(srctree),$(srctree),.)/busybox $(if $(srctree),$(srctree),.)/busybox_unstripped
-	@echo "[✓] Full distclean completed."
-
-# Instantiate cross-compile targets using DEFINE_CROSS_TARGET
-$(eval $(call DEFINE_CROSS_TARGET,cross-aarch64,arm64,$(BUILDROOT_MUSL_AARCH64),,arm64,Android Host Target - aarch64 musl static))
-$(eval $(call DEFINE_CROSS_TARGET,cross-arm64,arm64,$(BUILDROOT_MUSL_AARCH64),,arm64,Android Host Target - aarch64 musl static alias))
-$(eval $(call DEFINE_CROSS_TARGET,cross-aarch64-glibc,arm64,$(BUILDROOT_GLIBC_AARCH64),,arm64-glibc,Debian Container Target - aarch64 glibc))
-$(eval $(call DEFINE_CROSS_TARGET,native-x86_64,x86_64,,$(HOST_GCC),x86_64,Native Host Target - x86_64 gcc))
-$(eval $(call DEFINE_CROSS_TARGET,native,x86_64,,$(HOST_GCC),x86_64,Native Host Target alias))
-
-# Multi-architecture "all" targets
-.PHONY: cross-all all-cross all-arches
-cross-all all-cross all-arches:
-	@echo "========================================================================"
-	@echo "  [Cross-All] Building all architectures into $(BIN_DIR)/"
-	@echo "========================================================================"
-	@$(MAKE) cross-clean
-	@$(MAKE) native-x86_64
-	@$(MAKE) cross-clean
-	@$(MAKE) cross-arm64
-	@$(MAKE) cross-clean
-	@$(MAKE) cross-aarch64-glibc
-	@echo "========================================================================"
-	@echo "  [✓] All architectures built successfully in $(BIN_DIR):"
-	@ls -la $(BIN_DIR)/
-	@echo "========================================================================"
-
-.PHONY: cross-help
-cross-help:
-	@echo "Available Cross-Compilation Delegation Targets:"
-	@echo "  cross-arm64 / cross-aarch64  - Build BusyBox for Android (aarch64 musl static)"
-	@echo "  native-x86_64 / native       - Build BusyBox natively for host (x86_64 gcc)"
-	@echo "  cross-aarch64-glibc          - Build BusyBox for container (aarch64 glibc dynamic)"
-	@echo "  cross-all / all-arches       - Build ALL architectures into bin/ without overwriting"
-	@echo "  TARGET=<target>              - Optional target override (e.g. make cross-arm64 TARGET=archival/aimg.o)"
-	@echo "  cross-clean / clean-cross    - Clean root objects, binaries, and symlinks"
-	@echo "  clean-all                    - Clean objects, binaries, AND the bin/ storage directory"
-	@echo "  distclean-all                - Full distclean of configuration, objects, and bin/"
-	@echo "  cross-arm64-clean            - In-tree clean for aarch64 build"
-	@echo "  native-clean                 - In-tree clean for native x86_64 build"
+ifeq ($(HOST_ARCH),x86_64)
+  HOST_ARCH_CANONICAL := x86_64
+else ifneq ($(filter aarch64% arm64% armv8%,$(HOST_ARCH)),)
+  HOST_ARCH_CANONICAL := arm64
+else ifneq ($(filter arm% armv7%,$(HOST_ARCH)),)
+  HOST_ARCH_CANONICAL := arm32
+else ifneq ($(filter riscv64%,$(HOST_ARCH)),)
+  HOST_ARCH_CANONICAL := riscv64
+else
+  HOST_ARCH_CANONICAL := $(HOST_ARCH)
+endif
 
 -include $(srctree)/Makefile.local
+
+# Candidate prefixes per architecture
+CANDIDATES_ARM64   := aarch64-linux-musl- aarch64-buildroot-linux-musl- aarch64-unknown-linux-musl- aarch64-linux-gnu- aarch64-none-linux-gnu-
+CANDIDATES_ARM32   := arm-linux-musleabihf- arm-buildroot-linux-musleabihf- arm-linux-gnueabihf- arm-none-linux-gnueabihf-
+CANDIDATES_RISCV64 := riscv64-linux-musl- riscv64-buildroot-linux-musl- riscv64-linux-gnu- riscv64-unknown-linux-gnu-
+CANDIDATES_X86_64  := x86_64-linux-musl- x86_64-linux-gnu- x86_64-pc-linux-gnu-
+
+# When running natively on ARM64 or ARM32, permit native compiler as fallback
+ifeq ($(HOST_ARCH_CANONICAL),arm64)
+  CANDIDATES_ARM64 += ""
+endif
+ifeq ($(HOST_ARCH_CANONICAL),arm32)
+  CANDIDATES_ARM32 += ""
+endif
+
+# Helper function: finds first candidate compiler existing in PATH
+find_toolchain = $(firstword $(foreach p,$(1),$(if $(shell command -v $(p)gcc 2>/dev/null),$(p))))
+
+# Auto-discovered toolchain prefixes (overridable via CLI or Makefile.local)
+CROSS_ARM64_MUSL  ?= $(call find_toolchain,$(CANDIDATES_ARM64))
+CROSS_ARM64_GLIBC ?= $(call find_toolchain,aarch64-linux-gnu- aarch64-buildroot-linux-gnu- aarch64-none-linux-gnu-)
+CROSS_ARM32       ?= $(call find_toolchain,$(CANDIDATES_ARM32))
+CROSS_RISCV64     ?= $(call find_toolchain,$(CANDIDATES_RISCV64))
+
+LLD_BIN           ?= $(shell command -v ld.lld >/dev/null 2>&1 && dirname "$$(command -v ld.lld)")
+export LLD_BIN
+
+# Pre-flight check macro: verifies compiler, detects arch, and reports sysroot
+define VERIFY_TOOLCHAIN
+	@CC_BIN="$(1)gcc"; \
+	if ! command -v "$$CC_BIN" >/dev/null 2>&1; then \
+		echo "========================================================================"; \
+		echo " [!] ERROR: No cross-compiler found for architecture: $(2)"; \
+		echo "     Searched candidate prefixes on PATH:"; \
+		for c in $(3); do echo "       - $${c}gcc"; done; \
+		echo "     Please install a $(2) toolchain or set CROSS_COMPILE=<prefix>"; \
+		echo "========================================================================"; \
+		exit 1; \
+	fi; \
+	TRIPLET=$$("$$CC_BIN" -dumpmachine 2>/dev/null || echo "unknown"); \
+	SYSROOT=$$("$$CC_BIN" -print-sysroot 2>/dev/null || true); \
+	echo "  -> Compiler: $$CC_BIN"; \
+	echo "  -> Target:   $$TRIPLET"; \
+	if [ -n "$$SYSROOT" ] && [ "$$SYSROOT" != "/" ]; then \
+		echo "  -> Sysroot:  $$SYSROOT"; \
+	fi
+endef
+
+.PHONY: arm64 host glibc arm32 riscv64 all-bins clean-bins info
+
+# Diagnostics: Show detected host environment & available toolchains
+info:
+	@echo "========================================================================"
+	@echo "  BusyBox Dynamic Build System Diagnostics"
+	@echo "========================================================================"
+	@echo "  Host Machine:    $(HOST_ARCH) ($(HOST_OS))"
+	@echo "  Host Canonical:  $(HOST_ARCH_CANONICAL)"
+	@echo "  CPU Threads:     $(NPROC)"
+	@echo "  Host GCC:        $$(command -v $(HOST_GCC) 2>/dev/null || echo 'not found')"
+	@if [ -n "$(CROSS_ARM64_MUSL)" ]; then \
+		echo "  ARM64 Musl:      $(CROSS_ARM64_MUSL)gcc [$$($(CROSS_ARM64_MUSL)gcc -dumpmachine 2>/dev/null)]"; \
+	else \
+		echo "  ARM64 Musl:      none detected"; \
+	fi
+	@if [ -n "$(CROSS_ARM64_GLIBC)" ]; then \
+		echo "  ARM64 Glibc:     $(CROSS_ARM64_GLIBC)gcc [$$($(CROSS_ARM64_GLIBC)gcc -dumpmachine 2>/dev/null)]"; \
+	else \
+		echo "  ARM64 Glibc:     none detected"; \
+	fi
+	@if [ -n "$(CROSS_ARM32)" ]; then \
+		echo "  ARM32 Toolchain: $(CROSS_ARM32)gcc [$$($(CROSS_ARM32)gcc -dumpmachine 2>/dev/null)]"; \
+	else \
+		echo "  ARM32 Toolchain: none detected"; \
+	fi
+	@if [ -n "$(LLD_BIN)" ]; then \
+		echo "  LLD Linker:      $(LLD_BIN)/ld.lld"; \
+	else \
+		echo "  LLD Linker:      none (using standard GNU ld)"; \
+	fi
+	@echo "========================================================================"
+
+# 1. Android ARM64 Static (musl)
+arm64:
+	@echo "==> Building BusyBox for Android (ARM64 musl static)..."
+	$(call VERIFY_TOOLCHAIN,$(CROSS_ARM64_MUSL),arm64,$(CANDIDATES_ARM64))
+	$(MAKE) ARCH=arm64 CROSS_COMPILE=$(CROSS_ARM64_MUSL) -j$(NPROC) busybox
+	@mkdir -p $(BIN_DIR)
+	@cp -f busybox $(BIN_DIR)/busybox-arm64
+	@$(CROSS_ARM64_MUSL)strip -s $(BIN_DIR)/busybox-arm64 2>/dev/null || strip -s $(BIN_DIR)/busybox-arm64 2>/dev/null || true
+	@echo "  -> Ready: $(BIN_DIR)/busybox-arm64 ($$(ls -lh $(BIN_DIR)/busybox-arm64 | awk '{print $$5}'))"
+
+# 2. Native Host (Current PC)
+host:
+	@echo "==> Building BusyBox for Host ($(HOST_ARCH) on $(HOST_OS))..."
+	$(call VERIFY_TOOLCHAIN,,host,gcc)
+	$(MAKE) CC=$(HOST_GCC) -j$(NPROC) busybox
+	@mkdir -p $(BIN_DIR)
+	@cp -f busybox $(BIN_DIR)/busybox-$(HOST_ARCH)
+	@strip -s $(BIN_DIR)/busybox-$(HOST_ARCH) 2>/dev/null || true
+	@echo "  -> Ready: $(BIN_DIR)/busybox-$(HOST_ARCH) ($$(ls -lh $(BIN_DIR)/busybox-$(HOST_ARCH) | awk '{print $$5}'))"
+
+# 3. Container ARM64 Dynamic (glibc)
+glibc:
+	@echo "==> Building BusyBox for Container (ARM64 glibc)..."
+	$(call VERIFY_TOOLCHAIN,$(CROSS_ARM64_GLIBC),arm64-glibc,aarch64-linux-gnu-)
+	$(MAKE) ARCH=arm64 CROSS_COMPILE=$(CROSS_ARM64_GLIBC) -j$(NPROC) busybox
+	@mkdir -p $(BIN_DIR)
+	@cp -f busybox $(BIN_DIR)/busybox-arm64-glibc
+	@$(CROSS_ARM64_GLIBC)strip -s $(BIN_DIR)/busybox-arm64-glibc 2>/dev/null || true
+	@echo "  -> Ready: $(BIN_DIR)/busybox-arm64-glibc ($$(ls -lh $(BIN_DIR)/busybox-arm64-glibc | awk '{print $$5}'))"
+
+# 4. ARM 32-bit Static (musl/glibc)
+arm32:
+	@echo "==> Building BusyBox for ARM 32-bit..."
+	$(call VERIFY_TOOLCHAIN,$(CROSS_ARM32),arm32,$(CANDIDATES_ARM32))
+	$(MAKE) ARCH=arm CROSS_COMPILE=$(CROSS_ARM32) -j$(NPROC) busybox
+	@mkdir -p $(BIN_DIR)
+	@cp -f busybox $(BIN_DIR)/busybox-arm
+	@$(CROSS_ARM32)strip -s $(BIN_DIR)/busybox-arm 2>/dev/null || true
+	@echo "  -> Ready: $(BIN_DIR)/busybox-arm ($$(ls -lh $(BIN_DIR)/busybox-arm | awk '{print $$5}'))"
+
+# 5. Build All Configured Binaries
+all-bins:
+	@$(MAKE) clean
+	@$(MAKE) host
+	@$(MAKE) clean
+	@$(MAKE) arm64
+	@$(MAKE) clean
+	@$(MAKE) glibc
+	@echo "==> All binaries built in $(BIN_DIR)/:"
+	@ls -lh $(BIN_DIR)/
+
+# 6. Clean Saved Binaries
+clean-bins:
+	rm -rf $(BIN_DIR)

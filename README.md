@@ -63,11 +63,17 @@ busybox resetprop --adbd-root
 
 ### Building
 ```bash
-# Configure
-make defconfig
+# 1. Build for Android (ARM64 static musl) -> bin/busybox-arm64
+make arm64
 
-# Cross-compile fully static ARM64 musl binary
-CROSS_COMPILE=aarch64-buildroot-linux-musl- LDFLAGS="--static" make -j$(nproc)
+# 2. Build for Host PC (x86_64 gcc) -> bin/busybox-x86_64
+make host
+
+# 3. Build for Container (ARM64 glibc) -> bin/busybox-arm64-glibc
+make glibc
+
+# 4. Build all targets
+make all-bins
 ```
 
 ---
