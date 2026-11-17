@@ -70,6 +70,12 @@
 //usage:     "\n	--set-ramdisk <boot> <rd>     Inject/replace ramdisk in boot image (--live, --install)"
 //usage:     "\n	--extract-ramdisk <boot> [o]  Extract ramdisk (auto-decompress to cpio) from boot image"
 //usage:     "\n"
+//usage:     "\nAndroid Build Flags & Production Personality Engine:"
+//usage:     "\n	--build-status <boot|--live>  Inspect production/debug build flags and properties"
+//usage:     "\n	--set-build-type <b|live> <p> Set build personality (user, userdebug, eng)"
+//usage:     "\n	--set-debuggable <b|live> <v> Set ro.debuggable and cmdline flags (1 or 0)"
+//usage:     "\n	--set-insecure-adb <b|live> <v> Set ro.secure=0 and ro.adb.secure=0 (1 or 0)"
+//usage:     "\n"
 //usage:     "\nAnyKernel & Live Partition Operations:"
 //usage:     "\n	--flash-kernel <img|rec> [prt] Spliced live kernel flashing with AVB & DTB preservation"
 //usage:     "\n	--patch-cmdline [boot|file]   In-place boot header cmdline modifier (+add, -rm, key=val)"
@@ -7493,6 +7499,885 @@ static int magiskboot_info_image(const char *path) {
 }
 
 /* =========================================================================
+ * 13. Android Production & Debug Flags Engine (user, userdebug, eng)
+ * ========================================================================= */
+
+struct prop_grow_buf {
+	char *data;
+	size_t len;
+	size_t cap;
+};
+
+static void prop_gb_append(struct prop_grow_buf *gb, const void *src, size_t n)
+{
+	if (!gb || !src || n == 0) return;
+	if (gb->len + n + 1 > gb->cap) {
+		gb->cap = (gb->cap == 0) ? (n + 512) : (gb->cap * 2 + n + 512);
+		gb->data = xrealloc(gb->data, gb->cap);
+	}
+	memcpy(gb->data + gb->len, src, n);
+	gb->len += n;
+	gb->data[gb->len] = '\0';
+}
+
+static bool property_buffer_get(const char *buf, size_t sz, const char *key, char *out_val, size_t max_len)
+{
+	const char *cur = buf;
+	const char *end = buf + sz;
+	size_t klen;
+
+	if (!buf || sz == 0 || !key || !out_val || max_len == 0) return false;
+	klen = strlen(key);
+
+	while (cur < end) {
+		const char *line_start = cur;
+		const char *line_end = memchr(cur, '\n', end - cur);
+		const char *p;
+		const char *eq;
+		size_t vlen;
+
+		if (!line_end) line_end = end;
+		cur = (line_end < end) ? line_end + 1 : end;
+
+		p = line_start;
+		while (p < line_end && (*p == ' ' || *p == '\t')) p++;
+		if (p >= line_end || *p == '#' || *p == '\0') continue;
+
+		eq = memchr(p, '=', line_end - p);
+		if (!eq) continue;
+
+		if ((size_t)(eq - p) == klen && memcmp(p, key, klen) == 0) {
+			const char *vstart = eq + 1;
+			const char *vend = line_end;
+			while (vend > vstart && (*(vend - 1) == '\r' || *(vend - 1) == ' ' || *(vend - 1) == '\t'))
+				vend--;
+			vlen = vend - vstart;
+			if (vlen >= max_len) vlen = max_len - 1;
+			memcpy(out_val, vstart, vlen);
+			out_val[vlen] = '\0';
+			return true;
+		}
+	}
+	return false;
+}
+
+static char *property_buffer_set(const char *buf, size_t sz, const char *key, const char *val, size_t *out_sz)
+{
+	struct prop_grow_buf gb = { NULL, 0, 0 };
+	const char *cur = buf;
+	const char *end = buf + (buf ? sz : 0);
+	size_t klen = strlen(key);
+	bool found = false;
+
+	while (cur && cur < end) {
+		const char *line_start = cur;
+		const char *line_end = memchr(cur, '\n', end - cur);
+		const char *p;
+		const char *eq;
+
+		if (!line_end) line_end = end;
+		cur = (line_end < end) ? line_end + 1 : end;
+
+		p = line_start;
+		while (p < line_end && (*p == ' ' || *p == '\t')) p++;
+
+		if (p < line_end && *p != '#' && *p != '\0') {
+			eq = memchr(p, '=', line_end - p);
+			if (eq && (size_t)(eq - p) == klen && memcmp(p, key, klen) == 0) {
+				found = true;
+				if (val) {
+					/* Replace with key=val\n */
+					prop_gb_append(&gb, key, klen);
+					prop_gb_append(&gb, "=", 1);
+					prop_gb_append(&gb, val, strlen(val));
+					prop_gb_append(&gb, "\n", 1);
+				}
+				/* If val == NULL, omit line entirely */
+				continue;
+			}
+		}
+
+		/* Preserve original line */
+		prop_gb_append(&gb, line_start, cur - line_start);
+	}
+
+	if (!found && val) {
+		if (gb.len > 0 && gb.data[gb.len - 1] != '\n') {
+			prop_gb_append(&gb, "\n", 1);
+		}
+		prop_gb_append(&gb, key, klen);
+		prop_gb_append(&gb, "=", 1);
+		prop_gb_append(&gb, val, strlen(val));
+		prop_gb_append(&gb, "\n", 1);
+	}
+
+	if (out_sz) *out_sz = gb.len;
+	return gb.data ? gb.data : xstrdup("");
+}
+
+static char *bootconfig_buffer_set(const char *buf, size_t sz, const char *key, const char *val, size_t *out_sz)
+{
+	struct prop_grow_buf gb = { NULL, 0, 0 };
+	const char *cur = buf;
+	const char *end = buf + (buf ? sz : 0);
+	size_t klen = strlen(key);
+	bool found = false;
+
+	while (cur && cur < end) {
+		const char *line_start = cur;
+		const char *line_end = memchr(cur, '\n', end - cur);
+		const char *p;
+
+		if (!line_end) line_end = end;
+		cur = (line_end < end) ? line_end + 1 : end;
+
+		p = line_start;
+		while (p < line_end && (*p == ' ' || *p == '\t')) p++;
+
+		if (p < line_end && *p != '#' && *p != '\0') {
+			if ((size_t)(line_end - p) >= klen && memcmp(p, key, klen) == 0 &&
+			    (p + klen == line_end || p[klen] == ' ' || p[klen] == '\t' || p[klen] == '=')) {
+				found = true;
+				if (val) {
+					/* Replace with key = "val"\n */
+					prop_gb_append(&gb, key, klen);
+					prop_gb_append(&gb, " = \"", 4);
+					prop_gb_append(&gb, val, strlen(val));
+					prop_gb_append(&gb, "\"\n", 2);
+				}
+				continue;
+			}
+		}
+
+		prop_gb_append(&gb, line_start, cur - line_start);
+	}
+
+	if (!found && val) {
+		if (gb.len > 0 && gb.data[gb.len - 1] != '\n') {
+			prop_gb_append(&gb, "\n", 1);
+		}
+		prop_gb_append(&gb, key, klen);
+		prop_gb_append(&gb, " = \"", 4);
+		prop_gb_append(&gb, val, strlen(val));
+		prop_gb_append(&gb, "\"\n", 2);
+	}
+
+	if (out_sz) *out_sz = gb.len;
+	return gb.data ? gb.data : xstrdup("");
+}
+
+static char *cmdline_buffer_set_param(const char *cmdline, const char *key, const char *val)
+{
+	char *dup = xstrdup(cmdline ? cmdline : "");
+	char **tokens = NULL;
+	size_t cap = 32, count = 0;
+	char *tok, *saveptr;
+	size_t klen = strlen(key);
+	bool found = false;
+	size_t i;
+	struct prop_grow_buf gb = { NULL, 0, 0 };
+
+	tokens = xmalloc(cap * sizeof(char *));
+	tok = strtok_r(dup, " \t\r\n", &saveptr);
+	while (tok) {
+		if (count >= cap) {
+			cap *= 2;
+			tokens = xrealloc(tokens, cap * sizeof(char *));
+		}
+		tokens[count++] = xstrdup(tok);
+		tok = strtok_r(NULL, " \t\r\n", &saveptr);
+	}
+	free(dup);
+
+	for (i = 0; i < count; i++) {
+		if (!tokens[i]) continue;
+		if (strcmp(tokens[i], key) == 0 ||
+		    (strncmp(tokens[i], key, klen) == 0 && tokens[i][klen] == '=')) {
+			free(tokens[i]);
+			tokens[i] = NULL;
+			if (val) {
+				char tmp[512];
+				snprintf(tmp, sizeof(tmp), "%s=%s", key, val);
+				tokens[i] = xstrdup(tmp);
+				found = true;
+			}
+		}
+	}
+
+	if (!found && val) {
+		char tmp[512];
+		if (count >= cap) {
+			cap += 16;
+			tokens = xrealloc(tokens, cap * sizeof(char *));
+		}
+		snprintf(tmp, sizeof(tmp), "%s=%s", key, val);
+		tokens[count++] = xstrdup(tmp);
+	}
+
+	for (i = 0; i < count; i++) {
+		if (tokens[i]) {
+			if (gb.len > 0) prop_gb_append(&gb, " ", 1);
+			prop_gb_append(&gb, tokens[i], strlen(tokens[i]));
+			free(tokens[i]);
+		}
+	}
+	free(tokens);
+
+	return gb.data ? gb.data : xstrdup("");
+}
+
+struct build_flag_changes {
+	const char *build_type;      /* e.g. "user", "userdebug", "eng", or NULL if unchanged */
+	const char *debuggable;      /* e.g. "1", "0", or NULL if unchanged */
+	const char *secure;          /* e.g. "1", "0", or NULL if unchanged */
+	const char *adb_secure;      /* e.g. "1", "0", or NULL if unchanged */
+	const char *perf_harden;     /* e.g. "1", "0", or NULL if unchanged */
+	const char *cmd_debuggable;  /* e.g. "1", "0", or NULL if unchanged */
+	const char *cmd_devkmsg;     /* e.g. "on", or NULL if unchanged */
+};
+
+static int magiskboot_modify_flags_core(const char *target, bool live,
+                                        const struct build_flag_changes *changes,
+                                        const char *out_file)
+{
+	char discovered_boot[PATH_MAX];
+	char abs_target[PATH_MAX];
+	char abs_final_dest[PATH_MAX];
+	char old_cwd[512];
+	char tmp_dir[256];
+	char repacked_img[PATH_MAX];
+	int ret = 0;
+	bool is_bdev = false;
+	const char *final_dest = NULL;
+
+	if (!target || live) {
+		if (find_target_boot_image(discovered_boot, sizeof(discovered_boot)) != 0) {
+			bb_error_msg("failed to auto-detect target boot partition");
+			return 1;
+		}
+		target = discovered_boot;
+		live = true;
+		printf("[+] Target Live Boot Partition: %s\n", target);
+	} else {
+		printf("[+] Target Boot Image: %s\n", target);
+	}
+
+	if (realpath(target, abs_target)) {
+		target = abs_target;
+	}
+
+	is_bdev = is_block_device_node(target);
+	if (!getcwd(old_cwd, sizeof(old_cwd))) {
+		strcpy(old_cwd, ".");
+	}
+
+	if (live || is_bdev) {
+		final_dest = target;
+	} else if (out_file) {
+		if (out_file[0] != '/') {
+			snprintf(abs_final_dest, sizeof(abs_final_dest), "%s/%s", old_cwd, out_file);
+			final_dest = abs_final_dest;
+		} else {
+			final_dest = out_file;
+		}
+	} else {
+		final_dest = target;
+	}
+
+	safe_strncpy(tmp_dir, "/tmp/mb_bflags_XXXXXX", sizeof(tmp_dir));
+	if (!mkdtemp(tmp_dir)) {
+		bb_perror_msg("failed to create temporary directory '%s'", tmp_dir);
+		return 1;
+	}
+
+	printf("[*] Unpacking boot image to patch build flags: %s...\n", target);
+	chdir(tmp_dir);
+	if (magiskboot_unpack(target, true, false, false, false) != 0) {
+		bb_error_msg("failed to unpack boot image '%s'", target);
+		ret = 1;
+		goto cleanup;
+	}
+
+	/* 1. Modify HEADER_FILE (cmdline) */
+	if (access(HEADER_FILE, R_OK) == 0) {
+		FILE *hfp = fopen(HEADER_FILE, "r");
+		struct prop_grow_buf hbuf = { NULL, 0, 0 };
+		char *hline;
+
+		if (hfp) {
+			while ((hline = xmalloc_fgetline(hfp)) != NULL) {
+				if (strncmp(hline, "cmdline=", 8) == 0) {
+					char *cmdline = hline + 8;
+					char *new_cmd = NULL;
+
+					if (changes->cmd_debuggable) {
+						new_cmd = cmdline_buffer_set_param(cmdline, "androidboot.debuggable", changes->cmd_debuggable);
+					} else {
+						new_cmd = xstrdup(cmdline);
+					}
+
+					if (changes->cmd_devkmsg) {
+						char *tmp_cmd = cmdline_buffer_set_param(new_cmd, "printk.devkmsg", changes->cmd_devkmsg);
+						free(new_cmd);
+						new_cmd = tmp_cmd;
+					} else if (changes->build_type && strcmp(changes->build_type, "user") == 0) {
+						char *tmp_cmd = cmdline_buffer_set_param(new_cmd, "printk.devkmsg", NULL);
+						free(new_cmd);
+						new_cmd = tmp_cmd;
+					}
+
+					prop_gb_append(&hbuf, "cmdline=", 8);
+					prop_gb_append(&hbuf, new_cmd, strlen(new_cmd));
+					prop_gb_append(&hbuf, "\n", 1);
+					printf("  [+] Patched boot header cmdline: %s\n", new_cmd);
+					free(new_cmd);
+				} else {
+					prop_gb_append(&hbuf, hline, strlen(hline));
+					prop_gb_append(&hbuf, "\n", 1);
+				}
+				free(hline);
+			}
+			fclose(hfp);
+
+			if (hbuf.data) {
+				FILE *wfp = fopen(HEADER_FILE, "w");
+				if (wfp) {
+					fwrite(hbuf.data, 1, hbuf.len, wfp);
+					fclose(wfp);
+				}
+				free(hbuf.data);
+			}
+		}
+	}
+
+	/* 2. Modify BOOTCONFIG_FILE if present */
+	if (access(BOOTCONFIG_FILE, R_OK) == 0 && changes->cmd_debuggable) {
+		int bcfd = open(BOOTCONFIG_FILE, O_RDONLY);
+		if (bcfd >= 0) {
+			struct stat st;
+			if (fstat(bcfd, &st) == 0 && st.st_size > 0) {
+				char *bc_buf = xmalloc(st.st_size + 1);
+				if (full_read(bcfd, bc_buf, st.st_size) == st.st_size) {
+					size_t new_sz = 0;
+					char *new_bc = bootconfig_buffer_set(bc_buf, st.st_size,
+					                                     "androidboot.debuggable",
+					                                     changes->cmd_debuggable,
+					                                     &new_sz);
+					close(bcfd);
+					bcfd = -1;
+					if (new_bc) {
+						FILE *bcfp = fopen(BOOTCONFIG_FILE, "w");
+						if (bcfp) {
+							fwrite(new_bc, 1, new_sz, bcfp);
+							fclose(bcfp);
+							printf("  [+] Patched bootconfig: androidboot.debuggable = \"%s\"\n", changes->cmd_debuggable);
+						}
+						free(new_bc);
+					}
+				}
+				free(bc_buf);
+			}
+			if (bcfd >= 0) close(bcfd);
+		}
+	}
+
+	/* 3. Modify Ramdisk Properties */
+	if (access(RAMDISK_FILE, R_OK) == 0) {
+		cpio_node_t *head = cpio_read_all(RAMDISK_FILE);
+		if (head) {
+			cpio_node_t *cur;
+			bool prop_found = false;
+
+			for (cur = head; cur; cur = cur->next) {
+				if (!cur->data || cur->filesize == 0) continue;
+				if (strcmp(cur->name, "default.prop") == 0 ||
+				    strcmp(cur->name, "prop.default") == 0 ||
+				    strcmp(cur->name, "system/etc/prop.default") == 0 ||
+				    strcmp(cur->name, "vendor/default.prop") == 0 ||
+				    strcmp(cur->name, "vendor/etc/prop.default") == 0) {
+					char *data_str = (char *)cur->data;
+					size_t dsz = cur->filesize;
+					char *new_data = NULL;
+					size_t nsz = 0;
+					prop_found = true;
+
+					if (changes->build_type) {
+						new_data = property_buffer_set(data_str, dsz, "ro.build.type", changes->build_type, &nsz);
+						if (data_str != cur->data) free(data_str);
+						data_str = new_data; dsz = nsz;
+					}
+					if (changes->debuggable) {
+						new_data = property_buffer_set(data_str, dsz, "ro.debuggable", changes->debuggable, &nsz);
+						if (data_str != cur->data) free(data_str);
+						data_str = new_data; dsz = nsz;
+					}
+					if (changes->secure) {
+						new_data = property_buffer_set(data_str, dsz, "ro.secure", changes->secure, &nsz);
+						if (data_str != cur->data) free(data_str);
+						data_str = new_data; dsz = nsz;
+					}
+					if (changes->adb_secure) {
+						new_data = property_buffer_set(data_str, dsz, "ro.adb.secure", changes->adb_secure, &nsz);
+						if (data_str != cur->data) free(data_str);
+						data_str = new_data; dsz = nsz;
+					}
+					if (changes->perf_harden) {
+						new_data = property_buffer_set(data_str, dsz, "security.perf_harden", changes->perf_harden, &nsz);
+						if (data_str != cur->data) free(data_str);
+						data_str = new_data; dsz = nsz;
+					}
+
+					if (data_str != cur->data) {
+						free(cur->data);
+						cur->data = data_str;
+						cur->filesize = dsz;
+						printf("  [+] Patched ramdisk property file: %s\n", cur->name);
+					}
+				}
+			}
+
+			if (!prop_found) {
+				/* Create prop.default in ramdisk root */
+				struct prop_grow_buf pgb = { NULL, 0, 0 };
+				if (changes->build_type) {
+					prop_gb_append(&pgb, "ro.build.type=", 14);
+					prop_gb_append(&pgb, changes->build_type, strlen(changes->build_type));
+					prop_gb_append(&pgb, "\n", 1);
+				}
+				if (changes->debuggable) {
+					prop_gb_append(&pgb, "ro.debuggable=", 14);
+					prop_gb_append(&pgb, changes->debuggable, strlen(changes->debuggable));
+					prop_gb_append(&pgb, "\n", 1);
+				}
+				if (changes->secure) {
+					prop_gb_append(&pgb, "ro.secure=", 10);
+					prop_gb_append(&pgb, changes->secure, strlen(changes->secure));
+					prop_gb_append(&pgb, "\n", 1);
+				}
+				if (changes->adb_secure) {
+					prop_gb_append(&pgb, "ro.adb.secure=", 14);
+					prop_gb_append(&pgb, changes->adb_secure, strlen(changes->adb_secure));
+					prop_gb_append(&pgb, "\n", 1);
+				}
+				if (changes->perf_harden) {
+					prop_gb_append(&pgb, "security.perf_harden=", 21);
+					prop_gb_append(&pgb, changes->perf_harden, strlen(changes->perf_harden));
+					prop_gb_append(&pgb, "\n", 1);
+				}
+				if (pgb.data) {
+					cpio_set_file(&head, "prop.default", 0100644, pgb.data, pgb.len);
+					printf("  [+] Injected new ramdisk property file: prop.default\n");
+				}
+			}
+
+			printf("[*] Repacking ramdisk CPIO archive...\n");
+			if (cpio_write_all(RAMDISK_FILE, head) != 0) {
+				bb_error_msg("failed to write patched ramdisk CPIO archive");
+				cpio_free_all(head);
+				ret = 1;
+				goto cleanup;
+			}
+			cpio_free_all(head);
+
+			unlink("ramdisk.cpio.gz");
+			unlink("ramdisk.cpio.xz");
+			unlink("ramdisk.cpio.lz4");
+			unlink("ramdisk.cpio.bz2");
+			unlink("ramdisk.cpio.zst");
+		}
+	} else {
+		printf("[-] Notice: No ramdisk present in boot image (system-as-root mode)\n");
+	}
+
+	/* 4. Repack Boot Image */
+	printf("[*] Repacking boot image...\n");
+	snprintf(repacked_img, sizeof(repacked_img), "%s/new-boot.img", tmp_dir);
+	if (magiskboot_repack(target, repacked_img, false) != 0) {
+		bb_error_msg("failed to repack boot image");
+		ret = 1;
+		goto cleanup;
+	}
+
+	/* 5. Flash or Save */
+	if (live || is_bdev) {
+		printf("[*] Flashing patched boot image to %s...\n", target);
+		if (flash_partition_image(repacked_img, target, FLASH_OPT_VERIFY_READ) != 0) {
+			bb_error_msg("failed to flash updated boot image to %s", target);
+			ret = 1;
+			goto cleanup;
+		}
+		printf("[✓] SUCCESS: Flashed patched build configuration directly to %s\n", target);
+	} else {
+		chdir(old_cwd);
+		if (copy_file(repacked_img, final_dest, FILEUTILS_FORCE) != 0) {
+			bb_perror_msg("failed to write output image '%s'", final_dest);
+			ret = 1;
+			goto cleanup;
+		}
+		printf("[✓] SUCCESS: Updated build configuration inside boot image '%s'\n", final_dest);
+	}
+
+cleanup:
+	chdir(old_cwd);
+	remove_file(tmp_dir, FILEUTILS_RECUR | FILEUTILS_FORCE);
+	return ret;
+}
+
+static int magiskboot_build_status_op(int argc, char **argv)
+{
+	const char *target = NULL;
+	char discovered_boot[PATH_MAX];
+	boot_img_t boot;
+	char cmdline_buf[4096];
+	char prop_type[64] = "unknown";
+	char prop_debuggable[32] = "unknown";
+	char prop_secure[32] = "unknown";
+	char prop_adb_secure[32] = "unknown";
+	char prop_perf_harden[32] = "unknown";
+	char cmd_debuggable[32] = "not set";
+	char cmd_selinux[32] = "not set";
+	char cmd_force_normal[32] = "not set";
+	char cmd_devkmsg[32] = "not set";
+	char bcfg_debuggable[32] = "not set";
+	bool has_bootconfig = false;
+	bool has_ramdisk = false;
+	int prop_files_found = 0;
+	cpio_node_t *head = NULL;
+	cpio_node_t *cur;
+	char tmp_cpio[PATH_MAX];
+	int c_fd;
+
+	if (argc >= 3 && strcmp(argv[2], "--live") != 0 && argv[2][0] != '-') {
+		target = argv[2];
+	}
+
+	if (!target || (argc >= 3 && strcmp(argv[2], "--live") == 0)) {
+		if (find_target_boot_image(discovered_boot, sizeof(discovered_boot)) != 0) {
+			bb_error_msg("failed to auto-detect target boot partition");
+			return 1;
+		}
+		target = discovered_boot;
+		printf("[+] Inspecting Live Target Boot: %s\n", target);
+	} else {
+		printf("[+] Inspecting Target Boot Image: %s\n", target);
+	}
+
+	if (!boot_img_parse_full(&boot, target, true)) {
+		bb_error_msg("failed to parse boot image header from '%s'", target);
+		return 1;
+	}
+
+	/* 1. Extract and parse kernel cmdline */
+	memset(cmdline_buf, 0, sizeof(cmdline_buf));
+	switch (boot.hdr.type) {
+	case BOOT_HDR_V0:
+	case BOOT_HDR_V1:
+	case BOOT_HDR_V2: {
+		struct boot_img_hdr_v0 *h0 = (struct boot_img_hdr_v0 *)boot.hdr.raw;
+		snprintf(cmdline_buf, sizeof(cmdline_buf), "%.*s %.*s",
+		         BOOT_ARGS_SIZE, h0->cmdline,
+		         BOOT_EXTRA_ARGS_SIZE, h0->extra_cmdline);
+		break;
+	}
+	case BOOT_HDR_V3:
+	case BOOT_HDR_V4: {
+		struct boot_img_hdr_v3 *h3 = (struct boot_img_hdr_v3 *)boot.hdr.raw;
+		snprintf(cmdline_buf, sizeof(cmdline_buf), "%.*s",
+		         (int)sizeof(h3->cmdline), h3->cmdline);
+		break;
+	}
+	case BOOT_HDR_VND_V3:
+	case BOOT_HDR_VND_V4: {
+		struct boot_img_hdr_vnd_v3 *hv = (struct boot_img_hdr_vnd_v3 *)boot.hdr.raw;
+		snprintf(cmdline_buf, sizeof(cmdline_buf), "%.*s",
+		         (int)sizeof(hv->cmdline), hv->cmdline);
+		break;
+	}
+	default:
+		break;
+	}
+	trim(cmdline_buf);
+
+	{
+		char *tok, *saveptr;
+		char *dup = xstrdup(cmdline_buf);
+		tok = strtok_r(dup, " \t\r\n", &saveptr);
+		while (tok) {
+			if (strncmp(tok, "androidboot.debuggable=", 23) == 0) {
+				safe_strncpy(cmd_debuggable, tok + 23, sizeof(cmd_debuggable));
+			} else if (strncmp(tok, "androidboot.selinux=", 20) == 0) {
+				safe_strncpy(cmd_selinux, tok + 20, sizeof(cmd_selinux));
+			} else if (strncmp(tok, "androidboot.force_normal_boot=", 30) == 0) {
+				safe_strncpy(cmd_force_normal, tok + 30, sizeof(cmd_force_normal));
+			} else if (strncmp(tok, "printk.devkmsg=", 15) == 0) {
+				safe_strncpy(cmd_devkmsg, tok + 15, sizeof(cmd_devkmsg));
+			}
+			tok = strtok_r(NULL, " \t\r\n", &saveptr);
+		}
+		free(dup);
+	}
+
+	/* 2. Bootconfig inspection (Header v4) */
+	if (boot.bootconfig && boot.bootconfig_size > 0) {
+		has_bootconfig = true;
+		{
+			const char *bc = (const char *)boot.bootconfig;
+			const char *bc_end = bc + boot.bootconfig_size;
+			while (bc < bc_end) {
+				const char *le = memchr(bc, '\n', bc_end - bc);
+				if (!le) le = bc_end;
+				while (bc < le && (*bc == ' ' || *bc == '\t')) bc++;
+				if (bc < le && strncmp(bc, "androidboot.debuggable", 22) == 0) {
+					const char *eq = memchr(bc, '=', le - bc);
+					if (eq) {
+						const char *vs = eq + 1;
+						const char *ve;
+						while (vs < le && (*vs == ' ' || *vs == '\t' || *vs == '"')) vs++;
+						ve = le;
+						while (ve > vs && (*(ve - 1) == '\r' || *(ve - 1) == ' ' || *(ve - 1) == '\t' || *(ve - 1) == '"')) ve--;
+						if (ve > vs) {
+							size_t l = ve - vs;
+							if (l >= sizeof(bcfg_debuggable)) l = sizeof(bcfg_debuggable) - 1;
+							memcpy(bcfg_debuggable, vs, l);
+							bcfg_debuggable[l] = '\0';
+						}
+					}
+				}
+				bc = (le < bc_end) ? le + 1 : bc_end;
+			}
+		}
+	}
+
+	/* 3. Ramdisk properties inspection */
+	if (boot.ramdisk && boot.ramdisk_size > 0) {
+		has_ramdisk = true;
+		safe_strncpy(tmp_cpio, "/tmp/mb_bstat_XXXXXX", sizeof(tmp_cpio));
+		c_fd = xmkstemp(tmp_cpio);
+		if (boot_fmt_compressed(boot.r_fmt)) {
+			bb_decompress_data(boot.r_fmt, boot.ramdisk, boot.ramdisk_size, c_fd);
+		} else {
+			full_write(c_fd, boot.ramdisk, boot.ramdisk_size);
+		}
+		close(c_fd);
+
+		head = cpio_read_all(tmp_cpio);
+		unlink(tmp_cpio);
+
+		if (head) {
+			for (cur = head; cur; cur = cur->next) {
+				if (!cur->data || cur->filesize == 0) continue;
+				if (strcmp(cur->name, "default.prop") == 0 ||
+				    strcmp(cur->name, "prop.default") == 0 ||
+				    strcmp(cur->name, "system/etc/prop.default") == 0 ||
+				    strcmp(cur->name, "vendor/default.prop") == 0 ||
+				    strcmp(cur->name, "vendor/etc/prop.default") == 0) {
+					char val[64];
+					prop_files_found++;
+					if (property_buffer_get((const char *)cur->data, cur->filesize, "ro.build.type", val, sizeof(val)))
+						safe_strncpy(prop_type, val, sizeof(prop_type));
+					if (property_buffer_get((const char *)cur->data, cur->filesize, "ro.debuggable", val, sizeof(val)))
+						safe_strncpy(prop_debuggable, val, sizeof(prop_debuggable));
+					if (property_buffer_get((const char *)cur->data, cur->filesize, "ro.secure", val, sizeof(val)))
+						safe_strncpy(prop_secure, val, sizeof(prop_secure));
+					if (property_buffer_get((const char *)cur->data, cur->filesize, "ro.adb.secure", val, sizeof(val)))
+						safe_strncpy(prop_adb_secure, val, sizeof(prop_adb_secure));
+					if (property_buffer_get((const char *)cur->data, cur->filesize, "security.perf_harden", val, sizeof(val)))
+						safe_strncpy(prop_perf_harden, val, sizeof(prop_perf_harden));
+				}
+			}
+			cpio_free_all(head);
+		}
+	}
+
+	boot_img_free(&boot);
+
+	/* 4. Display Report */
+	printf("======================================================================\n");
+	printf("  Android Production & Debug Configuration Report\n");
+	printf("======================================================================\n");
+	printf("  • Target Path         : %s\n", target);
+	printf("  • Ramdisk Status      : %s (found %d prop file%s)\n",
+	       has_ramdisk ? "Present" : "None (System-as-root / DLKM-only)",
+	       prop_files_found, (prop_files_found == 1) ? "" : "s");
+	if (has_bootconfig) {
+		printf("  • Bootconfig Status   : Present (%s)\n", bcfg_debuggable);
+	}
+	printf("----------------------------------------------------------------------\n");
+	printf("  Kernel Command Line & Bootconfig Parameters:\n");
+	printf("    - androidboot.debuggable   : %s\n", cmd_debuggable);
+	printf("    - androidboot.selinux      : %s\n", cmd_selinux);
+	printf("    - androidboot.force_normal : %s\n", cmd_force_normal);
+	printf("    - printk.devkmsg           : %s\n", cmd_devkmsg);
+	if (has_bootconfig) {
+		printf("    - bootconfig debuggable    : %s\n", bcfg_debuggable);
+	}
+	printf("----------------------------------------------------------------------\n");
+	printf("  Ramdisk Build Properties (%s):\n", prop_files_found ? "Resolved" : "Default / Absent");
+	printf("    - ro.build.type            : %s\n", prop_type);
+	printf("    - ro.debuggable            : %s\n", prop_debuggable);
+	printf("    - ro.secure                : %s\n", prop_secure);
+	printf("    - ro.adb.secure            : %s\n", prop_adb_secure);
+	printf("    - security.perf_harden     : %s\n", prop_perf_harden);
+	printf("======================================================================\n");
+
+	/* 5. Classification Assessment */
+	{
+		bool is_userdebug = false;
+		bool is_eng = false;
+
+		if (strcmp(prop_type, "eng") == 0 || (strcmp(prop_debuggable, "1") == 0 && strcmp(prop_secure, "0") == 0)) {
+			is_eng = true;
+		} else if (strcmp(prop_type, "userdebug") == 0 || strcmp(prop_debuggable, "1") == 0 || strcmp(cmd_debuggable, "1") == 0) {
+			is_userdebug = true;
+		}
+
+		printf("  [★] ACTIVE BUILD PERSONALITY: ");
+		if (is_eng) {
+			printf("ENG (Engineering / Insecure Development)\n");
+			printf("      - ADB Root           : Elevated by default (UID 0 / GID 0)\n");
+			printf("      - ADB Authentication : INSECURE (No RSA device confirmation dialog)\n");
+			printf("      - App Debugging      : Unrestricted JDWP debugging enabled\n");
+			printf("      - SELinux Permissive : Permitted at boot\n");
+		} else if (is_userdebug) {
+			printf("USERDEBUG (User Debug / Root Available)\n");
+			printf("      - ADB Root           : Available on demand via 'adb root'\n");
+			printf("      - ADB Authentication : SECURE (Requires RSA device confirmation)\n");
+			printf("      - App Debugging      : JDWP debugging enabled\n");
+			printf("      - SELinux Permissive : Permitted via kernel cmdline\n");
+		} else {
+			printf("USER (Strict Production)\n");
+			printf("      - ADB Root           : FORBIDDEN ('adbd cannot run as root in production builds')\n");
+			printf("      - ADB Authentication : SECURE (Enforced RSA dialog)\n");
+			printf("      - App Debugging      : Restricted to android:debuggable=true apps\n");
+			printf("      - SELinux Permissive : LOCKED (Enforcing mandatory by /init)\n");
+		}
+	}
+	printf("======================================================================\n");
+
+	return 0;
+}
+
+static int magiskboot_set_build_type_op(int argc, char **argv)
+{
+	const char *target = NULL;
+	const char *profile = NULL;
+	const char *out_file = NULL;
+	bool live = false;
+	struct build_flag_changes changes;
+	int i;
+
+	memset(&changes, 0, sizeof(changes));
+
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--live") == 0) {
+			live = true;
+		} else if (strcmp(argv[i], "user") == 0 ||
+		           strcmp(argv[i], "userdebug") == 0 ||
+		           strcmp(argv[i], "eng") == 0) {
+			profile = argv[i];
+		} else if (!target) {
+			target = argv[i];
+		} else if (!out_file) {
+			out_file = argv[i];
+		}
+	}
+
+	if (!profile) {
+		bb_error_msg("missing build profile (must be 'user', 'userdebug', or 'eng')");
+		bb_error_msg("usage: aimg --set-build-type <boot.img|--live> <user|userdebug|eng> [out.img]");
+		return 1;
+	}
+
+	if (strcmp(profile, "user") == 0) {
+		changes.build_type = "user";
+		changes.debuggable = "0";
+		changes.secure = "1";
+		changes.adb_secure = "1";
+		changes.perf_harden = "1";
+		changes.cmd_debuggable = "0";
+		changes.cmd_devkmsg = NULL;
+	} else if (strcmp(profile, "userdebug") == 0) {
+		changes.build_type = "userdebug";
+		changes.debuggable = "1";
+		changes.secure = "1";
+		changes.adb_secure = "1";
+		changes.perf_harden = "0";
+		changes.cmd_debuggable = "1";
+		changes.cmd_devkmsg = "on";
+	} else if (strcmp(profile, "eng") == 0) {
+		changes.build_type = "eng";
+		changes.debuggable = "1";
+		changes.secure = "0";
+		changes.adb_secure = "0";
+		changes.perf_harden = "0";
+		changes.cmd_debuggable = "1";
+		changes.cmd_devkmsg = "on";
+	}
+
+	return magiskboot_modify_flags_core(target, live, &changes, out_file);
+}
+
+static int magiskboot_set_flag_op(int argc, char **argv, const char *flag_name)
+{
+	const char *target = NULL;
+	const char *val_str = NULL;
+	const char *out_file = NULL;
+	bool live = false;
+	bool enable;
+	struct build_flag_changes changes;
+	int i;
+
+	memset(&changes, 0, sizeof(changes));
+
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--live") == 0) {
+			live = true;
+		} else if (strcmp(argv[i], "1") == 0 || strcmp(argv[i], "0") == 0 ||
+		           strcmp(argv[i], "true") == 0 || strcmp(argv[i], "false") == 0 ||
+		           strcmp(argv[i], "on") == 0 || strcmp(argv[i], "off") == 0 ||
+		           strcmp(argv[i], "enable") == 0 || strcmp(argv[i], "disable") == 0) {
+			val_str = argv[i];
+		} else if (!target) {
+			target = argv[i];
+		} else if (!out_file) {
+			out_file = argv[i];
+		}
+	}
+
+	if (!val_str) {
+		bb_error_msg("missing flag value (1/0, on/off, true/false)");
+		bb_error_msg("usage: aimg --set-%s <boot.img|--live> <1|0> [out.img]", flag_name);
+		return 1;
+	}
+
+	enable = (strcmp(val_str, "1") == 0 || strcmp(val_str, "true") == 0 ||
+	          strcmp(val_str, "on") == 0 || strcmp(val_str, "enable") == 0);
+
+	if (strcmp(flag_name, "debuggable") == 0) {
+		changes.debuggable = enable ? "1" : "0";
+		changes.cmd_debuggable = enable ? "1" : "0";
+		if (enable) {
+			changes.build_type = "userdebug";
+			changes.perf_harden = "0";
+			changes.cmd_devkmsg = "on";
+		} else {
+			changes.build_type = "user";
+			changes.perf_harden = "1";
+		}
+	} else if (strcmp(flag_name, "insecure-adb") == 0) {
+		if (enable) {
+			changes.secure = "0";
+			changes.adb_secure = "0";
+		} else {
+			changes.secure = "1";
+			changes.adb_secure = "1";
+		}
+	}
+
+	return magiskboot_modify_flags_core(target, live, &changes, out_file);
+}
+
+/* =========================================================================
  * 6. BusyBox Applet Entrypoint
  * ========================================================================= */
 
@@ -7612,6 +8497,18 @@ int aimg_main(int argc, char **argv) {
 		"--patch-fstab\0"
 		"patch-fstab\0"
 
+		/* Android Build Flags & Production Personality Engine */
+		"--build-status\0"
+		"build-status\0"
+		"--set-build-type\0"
+		"set-build-type\0"
+		"--build-type\0"
+		"build-type\0"
+		"--set-debuggable\0"
+		"set-debuggable\0"
+		"--set-insecure-adb\0"
+		"set-insecure-adb\0"
+
 		/* Help */
 		"-h\0"
 		"--help\0"
@@ -7723,6 +8620,17 @@ int aimg_main(int argc, char **argv) {
 		CMD_patch_cmdline_no_dash,
 		CMD_patch_fstab,
 		CMD_patch_fstab_no_dash,
+
+		CMD_build_status,
+		CMD_build_status_no_dash,
+		CMD_set_build_type,
+		CMD_set_build_type_no_dash,
+		CMD_build_type,
+		CMD_build_type_no_dash,
+		CMD_set_debuggable,
+		CMD_set_debuggable_no_dash,
+		CMD_set_insecure_adb,
+		CMD_set_insecure_adb_no_dash,
 
 		CMD_h,
 		CMD_help,
@@ -8138,6 +9046,32 @@ int aimg_main(int argc, char **argv) {
 	case CMD_patch_fstab_no_dash:
 		if (argc < 3) bb_show_usage();
 		return magiskboot_patch_fstab_op(argc, argv);
+
+	case CMD_build_status:
+	case CMD_build_status_no_dash:
+		return magiskboot_build_status_op(argc, argv);
+
+	case CMD_set_build_type:
+	case CMD_set_build_type_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_set_build_type_op(argc, argv);
+
+	case CMD_build_type:
+	case CMD_build_type_no_dash:
+		if (argc <= 3) {
+			return magiskboot_build_status_op(argc, argv);
+		}
+		return magiskboot_set_build_type_op(argc, argv);
+
+	case CMD_set_debuggable:
+	case CMD_set_debuggable_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_set_flag_op(argc, argv, "debuggable");
+
+	case CMD_set_insecure_adb:
+	case CMD_set_insecure_adb_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_set_flag_op(argc, argv, "insecure-adb");
 
 	case CMD_h:
 	case CMD_help:
