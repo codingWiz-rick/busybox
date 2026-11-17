@@ -68,3 +68,35 @@ TAGS
 #
 /bin/
 /build/
+
+#
+# IDE & Editor files
+#
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+#
+# Android image dumps & test artifacts
+#
+*.img
+*.img.*
+ramdisk*
+
+#
+# Logs & temporary files
+#
+*.log
+*.tmp
+*.bak
+
+#
+# Local configs & module artifacts
+#
+.config
+.config.old
+.version
+*.ko
+*.so
