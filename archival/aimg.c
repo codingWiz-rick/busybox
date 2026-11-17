@@ -41,7 +41,7 @@
 //usage:     "\n	    -n, --no-comp             Do not compress repacked ramdisk"
 //usage:     "\n	-e, --extract <img|payload> [part|comp] [out] Extract partition or component"
 //usage:     "\n	-c, --cleanup                 Clean up unpacked temporary files"
-//usage:     "\n	-i, --info <file>             Inspect boot image, kernel, ramdisk, DTB, or sparse metrics"
+//usage:     "\n	-i, --info <file>             Deep metrics for boot images, super, sparse, filesystems, vbmeta, DTB"
 //usage:     "\n"
 //usage:     "\nKernel Module Toolkit:"
 //usage:     "\n	--mod-info <mod.ko>           Display module vermagic and ELF header info"
@@ -54,7 +54,11 @@
 //usage:     "\n"
 //usage:     "\nRamdisk & Component Patchers:"
 //usage:     "\n	--init <boot.img> <action>    In-place /init tool (status, wrap, replace, extract, rm)"
-//usage:     "\n	--cpio <ramdisk> <act> [...]  CPIO operations (test, ls, extract, add, mkdir, rm)"
+//usage:     "\n	--cpio <rd|boot> <act> [...]  CPIO tool (ls, cat, extract, add, rm, chmod, chown, mv, stat, exists)"
+//usage:     "\n	--ramdisk-ls <boot|rd>        List entries inside boot ramdisk"
+//usage:     "\n	--ramdisk-cat <boot|rd> <ent> Output entry from boot ramdisk to stdout"
+//usage:     "\n	--ramdisk-stat <boot|rd> <en> Display file stat metrics inside boot ramdisk"
+//usage:     "\n	--ramdisk-test <boot|rd>      Verify ramdisk archive integrity"
 //usage:     "\n	--dtb <file> [print|patch]    DTB inspector and AVB/fstab verity patcher"
 //usage:     "\n	--vbmeta <file> [disable|...] VBMeta AVB 2.0 flags inspector and verity disabler"
 //usage:     "\n	--fstab <file> <print|patch>  In-place fstab configuration tool"
@@ -145,6 +149,9 @@ static uint8_t boot_check_fmt(const void *buf, size_t len) {
 	if (len >= 1024 + 4 && memcmp(b + 1024, "\xe2\xe1\xf5\xe0", 4) == 0) return BOOT_FMT_EROFS;
 	if (len >= 1024 + 4 && memcmp(b + 1024, "\x10\x20\xf5\xf2", 4) == 0) return BOOT_FMT_F2FS;
 	if (len >= 1080 + 2 && memcmp(b + 1080, "\x53\xef", 2) == 0) return BOOT_FMT_EXT4;
+	if (len >= 4096 + 4 && memcmp(b + 4096, "gDla", 4) == 0) return BOOT_FMT_SUPER;
+	if (len >= 4 && (memcmp(b, "gDla", 4) == 0 || memcmp(b, "0PLA", 4) == 0)) return BOOT_FMT_SUPER;
+	if (len >= 4 && (memcmp(b, "hsqs", 4) == 0 || memcmp(b, "sqsh", 4) == 0)) return BOOT_FMT_SQUASHFS;
 	if (len >= 4 && memcmp(b, "\x88\x16\x88\x58", 4) == 0) return BOOT_FMT_MTK;
 
 	/* LZMA header check */
@@ -188,6 +195,8 @@ static const char *boot_fmt2name(uint8_t fmt) {
 	case BOOT_FMT_EROFS:       return "erofs";
 	case BOOT_FMT_F2FS:        return "f2fs";
 	case BOOT_FMT_EXT4:        return "ext4";
+	case BOOT_FMT_SUPER:       return "super";
+	case BOOT_FMT_SQUASHFS:    return "squashfs";
 	case BOOT_FMT_VBMETA:      return "vbmeta";
 	case BOOT_FMT_PAYLOAD:     return "payload";
 	case BOOT_FMT_MTK:         return "mtk";
@@ -1052,6 +1061,625 @@ static void print_bootconfig_preview(const void *buf, size_t len, const char *pr
 	}
 }
 
+/* =========================================================================
+ * Comprehensive Image & Compression Inspection Engine
+ * ========================================================================= */
+
+static void inspect_compression_details(const void *buf, size_t len, uint8_t fmt, const char *prefix) {
+	const uint8_t *b = (const uint8_t *)buf;
+	if (!buf || len < 4) return;
+
+	switch (fmt) {
+	case BOOT_FMT_GZIP:
+		if (len >= 10 && b[0] == 0x1f && (b[1] == 0x8b || b[1] == 0x9e)) {
+			uint8_t flg = b[3];
+			uint32_t mtime = (uint32_t)b[4] | ((uint32_t)b[5] << 8) | ((uint32_t)b[6] << 16) | ((uint32_t)b[7] << 24);
+			uint8_t xfl = b[8];
+			uint8_t os = b[9];
+			const char *os_name = (os == 0) ? "FAT" : (os == 3) ? "Unix/Linux" : (os == 255) ? "Unknown" : "Other";
+			const char *level_str = (xfl == 2) ? "Maximum compression" : (xfl == 4) ? "Fastest algorithm" : "Default";
+
+			printf("%sCompression Algorithm: GZIP (Deflate)\n", prefix);
+			printf("%sCompression Level:     %s (XFL 0x%02x)\n", prefix, level_str, xfl);
+			printf("%sTarget OS:             %s (OS 0x%02x)\n", prefix, os_name, os);
+			if (mtime > 0) {
+				time_t t = (time_t)mtime;
+				struct tm tm_val;
+				char time_buf[64];
+				if (gmtime_r(&t, &tm_val)) {
+					strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S UTC", &tm_val);
+					printf("%sTimestamp (MTime):    %s\n", prefix, time_buf);
+				}
+			}
+			if (flg & 0x08) { /* FNAME */
+				size_t fn_off = 10;
+				if (flg & 0x04) { /* FEXTRA */
+					if (fn_off + 2 <= len) {
+						uint16_t xlen = (uint16_t)b[fn_off] | ((uint16_t)b[fn_off + 1] << 8);
+						fn_off += 2 + xlen;
+					}
+				}
+				if (fn_off < len) {
+					char orig_name[128];
+					size_t k = 0;
+					while (fn_off < len && b[fn_off] != 0 && k < sizeof(orig_name) - 1) {
+						orig_name[k++] = (char)b[fn_off++];
+					}
+					orig_name[k] = '\0';
+					if (k > 0) printf("%sOriginal Filename:    %s\n", prefix, orig_name);
+				}
+			}
+			if (len >= 18) {
+				uint32_t isize = (uint32_t)b[len - 4] | ((uint32_t)b[len - 3] << 8) | ((uint32_t)b[len - 2] << 16) | ((uint32_t)b[len - 1] << 24);
+				uint32_t crc32_val = (uint32_t)b[len - 8] | ((uint32_t)b[len - 7] << 8) | ((uint32_t)b[len - 6] << 16) | ((uint32_t)b[len - 5] << 24);
+				printf("%sCRC32 Checksum:       0x%08x\n", prefix, crc32_val);
+				if (isize > 0) {
+					double ratio = ((double)len / (double)isize) * 100.0;
+					printf("%sUncompressed Size:    %u bytes (%.2f MB)\n", prefix, isize, (double)isize / (1024 * 1024));
+					printf("%sCompression Ratio:    %.1f%% (Saved %.1f%%)\n", prefix, ratio, 100.0 - ratio);
+				}
+			}
+		}
+		break;
+
+	case BOOT_FMT_ZSTD:
+		if (len >= 5 && memcmp(b, "\x28\xb5\x2f\xfd", 4) == 0) {
+			uint8_t fhd = b[4];
+			uint8_t fcs_flag = (fhd >> 6) & 3;
+			bool single_seg = (fhd & (1 << 5)) != 0;
+			bool content_chk = (fhd & (1 << 2)) != 0;
+			uint8_t dict_flag = fhd & 3;
+			size_t off = 5;
+			uint64_t win_sz = 0;
+			uint64_t uncomp_sz = 0;
+
+			printf("%sCompression Algorithm: Zstandard (ZSTD RFC 8478)\n", prefix);
+			if (!single_seg && off < len) {
+				uint8_t wb = b[off++];
+				uint8_t exp = wb >> 3;
+				uint8_t mant = wb & 7;
+				win_sz = (1ULL << (10 + exp)) + (mant << (7 + exp));
+				printf("%sWindow Size:          %llu KB\n", prefix, (unsigned long long)(win_sz / 1024));
+			}
+			if (dict_flag) {
+				size_t dlen = (dict_flag == 1) ? 1 : (dict_flag == 2) ? 2 : 4;
+				off += dlen;
+			}
+			if (single_seg && fcs_flag == 0) {
+				if (off < len) uncomp_sz = b[off++];
+			} else if (fcs_flag == 1 && off + 2 <= len) {
+				uncomp_sz = ((uint64_t)b[off] | ((uint64_t)b[off + 1] << 8)) + 256;
+				off += 2;
+			} else if (fcs_flag == 2 && off + 4 <= len) {
+				uncomp_sz = (uint64_t)b[off] | ((uint64_t)b[off + 1] << 8) | ((uint64_t)b[off + 2] << 16) | ((uint64_t)b[off + 3] << 24);
+				off += 4;
+			} else if (fcs_flag == 3 && off + 8 <= len) {
+				memcpy(&uncomp_sz, b + off, 8);
+				off += 8;
+			}
+			if (uncomp_sz > 0) {
+				double ratio = ((double)len / (double)uncomp_sz) * 100.0;
+				printf("%sUncompressed Size:    %llu bytes (%.2f MB)\n", prefix, (unsigned long long)uncomp_sz, (double)uncomp_sz / (1024 * 1024));
+				printf("%sCompression Ratio:    %.1f%% (Saved %.1f%%)\n", prefix, ratio, 100.0 - ratio);
+			}
+			printf("%sContent Checksum:     %s\n", prefix, content_chk ? "Enabled (XXH64)" : "Disabled");
+		}
+		break;
+
+	case BOOT_FMT_LZ4:
+		if (len >= 7 && (memcmp(b, "\x04\x22\x4d\x18", 4) == 0 || memcmp(b, "\x03\x21\x4c\x18", 4) == 0)) {
+			uint8_t flg = b[4];
+			uint8_t bd = b[5];
+			uint8_t ver = (flg >> 6) & 3;
+			bool blk_indep = (flg & (1 << 5)) != 0;
+			bool blk_chk = (flg & (1 << 4)) != 0;
+			bool content_sz = (flg & (1 << 3)) != 0;
+			bool content_chk = (flg & (1 << 2)) != 0;
+			uint32_t blk_max = (bd >> 4) & 7;
+			const char *blk_str = (blk_max == 4) ? "64 KB" : (blk_max == 5) ? "256 KB" : (blk_max == 6) ? "1 MB" : (blk_max == 7) ? "4 MB" : "Default";
+
+			printf("%sCompression Algorithm: LZ4 Frame (v%u)\n", prefix, ver);
+			printf("%sMax Block Size:       %s\n", prefix, blk_str);
+			printf("%sBlock Independence:   %s\n", prefix, blk_indep ? "Independent" : "Linked");
+			printf("%sChecksums:            Block: %s, Content: %s\n", prefix, blk_chk ? "Yes" : "No", content_chk ? "Yes" : "No");
+			if (content_sz && len >= 15) {
+				uint64_t uncomp_sz = 0;
+				memcpy(&uncomp_sz, b + 6, 8);
+				if (uncomp_sz > 0) {
+					double ratio = ((double)len / (double)uncomp_sz) * 100.0;
+					printf("%sUncompressed Size:    %llu bytes (%.2f MB)\n", prefix, (unsigned long long)uncomp_sz, (double)uncomp_sz / (1024 * 1024));
+					printf("%sCompression Ratio:    %.1f%% (Saved %.1f%%)\n", prefix, ratio, 100.0 - ratio);
+				}
+			}
+		}
+		break;
+
+	case BOOT_FMT_LZ4_LEGACY:
+	case BOOT_FMT_LZ4_LG:
+		printf("%sCompression Algorithm: LZ4 Legacy Stream (%s)\n", prefix, (fmt == BOOT_FMT_LZ4_LG) ? "LG Format" : "Standard Legacy");
+		break;
+
+	case BOOT_FMT_XZ:
+		if (len >= 12 && memcmp(b, "\xfd" "7zXZ\x00", 6) == 0) {
+			uint8_t check_type = b[7] & 0x0f;
+			const char *chk_str = (check_type == 0) ? "None" : (check_type == 1) ? "CRC32" : (check_type == 4) ? "CRC64" : (check_type == 10) ? "SHA-256" : "Unknown";
+			printf("%sCompression Algorithm: XZ (LZMA2)\n", prefix);
+			printf("%sIntegrity Check:      %s (Type %u)\n", prefix, chk_str, check_type);
+		}
+		break;
+
+	case BOOT_FMT_BZIP2:
+		if (len >= 4 && memcmp(b, "BZh", 3) == 0) {
+			char lvl = b[3];
+			printf("%sCompression Algorithm: BZIP2 (Block level %c = %d KB)\n", prefix, lvl, (lvl - '0') * 100);
+		}
+		break;
+
+	case BOOT_FMT_LZOP:
+		if (len >= 9 && memcmp(b, "\x89LZO", 4) == 0) {
+			uint16_t ver = (uint16_t)b[4] << 8 | b[5];
+			printf("%sCompression Algorithm: LZO / LZO1X (Version 0x%04x)\n", prefix, ver);
+		}
+		break;
+
+	case BOOT_FMT_LZMA:
+		if (len >= 13 && b[0] == 0x5d) {
+			uint32_t dict_sz = (uint32_t)b[1] | ((uint32_t)b[2] << 8) | ((uint32_t)b[3] << 16) | ((uint32_t)b[4] << 24);
+			uint64_t uncomp_sz = 0;
+			memcpy(&uncomp_sz, b + 5, 8);
+			printf("%sCompression Algorithm: Raw LZMA\n", prefix);
+			printf("%sDictionary Size:      %u bytes (%u KB)\n", prefix, dict_sz, dict_sz / 1024);
+			if (uncomp_sz != 0xFFFFFFFFFFFFFFFFULL && uncomp_sz > 0) {
+				double ratio = ((double)len / (double)uncomp_sz) * 100.0;
+				printf("%sUncompressed Size:    %llu bytes (%.2f MB)\n", prefix, (unsigned long long)uncomp_sz, (double)uncomp_sz / (1024 * 1024));
+				printf("%sCompression Ratio:    %.1f%% (Saved %.1f%%)\n", prefix, ratio, 100.0 - ratio);
+			}
+		}
+		break;
+
+	default:
+		break;
+	}
+}
+
+static void inspect_kernel_embedded_details(const void *buf, size_t len, const char *prefix) {
+	const uint8_t *b = (const uint8_t *)buf;
+	const uint8_t *end;
+	const uint8_t *p;
+
+	if (!buf || len < 64) return;
+	end = b + len - 16;
+
+	/* Scan for IKCONFIG (embedded /proc/config.gz) */
+	p = b;
+	while (p <= end) {
+		if (memcmp(p, "IKCFG_ST", 8) == 0) {
+			size_t off = p - b;
+			const uint8_t *gz_start = p + 8;
+			if (gz_start + 10 <= b + len && gz_start[0] == 0x1f && gz_start[1] == 0x8b) {
+				printf("%sEmbedded Kernel Config: Present (IKCONFIG /proc/config.gz at offset 0x%zx)\n", prefix, off);
+			}
+			break;
+		}
+		p++;
+	}
+
+	/* Scan for Vermagic */
+	p = b;
+	while (p <= end) {
+		if (memcmp(p, "vermagic=", 9) == 0) {
+			char vm[128];
+			size_t k = 0;
+			const uint8_t *s = p + 9;
+			while (s < b + len && *s >= 0x20 && *s <= 0x7e && k < sizeof(vm) - 1) {
+				vm[k++] = *s++;
+			}
+			vm[k] = '\0';
+			if (k > 0) printf("%sKernel Vermagic:        %s\n", prefix, vm);
+			break;
+		}
+		p++;
+	}
+}
+
+static void inspect_filesystem_details(const void *buf, size_t len, uint8_t fmt, const char *prefix) {
+	const uint8_t *b = (const uint8_t *)buf;
+	if (!buf || len < 1024 + 128) return;
+
+	if (fmt == BOOT_FMT_EROFS) {
+		const uint8_t *sb = b + 1024;
+		uint32_t magic = (uint32_t)sb[0] | ((uint32_t)sb[1] << 8) | ((uint32_t)sb[2] << 16) | ((uint32_t)sb[3] << 24);
+		if (magic == EROFS_SUPER_MAGIC_V1) {
+			uint8_t blkszbits = sb[8];
+			uint32_t blk_sz = 1U << blkszbits;
+			uint32_t blocks = (uint32_t)sb[24] | ((uint32_t)sb[25] << 8) | ((uint32_t)sb[26] << 16) | ((uint32_t)sb[27] << 24);
+			uint64_t inos = 0;
+			char vol[17] = {0};
+			uint32_t feat_incompat = (uint32_t)sb[48] | ((uint32_t)sb[49] << 8) | ((uint32_t)sb[50] << 16) | ((uint32_t)sb[51] << 24);
+			uint64_t total_sz = (uint64_t)blocks * blk_sz;
+
+			memcpy(&inos, sb + 16, 8);
+			memcpy(vol, sb + 32, 16);
+
+			printf("%sType:                 EROFS (Enhanced Read-Only File System)\n", prefix);
+			printf("%sBlock Size:           %u bytes\n", prefix, blk_sz);
+			printf("%sTotal Blocks:         %u\n", prefix, blocks);
+			printf("%sFilesystem Size:      %llu bytes (%.2f MB)\n", prefix, (unsigned long long)total_sz, (double)total_sz / (1024 * 1024));
+			if (inos) printf("%sInodes Count:         %llu\n", prefix, (unsigned long long)inos);
+			if (vol[0]) printf("%sVolume Label:         %s\n", prefix, vol);
+			printf("%sCompression Features: %s%s\n", prefix,
+			       (feat_incompat & 1) ? "LZ4 " : "",
+			       (feat_incompat & 2) ? "LZMA/MicroLZMA " : "");
+		}
+	} else if (fmt == BOOT_FMT_EXT4) {
+		const uint8_t *sb = b + 1024;
+		uint16_t magic = (uint16_t)sb[56] | ((uint16_t)sb[57] << 8);
+		if (magic == 0xef53) {
+			uint32_t inodes_cnt = (uint32_t)sb[0] | ((uint32_t)sb[1] << 8) | ((uint32_t)sb[2] << 16) | ((uint32_t)sb[3] << 24);
+			uint32_t blocks_cnt = (uint32_t)sb[4] | ((uint32_t)sb[5] << 8) | ((uint32_t)sb[6] << 16) | ((uint32_t)sb[7] << 24);
+			uint32_t free_blocks = (uint32_t)sb[12] | ((uint32_t)sb[13] << 8) | ((uint32_t)sb[14] << 16) | ((uint32_t)sb[15] << 24);
+			uint32_t free_inodes = (uint32_t)sb[16] | ((uint32_t)sb[17] << 8) | ((uint32_t)sb[18] << 16) | ((uint32_t)sb[19] << 24);
+			uint32_t log_blk_sz = (uint32_t)sb[24] | ((uint32_t)sb[25] << 8) | ((uint32_t)sb[26] << 16) | ((uint32_t)sb[27] << 24);
+			uint32_t blk_sz = 1024U << log_blk_sz;
+			uint64_t total_sz = (uint64_t)blocks_cnt * blk_sz;
+			char vol[17] = {0};
+			memcpy(vol, sb + 120, 16);
+
+			printf("%sType:                 EXT4 File System\n", prefix);
+			printf("%sBlock Size:           %u bytes\n", prefix, blk_sz);
+			printf("%sTotal Blocks:         %u (Free: %u)\n", prefix, blocks_cnt, free_blocks);
+			printf("%sFilesystem Size:      %llu bytes (%.2f MB)\n", prefix, (unsigned long long)total_sz, (double)total_sz / (1024 * 1024));
+			printf("%sInodes:               %u (Free: %u)\n", prefix, inodes_cnt, free_inodes);
+			if (vol[0]) printf("%sVolume Label:         %s\n", prefix, vol);
+		}
+	} else if (fmt == BOOT_FMT_F2FS) {
+		const uint8_t *sb = b + 1024;
+		uint32_t magic = (uint32_t)sb[0] | ((uint32_t)sb[1] << 8) | ((uint32_t)sb[2] << 16) | ((uint32_t)sb[3] << 24);
+		if (magic == 0xf2f52010) {
+			uint16_t major = (uint16_t)sb[4] | ((uint16_t)sb[5] << 8);
+			uint16_t minor = (uint16_t)sb[6] | ((uint16_t)sb[7] << 8);
+			uint32_t log_blksz = (uint32_t)sb[12] | ((uint32_t)sb[13] << 8) | ((uint32_t)sb[14] << 16) | ((uint32_t)sb[15] << 24);
+			uint32_t blk_sz = 1U << log_blksz;
+			uint64_t block_count = 0;
+			uint64_t total_sz;
+			memcpy(&block_count, sb + 32, 8);
+			total_sz = block_count * blk_sz;
+
+			printf("%sType:                 F2FS (Flash-Friendly File System)\n", prefix);
+			printf("%sVersion:              %u.%u\n", prefix, major, minor);
+			printf("%sBlock Size:           %u bytes\n", prefix, blk_sz);
+			printf("%sTotal Blocks:         %llu\n", prefix, (unsigned long long)block_count);
+			printf("%sFilesystem Size:      %llu bytes (%.2f MB)\n", prefix, (unsigned long long)total_sz, (double)total_sz / (1024 * 1024));
+		}
+	}
+}
+
+static void inspect_super_details(const void *buf, size_t len, const char *prefix) {
+	const uint8_t *b = (const uint8_t *)buf;
+	const struct lp_metadata_geometry *geom = NULL;
+	const struct lp_metadata_header *hdr = NULL;
+	size_t geom_off = 0;
+	size_t hdr_off = 0;
+	uint32_t i;
+
+	if (!buf || len < 4096 + sizeof(struct lp_metadata_geometry)) return;
+
+	if (memcmp(b + 4096, "gDla", 4) == 0) {
+		geom = (const struct lp_metadata_geometry *)(b + 4096);
+		geom_off = 4096;
+	} else if (memcmp(b, "gDla", 4) == 0) {
+		geom = (const struct lp_metadata_geometry *)b;
+		geom_off = 0;
+	} else {
+		return;
+	}
+
+	printf("%sType:                 Android Dynamic Partitions (Super / liblp)\n", prefix);
+	printf("%sLogical Block Size:   %u bytes\n", prefix, geom->logical_block_size);
+	printf("%sMetadata Max Size:    %u bytes\n", prefix, geom->metadata_max_size);
+	printf("%sMetadata Slots:       %u\n", prefix, geom->metadata_slot_count);
+
+	/* Look for primary metadata header:
+	 * In standard Android dynamic partitions (liblp), offset 0 is 4KB reserved,
+	 * offset 4096 is primary geometry (4KB), offset 8192 is backup geometry (4KB),
+	 * and offset 12288 (4096 + 2 * 4096) is metadata slot 0 (0PLA).
+	 * In metadata-only images where geom_off == 0, slot 0 is at offset 8192.
+	 */
+	if (geom_off == 4096 && len >= 12288 + sizeof(struct lp_metadata_header) && memcmp(b + 12288, "0PLA", 4) == 0) {
+		hdr = (const struct lp_metadata_header *)(b + 12288);
+		hdr_off = 12288;
+	} else if (geom_off == 0 && len >= 8192 + sizeof(struct lp_metadata_header) && memcmp(b + 8192, "0PLA", 4) == 0) {
+		hdr = (const struct lp_metadata_header *)(b + 8192);
+		hdr_off = 8192;
+	} else {
+		size_t scan;
+		for (scan = 0; scan + sizeof(struct lp_metadata_header) <= len && scan < 262144; scan += 512) {
+			if (memcmp(b + scan, "0PLA", 4) == 0) {
+				hdr = (const struct lp_metadata_header *)(b + scan);
+				hdr_off = scan;
+				break;
+			}
+		}
+	}
+
+	if (hdr && hdr_off + hdr->header_size <= len) {
+		const uint8_t *tables_base = b + hdr_off + hdr->header_size;
+		printf("%sMetadata Version:     %u.%u\n", prefix, hdr->major_version, hdr->minor_version);
+		printf("%sTables Size:          %u bytes\n", prefix, hdr->tables_size);
+
+		/* Block Devices */
+		if (hdr->block_devices.num_entries > 0 &&
+		    hdr->block_devices.offset + hdr->block_devices.num_entries * hdr->block_devices.entry_size <= hdr->tables_size) {
+			printf("%sBlock Devices (%u):\n", prefix, hdr->block_devices.num_entries);
+			for (i = 0; i < hdr->block_devices.num_entries; i++) {
+				const struct lp_metadata_block_device *bdev =
+					(const struct lp_metadata_block_device *)(tables_base + hdr->block_devices.offset + i * hdr->block_devices.entry_size);
+				printf("%s  [%u] Device: %-16s Size: %llu bytes (%.2f GB) Alignment: %u\n",
+				       prefix, i, bdev->partition_name, (unsigned long long)bdev->size,
+				       (double)bdev->size / (1024.0 * 1024.0 * 1024.0), bdev->alignment);
+			}
+		}
+
+		/* Partition Groups */
+		if (hdr->groups.num_entries > 0 &&
+		    hdr->groups.offset + hdr->groups.num_entries * hdr->groups.entry_size <= hdr->tables_size) {
+			printf("%sPartition Groups (%u):\n", prefix, hdr->groups.num_entries);
+			for (i = 0; i < hdr->groups.num_entries; i++) {
+				const struct lp_metadata_group *grp =
+					(const struct lp_metadata_group *)(tables_base + hdr->groups.offset + i * hdr->groups.entry_size);
+				if (grp->maximum_size > 0) {
+					printf("%s  [%u] Group: %-24s Max Size: %llu bytes (%.2f MB)\n",
+					       prefix, i, grp->name, (unsigned long long)grp->maximum_size,
+					       (double)grp->maximum_size / (1024.0 * 1024.0));
+				} else {
+					printf("%s  [%u] Group: %-24s Max Size: Unlimited\n", prefix, i, grp->name);
+				}
+			}
+		}
+
+		/* Partitions & Extents */
+		if (hdr->partitions.num_entries > 0 &&
+		    hdr->partitions.offset + hdr->partitions.num_entries * hdr->partitions.entry_size <= hdr->tables_size) {
+			printf("%sLogical Partitions (%u):\n", prefix, hdr->partitions.num_entries);
+			printf("%s  %-24s %-16s %-14s %-12s %s\n", prefix, "Partition", "Size (Bytes)", "Size (MB)", "Group", "Attributes");
+			printf("%s  --------------------------------------------------------------------------------\n", prefix);
+
+			for (i = 0; i < hdr->partitions.num_entries; i++) {
+				const struct lp_metadata_partition *part =
+					(const struct lp_metadata_partition *)(tables_base + hdr->partitions.offset + i * hdr->partitions.entry_size);
+				uint64_t total_sectors = 0;
+				uint64_t part_bytes;
+				uint32_t e;
+				const char *grp_name = "unknown";
+				char attr_buf[64];
+
+				attr_buf[0] = '\0';
+				if (hdr->groups.num_entries > 0 && part->group_index < hdr->groups.num_entries) {
+					const struct lp_metadata_group *grp =
+						(const struct lp_metadata_group *)(tables_base + hdr->groups.offset + part->group_index * hdr->groups.entry_size);
+					grp_name = grp->name;
+				}
+
+				if (hdr->extents.num_entries > 0) {
+					for (e = 0; e < part->num_extents; e++) {
+						uint32_t eidx = part->first_extent_index + e;
+						if (eidx < hdr->extents.num_entries) {
+							const struct lp_metadata_extent *ext =
+								(const struct lp_metadata_extent *)(tables_base + hdr->extents.offset + eidx * hdr->extents.entry_size);
+							total_sectors += ext->num_sectors;
+						}
+					}
+				}
+				part_bytes = total_sectors * 512;
+
+				if (part->attributes & 1) strcat(attr_buf, "RO ");
+				if (part->attributes & 2) strcat(attr_buf, "SLOT_SUFFIXED ");
+				if (part->attributes & 4) strcat(attr_buf, "UPDATED ");
+				if (part->attributes & 8) strcat(attr_buf, "DISABLED ");
+				if (attr_buf[0] == '\0') strcpy(attr_buf, "none");
+
+				printf("%s  %-24s %-16llu %-14.2f %-12s %s\n", prefix, part->name,
+				       (unsigned long long)part_bytes, (double)part_bytes / (1024.0 * 1024.0), grp_name, attr_buf);
+			}
+		}
+	}
+}
+
+static void inspect_sparse_details(const void *buf, size_t len, const char *prefix) {
+	const struct sparse_header *sph;
+	uint64_t unsparse_sz;
+	const uint8_t *p;
+	const uint8_t *end;
+	uint32_t chunk_idx;
+	uint32_t raw_chunks = 0, fill_chunks = 0, dont_care_chunks = 0, crc_chunks = 0;
+	uint64_t data_bytes = 0;
+	const uint8_t *first_raw_payload = NULL;
+	size_t first_raw_len = 0;
+
+	if (!buf || len < sizeof(struct sparse_header)) return;
+	sph = (const struct sparse_header *)buf;
+	unsparse_sz = (uint64_t)sph->total_blks * sph->blk_sz;
+
+	printf("%sType:                 Android Sparse Image (simg)\n", prefix);
+	printf("%sSparse Version:       %u.%u\n", prefix, sph->major_version, sph->minor_version);
+	printf("%sBlock Size:           %u bytes\n", prefix, sph->blk_sz);
+	printf("%sTotal Blocks:         %u\n", prefix, sph->total_blks);
+	printf("%sUnsparse Raw Size:    %llu bytes (%.2f MB)\n", prefix, (unsigned long long)unsparse_sz, (double)unsparse_sz / (1024 * 1024));
+	printf("%sTotal Chunks:         %u\n", prefix, sph->total_chunks);
+	if (sph->image_checksum) printf("%sImage Checksum:       0x%08x\n", prefix, sph->image_checksum);
+
+	/* Chunk scan */
+	p = (const uint8_t *)buf + sph->file_hdr_sz;
+	end = (const uint8_t *)buf + len;
+
+	for (chunk_idx = 0; chunk_idx < sph->total_chunks && p + sph->chunk_hdr_sz <= end; chunk_idx++) {
+		const struct chunk_header *ch = (const struct chunk_header *)p;
+		uint16_t ctype = ch->chunk_type;
+		uint32_t cblocks = ch->chunk_sz;
+		uint32_t ctot = ch->total_sz;
+
+		if (ctype == CHUNK_TYPE_RAW) {
+			raw_chunks++;
+			data_bytes += (uint64_t)cblocks * sph->blk_sz;
+			if (!first_raw_payload && ctot > sph->chunk_hdr_sz) {
+				first_raw_payload = p + sph->chunk_hdr_sz;
+				first_raw_len = ctot - sph->chunk_hdr_sz;
+			}
+		} else if (ctype == CHUNK_TYPE_FILL) {
+			fill_chunks++;
+		} else if (ctype == CHUNK_TYPE_DONT_CARE) {
+			dont_care_chunks++;
+		} else if (ctype == CHUNK_TYPE_CRC32) {
+			crc_chunks++;
+		}
+
+		if (ctot < sph->chunk_hdr_sz) break;
+		p += ctot;
+	}
+
+	printf("%sChunk Breakdown:      RAW: %u, FILL: %u, DONT_CARE: %u, CRC32: %u\n",
+	       prefix, raw_chunks, fill_chunks, dont_care_chunks, crc_chunks);
+	printf("%sData Payload Size:    %llu bytes (%.2f MB)\n", prefix, (unsigned long long)data_bytes, (double)data_bytes / (1024.0 * 1024.0));
+	if (unsparse_sz > 0) {
+		double efficiency = ((double)len / (double)unsparse_sz) * 100.0;
+		printf("%sStorage Reduction:    %.1f%% of raw size (Saved %.1f%%)\n", prefix, efficiency, 100.0 - efficiency);
+	}
+
+	/* Probe inner payload */
+	if (first_raw_payload && first_raw_len >= 1024) {
+		uint8_t inner_fmt = boot_check_fmt(first_raw_payload, first_raw_len);
+		if (inner_fmt != BOOT_FMT_UNKNOWN) {
+			printf("%sInner Payload:        %s\n", prefix, boot_fmt2name(inner_fmt));
+			if (inner_fmt == BOOT_FMT_EROFS || inner_fmt == BOOT_FMT_EXT4 || inner_fmt == BOOT_FMT_F2FS) {
+				inspect_filesystem_details(first_raw_payload, first_raw_len, inner_fmt, prefix);
+			} else if (inner_fmt == BOOT_FMT_SUPER) {
+				inspect_super_details(first_raw_payload, first_raw_len, prefix);
+			}
+		}
+	}
+}
+
+static void inspect_avb_vbmeta_details(const void *buf, size_t len, const char *prefix) {
+	const struct avb_vbmeta_image_header *vbh;
+	const uint8_t *aux_base;
+	size_t aux_sz;
+	size_t off = 0;
+	uint32_t desc_count = 0;
+
+	if (!buf || len < sizeof(struct avb_vbmeta_image_header)) return;
+	vbh = (const struct avb_vbmeta_image_header *)buf;
+
+	printf("%sType:                 AVB 2.0 VBMeta Image\n", prefix);
+	printf("%sAVB Version:          %u.%u\n", prefix,
+	       SWAP_BE32(vbh->required_libavb_version_major), SWAP_BE32(vbh->required_libavb_version_minor));
+	printf("%sRollback Index:       %llu\n", prefix, (unsigned long long)SWAP_BE64(vbh->rollback_index));
+	printf("%sRelease String:       %s\n", prefix, vbh->release_string);
+
+	{
+		uint32_t flg = SWAP_BE32(vbh->flags);
+		printf("%sFlags:                0x%08x%s%s\n", prefix, flg,
+		       (flg & 1) ? " [HASHTREE_DISABLED (dm-verity off)]" : "",
+		       (flg & 2) ? " [VERIFICATION_DISABLED (avb off)]" : "");
+	}
+
+	aux_sz = (size_t)SWAP_BE64(vbh->auxiliary_data_block_size);
+	aux_base = (const uint8_t *)buf + sizeof(struct avb_vbmeta_image_header) + SWAP_BE64(vbh->authentication_data_block_size);
+
+	if (aux_base + aux_sz <= (const uint8_t *)buf + len) {
+		size_t desc_off = (size_t)SWAP_BE64(vbh->descriptors_offset);
+		size_t desc_sz = (size_t)SWAP_BE64(vbh->descriptors_size);
+		size_t desc_end = desc_off + desc_sz;
+
+		if (desc_end > aux_sz) desc_end = aux_sz;
+		off = desc_off;
+
+		if (desc_sz > 0) {
+			printf("%sAVB Descriptors:\n", prefix);
+			while (off + sizeof(struct avb_descriptor) <= desc_end) {
+				const struct avb_descriptor *d = (const struct avb_descriptor *)(aux_base + off);
+				uint64_t tag = SWAP_BE64(d->tag);
+				uint64_t nbf = SWAP_BE64(d->num_bytes_following);
+				const uint8_t *d_data = aux_base + off + sizeof(struct avb_descriptor);
+
+				if (off + sizeof(struct avb_descriptor) + nbf > desc_end) break;
+
+			if (tag == AVB_DESCRIPTOR_TAG_HASH) {
+				const struct avb_hash_descriptor *hd = (const struct avb_hash_descriptor *)d;
+				uint32_t nlen = SWAP_BE32(hd->partition_name_len);
+				uint32_t dlen = SWAP_BE32(hd->digest_len);
+				uint32_t slen = SWAP_BE32(hd->salt_len);
+				const char *pname = (const char *)(d_data + sizeof(*hd) - sizeof(*d));
+				const uint8_t *salt = (const uint8_t *)pname + nlen;
+				const uint8_t *digest = salt + slen;
+				char part_name[64] = {0};
+				char digest_hex[128] = {0};
+				uint32_t k;
+
+				if (nlen < sizeof(part_name)) memcpy(part_name, pname, nlen);
+				for (k = 0; k < dlen && k < 32; k++) {
+					sprintf(digest_hex + k * 2, "%02x", digest[k]);
+				}
+
+				printf("%s  [Hash] Partition: %-16s Algo: %-10s Size: %-10llu Digest: %s\n",
+				       prefix, part_name, (const char *)hd->hash_algorithm,
+				       (unsigned long long)SWAP_BE64(hd->image_size), digest_hex);
+				desc_count++;
+			} else if (tag == AVB_DESCRIPTOR_TAG_HASHTREE) {
+				const struct avb_hashtree_descriptor *htd = (const struct avb_hashtree_descriptor *)d;
+				uint32_t nlen = SWAP_BE32(htd->partition_name_len);
+				uint32_t rdlen = SWAP_BE32(htd->root_digest_len);
+				uint32_t slen = SWAP_BE32(htd->salt_len);
+				const char *pname = (const char *)(d_data + sizeof(*htd) - sizeof(*d));
+				const uint8_t *salt = (const uint8_t *)pname + nlen;
+				const uint8_t *rdigest = salt + slen;
+				char part_name[64] = {0};
+				char rdigest_hex[128] = {0};
+				uint32_t k;
+
+				if (nlen < sizeof(part_name)) memcpy(part_name, pname, nlen);
+				for (k = 0; k < rdlen && k < 32; k++) {
+					sprintf(rdigest_hex + k * 2, "%02x", rdigest[k]);
+				}
+
+				printf("%s  [Hashtree] Partition: %-12s Tree: %-8llu Algo: %-8s Root Digest: %s\n",
+				       prefix, part_name, (unsigned long long)SWAP_BE64(htd->tree_size),
+				       (const char *)htd->hash_algorithm, rdigest_hex);
+				desc_count++;
+			} else if (tag == AVB_DESCRIPTOR_TAG_CHAIN_PARTITION) {
+				const struct avb_chain_partition_descriptor *cpd = (const struct avb_chain_partition_descriptor *)d;
+				uint32_t nlen = SWAP_BE32(cpd->partition_name_len);
+				const char *pname = (const char *)(d_data + sizeof(*cpd) - sizeof(*d));
+				char part_name[64] = {0};
+				if (nlen < sizeof(part_name)) memcpy(part_name, pname, nlen);
+
+				printf("%s  [Chain] Partition: %-16s Rollback Index Location: %u Key Size: %u\n",
+				       prefix, part_name, SWAP_BE32(cpd->rollback_index_location), SWAP_BE32(cpd->public_key_len));
+				desc_count++;
+			} else if (tag == AVB_DESCRIPTOR_TAG_KERNEL_CMDLINE) {
+				const struct avb_kernel_cmdline_descriptor *kcd = (const struct avb_kernel_cmdline_descriptor *)d;
+				uint32_t clen = SWAP_BE32(kcd->kernel_cmdline_length);
+				const char *cmd = (const char *)(d_data + sizeof(*kcd) - sizeof(*d));
+				printf("%s  [Kernel Cmdline] %.*s\n", prefix, (int)clen, cmd);
+				desc_count++;
+			} else if (tag == AVB_DESCRIPTOR_TAG_PROPERTY) {
+				const struct avb_property_descriptor *pd = (const struct avb_property_descriptor *)d;
+				uint64_t klen = SWAP_BE64(pd->key_num_bytes);
+				uint64_t vlen = SWAP_BE64(pd->value_num_bytes);
+				const char *key = (const char *)(d_data + sizeof(*pd) - sizeof(*d));
+				const char *val = key + klen + 1;
+				printf("%s  [Property] %.*s=%.*s\n", prefix, (int)klen, key, (int)vlen, val);
+				desc_count++;
+			}
+
+			off += sizeof(struct avb_descriptor) + nbf;
+		}
+		}
+		if (desc_count > 0) {
+			printf("%sTotal Descriptors:    %u\n", prefix, desc_count);
+		}
+	}
+}
+
 static void boot_img_print_info(const boot_img_t *img, const char *path) {
 	uint32_t ver;
 	bool is_vnd;
@@ -1119,6 +1747,9 @@ static void boot_img_print_info(const boot_img_t *img, const char *path) {
 		printf("Kernel:\n");
 		printf("  Size:               %u bytes (%.2f MB)\n", img->kernel_size, (double)img->kernel_size / (1024 * 1024));
 		printf("  Format:             %s\n", boot_fmt2name(img->k_fmt));
+		if (boot_fmt_compressed(img->k_fmt)) {
+			inspect_compression_details(img->kernel, img->kernel_size, img->k_fmt, "  ");
+		}
 		if (img->k_fmt == BOOT_FMT_ARM64_IMAGE) {
 			inspect_arm64_image(img->kernel, img->kernel_size, "  ");
 		} else if (img->k_fmt == BOOT_FMT_ZIMAGE) {
@@ -1127,6 +1758,7 @@ static void boot_img_print_info(const boot_img_t *img, const char *path) {
 		if (extract_kernel_banner(img->kernel, img->kernel_size, img->k_fmt, banner, sizeof(banner))) {
 			printf("  Banner:             %s\n", banner);
 		}
+		inspect_kernel_embedded_details(img->kernel, img->kernel_size, "  ");
 	}
 
 	if (img->kernel_dtb_size > 0 && img->kernel_dtb) {
@@ -1141,6 +1773,9 @@ static void boot_img_print_info(const boot_img_t *img, const char *path) {
 		printf("Ramdisk:\n");
 		printf("  Size:               %u bytes (%.2f MB)\n", img->ramdisk_size, (double)img->ramdisk_size / (1024 * 1024));
 		printf("  Format:             %s\n", boot_fmt2name(img->r_fmt));
+		if (boot_fmt_compressed(img->r_fmt)) {
+			inspect_compression_details(img->ramdisk, img->ramdisk_size, img->r_fmt, "  ");
+		}
 		inspect_ramdisk_details(img->ramdisk, img->ramdisk_size, img->r_fmt, "  ");
 	}
 
@@ -1230,6 +1865,13 @@ static void boot_img_print_info(const boot_img_t *img, const char *path) {
 			       (unsigned long long)img->avb_footer->vbmeta_offset,
 			       (unsigned long long)img->avb_footer->vbmeta_offset);
 			printf("  VBMeta Size:        %llu bytes\n", (unsigned long long)img->avb_footer->vbmeta_size);
+			if (img->map_ptr && img->avb_footer->vbmeta_offset < img->map_sz &&
+			    img->avb_footer->vbmeta_offset + img->avb_footer->vbmeta_size <= img->map_sz) {
+				const void *vb_ptr = (const uint8_t *)img->map_ptr + img->avb_footer->vbmeta_offset;
+				if (memcmp(vb_ptr, "AVB0", 4) == 0) {
+					inspect_avb_vbmeta_details(vb_ptr, (size_t)img->avb_footer->vbmeta_size, "  ");
+				}
+			}
 		}
 	}
 	printf("====================================================================\n");
@@ -1293,6 +1935,7 @@ static bool boot_img_parse_full(boot_img_t *img, const char *path, bool silent) 
 	const uint8_t *end;
 	const uint8_t *hdr_ptr = NULL;
 	const uint8_t *addr;
+	const uint8_t *scan_limit;
 	uint32_t page_sz;
 	size_t off;
 
@@ -1326,7 +1969,10 @@ static bool boot_img_parse_full(boot_img_t *img, const char *path, bool silent) 
 	start = (const uint8_t *)img->map_ptr;
 	end = start + img->map_sz;
 
-	for (addr = start; addr + sizeof(struct boot_img_hdr_v0) <= end; ++addr) {
+	scan_limit = start + 131072;
+	if (scan_limit > end) scan_limit = end;
+
+	for (addr = start; addr + sizeof(struct boot_img_hdr_v0) <= scan_limit; ++addr) {
 		size_t rem = end - addr;
 		if (rem >= 8 && memcmp(addr, "CHROMEOS", 8) == 0) {
 			img->flags |= BOOT_FLAG_CHROMEOS;
@@ -1368,6 +2014,13 @@ static bool boot_img_parse_full(boot_img_t *img, const char *path, bool silent) 
 	memcpy(img->hdr.raw, hdr_ptr, img->hdr.raw_sz);
 
 	page_sz = dyn_hdr_page_size(&img->hdr);
+	if (page_sz < 2048 || page_sz > 65536 || (page_sz & (page_sz - 1)) != 0) {
+		if (!silent) bb_error_msg("invalid boot page size (%u)", page_sz);
+		free(img->hdr.raw);
+		img->hdr.raw = NULL;
+		munmap(img->map_ptr, img->map_sz);
+		return false;
+	}
 	off = align_to(img->hdr.raw_sz, page_sz);
 
 	/* Populate sections */
@@ -2504,7 +3157,15 @@ static int cpio_exec_cmd(cpio_node_t **head_ptr, int argc, char **argv, bool *mo
 		"ln\0"
 		"rm\0"
 		"extract\0"
-		"ls\0";
+		"ls\0"
+		"cat\0"
+		"chmod\0"
+		"chown\0"
+		"mv\0"
+		"rename\0"
+		"stat\0"
+		"exists\0"
+		"repack\0";
 	enum {
 		CPIO_ACT_mkdir = 0,
 		CPIO_ACT_add,
@@ -2512,6 +3173,14 @@ static int cpio_exec_cmd(cpio_node_t **head_ptr, int argc, char **argv, bool *mo
 		CPIO_ACT_rm,
 		CPIO_ACT_extract,
 		CPIO_ACT_ls,
+		CPIO_ACT_cat,
+		CPIO_ACT_chmod,
+		CPIO_ACT_chown,
+		CPIO_ACT_mv,
+		CPIO_ACT_rename,
+		CPIO_ACT_stat,
+		CPIO_ACT_exists,
+		CPIO_ACT_repack,
 	};
 	const char *act;
 	if (argc < 1) return 0;
@@ -2747,44 +3416,400 @@ static int cpio_exec_cmd(cpio_node_t **head_ptr, int argc, char **argv, bool *mo
 		return 1;
 	}
 
+	case CPIO_ACT_cat: {
+		const char *entry_name;
+		cpio_node_t *curr;
+		bool found = false;
+		if (argc < 2) return 1;
+		entry_name = argv[1];
+		for (curr = *head_ptr; curr; curr = curr->next) {
+			if (strcmp(curr->name, entry_name) == 0) {
+				if (curr->data && curr->filesize > 0) {
+					full_write(STDOUT_FILENO, curr->data, curr->filesize);
+				}
+				found = true;
+				break;
+			}
+		}
+		if (!found) bb_error_msg("entry '%s' not found in cpio", entry_name);
+		return 2;
+	}
+
+	case CPIO_ACT_chmod: {
+		uint32_t mode;
+		const char *entry_name;
+		cpio_node_t *curr;
+		bool found = false;
+		if (argc < 3) return 1;
+		mode = bb_strtou(argv[1], NULL, 8);
+		entry_name = argv[2];
+		for (curr = *head_ptr; curr; curr = curr->next) {
+			if (strcmp(curr->name, entry_name) == 0) {
+				curr->mode = (curr->mode & ~07777) | (mode & 07777);
+				*modified = true;
+				found = true;
+				break;
+			}
+		}
+		if (!found) bb_error_msg("entry '%s' not found in cpio", entry_name);
+		return 3;
+	}
+
+	case CPIO_ACT_chown: {
+		const char *ug_str;
+		const char *entry_name;
+		uint32_t uid = 0, gid = 0;
+		char *colon;
+		cpio_node_t *curr;
+		bool found = false;
+		if (argc < 3) return 1;
+		ug_str = argv[1];
+		entry_name = argv[2];
+		uid = bb_strtou(ug_str, &colon, 10);
+		if (colon && *colon == ':') {
+			gid = bb_strtou(colon + 1, NULL, 10);
+		}
+		for (curr = *head_ptr; curr; curr = curr->next) {
+			if (strcmp(curr->name, entry_name) == 0) {
+				curr->uid = uid;
+				curr->gid = gid;
+				*modified = true;
+				found = true;
+				break;
+			}
+		}
+		if (!found) bb_error_msg("entry '%s' not found in cpio", entry_name);
+		return 3;
+	}
+
+	case CPIO_ACT_mv:
+	case CPIO_ACT_rename: {
+		const char *from;
+		const char *to;
+		cpio_node_t *curr;
+		bool found = false;
+		if (argc < 3) return 1;
+		from = argv[1];
+		to = argv[2];
+		for (curr = *head_ptr; curr; curr = curr->next) {
+			if (strcmp(curr->name, from) == 0) {
+				free(curr->name);
+				curr->name = xstrdup(to);
+				*modified = true;
+				found = true;
+				break;
+			}
+		}
+		if (!found) bb_error_msg("entry '%s' not found in cpio", from);
+		return 3;
+	}
+
+	case CPIO_ACT_stat: {
+		const char *entry_name;
+		cpio_node_t *curr;
+		bool found = false;
+		if (argc < 2) return 1;
+		entry_name = argv[1];
+		for (curr = *head_ptr; curr; curr = curr->next) {
+			if (strcmp(curr->name, entry_name) == 0) {
+				const char *type_str = S_ISDIR(curr->mode) ? "Directory" : S_ISLNK(curr->mode) ? "Symbolic Link" : "Regular File";
+				printf("  Entry:     %s\n", curr->name);
+				printf("  Type:      %s\n", type_str);
+				printf("  Mode:      0%o\n", curr->mode & 07777);
+				printf("  Size:      %u bytes\n", curr->filesize);
+				printf("  UID/GID:   %u / %u\n", curr->uid, curr->gid);
+				printf("  Links:     %u\n", curr->nlink);
+				if (S_ISLNK(curr->mode) && curr->data) {
+					printf("  Target:    %.*s\n", curr->filesize, (char *)curr->data);
+				}
+				found = true;
+				break;
+			}
+		}
+		if (!found) bb_error_msg("entry '%s' not found in cpio", entry_name);
+		return 2;
+	}
+
+	case CPIO_ACT_exists: {
+		const char *entry_name;
+		cpio_node_t *curr;
+		if (argc < 2) return 1;
+		entry_name = argv[1];
+		for (curr = *head_ptr; curr; curr = curr->next) {
+			if (strcmp(curr->name, entry_name) == 0) {
+				return 2;
+			}
+		}
+		return -1;
+	}
+
+	case CPIO_ACT_repack: {
+		const char *out_cpio;
+		if (argc < 2) return 1;
+		out_cpio = argv[1];
+		cpio_write_all(out_cpio, *head_ptr);
+		printf("Repacked cpio to '%s'\n", out_cpio);
+		return 2;
+	}
+
 	default:
-		bb_error_msg("unknown cpio action '%s' (supported: test, ls, extract, mkdir, add, ln, rm)", act);
+		bb_error_msg("unknown cpio action '%s' (supported: test, ls, cat, extract, mkdir, add, ln, rm, chmod, chown, mv, stat, exists, repack)", act);
 		return 1;
 	}
 }
 
+static int boot_img_write_repacked_with_ramdisk(boot_img_t *boot, const char *new_rd, const char *final_target) {
+	char tmp_out_boot[PATH_MAX + 64];
+	int out_fd;
+	uint32_t page_sz;
+	size_t hdr_pad;
+	uint32_t kernel_sz = 0;
+	uint32_t ramdisk_sz = 0;
+	uint32_t second_sz;
+	uint32_t extra_sz;
+	uint32_t recov_dtbo_sz;
+	uint32_t dtb_sz;
+	uint32_t bootconfig_sz;
+
+	if (!boot || !new_rd || !final_target) return 1;
+
+	snprintf(tmp_out_boot, sizeof(tmp_out_boot), "%s.tmp.%d", final_target, (int)getpid());
+	out_fd = open3_or_warn(tmp_out_boot, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (out_fd < 0) return 1;
+
+	page_sz = dyn_hdr_page_size(&boot->hdr);
+	hdr_pad = align_to(boot->hdr.raw_sz, page_sz);
+	lseek(out_fd, hdr_pad, SEEK_SET);
+
+	/* 1. Write kernel section */
+	if (!dyn_hdr_is_vendor(&boot->hdr) && boot->kernel && boot->kernel_size > 0) {
+		size_t rem;
+		kernel_sz = (uint32_t)boot->kernel_size;
+		full_write(out_fd, boot->kernel, kernel_sz);
+		if (boot->kernel_dtb && boot->kernel_dtb_size > 0) {
+			full_write(out_fd, boot->kernel_dtb, boot->kernel_dtb_size);
+			kernel_sz += (uint32_t)boot->kernel_dtb_size;
+		}
+		rem = kernel_sz % page_sz;
+		if (rem > 0) {
+			static const uint8_t zeros[4096] = {0};
+			full_write(out_fd, zeros, page_sz - rem);
+		}
+		*dyn_hdr_kernel_size(&boot->hdr) = kernel_sz;
+	}
+
+	/* 2. Write new ramdisk */
+	copy_file_section(out_fd, new_rd, page_sz, &ramdisk_sz);
+	*dyn_hdr_ramdisk_size(&boot->hdr) = ramdisk_sz;
+
+	/* 3. Write remaining sections */
+	second_sz = (uint32_t)boot->second_size;
+	if (boot->second && second_sz > 0) {
+		size_t rem;
+		full_write(out_fd, boot->second, second_sz);
+		rem = second_sz % page_sz;
+		if (rem > 0) {
+			static const uint8_t zeros[4096] = {0};
+			full_write(out_fd, zeros, page_sz - rem);
+		}
+	}
+
+	extra_sz = (uint32_t)boot->extra_size;
+	if (boot->extra && extra_sz > 0) {
+		size_t rem;
+		full_write(out_fd, boot->extra, extra_sz);
+		rem = extra_sz % page_sz;
+		if (rem > 0) {
+			static const uint8_t zeros[4096] = {0};
+			full_write(out_fd, zeros, page_sz - rem);
+		}
+	}
+
+	recov_dtbo_sz = (uint32_t)boot->recovery_dtbo_size;
+	if (boot->recovery_dtbo && recov_dtbo_sz > 0) {
+		size_t rem;
+		full_write(out_fd, boot->recovery_dtbo, recov_dtbo_sz);
+		rem = recov_dtbo_sz % page_sz;
+		if (rem > 0) {
+			static const uint8_t zeros[4096] = {0};
+			full_write(out_fd, zeros, page_sz - rem);
+		}
+	}
+
+	dtb_sz = (uint32_t)boot->dtb_size;
+	if (boot->dtb && dtb_sz > 0) {
+		size_t rem;
+		full_write(out_fd, boot->dtb, dtb_sz);
+		rem = dtb_sz % page_sz;
+		if (rem > 0) {
+			static const uint8_t zeros[4096] = {0};
+			full_write(out_fd, zeros, page_sz - rem);
+		}
+	}
+
+	bootconfig_sz = (uint32_t)boot->bootconfig_size;
+	if (boot->bootconfig && bootconfig_sz > 0) {
+		size_t rem;
+		full_write(out_fd, boot->bootconfig, bootconfig_sz);
+		rem = bootconfig_sz % page_sz;
+		if (rem > 0) {
+			static const uint8_t zeros[4096] = {0};
+			full_write(out_fd, zeros, page_sz - rem);
+		}
+	}
+
+	/* 4. Recalculate SHA ID */
+	dyn_hdr_recalc_id(&boot->hdr, out_fd, hdr_pad, page_sz,
+	                  kernel_sz, ramdisk_sz, second_sz, extra_sz,
+	                  recov_dtbo_sz, dtb_sz);
+
+	/* 5. Handle AVB footer */
+	if ((boot->flags & BOOT_FLAG_AVB) && boot->avb_footer) {
+		uint64_t orig_vbmeta_off = SWAP_BE64(boot->avb_footer->vbmeta_offset);
+		uint64_t orig_vbmeta_sz = SWAP_BE64(boot->avb_footer->vbmeta_size);
+		if (orig_vbmeta_sz > 0 && orig_vbmeta_off + orig_vbmeta_sz <= boot->map_sz) {
+			struct avb_footer new_footer;
+			size_t rem;
+			off_t aosp_img_size = lseek(out_fd, 0, SEEK_CUR);
+			off_t new_vbmeta_off;
+
+			rem = (size_t)aosp_img_size % 4096;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, 4096 - rem);
+			}
+			new_vbmeta_off = lseek(out_fd, 0, SEEK_CUR);
+			full_write(out_fd, (const uint8_t *)boot->map_ptr + orig_vbmeta_off, orig_vbmeta_sz);
+			rem = (size_t)orig_vbmeta_sz % 4096;
+			if (rem > 0) {
+				static const uint8_t zeros[4096] = {0};
+				full_write(out_fd, zeros, 4096 - rem);
+			}
+			memcpy(&new_footer, boot->avb_footer, sizeof(new_footer));
+			new_footer.original_image_size = SWAP_BE64((uint64_t)aosp_img_size);
+			new_footer.vbmeta_offset = SWAP_BE64((uint64_t)new_vbmeta_off);
+			new_footer.vbmeta_size = boot->avb_footer->vbmeta_size;
+			full_write(out_fd, &new_footer, sizeof(new_footer));
+		}
+	}
+
+	/* 6. Write finalized header at offset 0 */
+	lseek(out_fd, 0, SEEK_SET);
+	full_write(out_fd, boot->hdr.raw, boot->hdr.raw_sz);
+
+	if (hdr_pad > boot->hdr.raw_sz) {
+		static const uint8_t zeros[4096] = {0};
+		full_write(out_fd, zeros, hdr_pad - boot->hdr.raw_sz);
+	}
+
+	close(out_fd);
+
+	if (rename(tmp_out_boot, final_target) != 0) {
+		if (copy_file(tmp_out_boot, final_target, FILEUTILS_FORCE) != 0) {
+			bb_perror_msg("failed to update '%s'", final_target);
+			unlink(tmp_out_boot);
+			return 1;
+		}
+		unlink(tmp_out_boot);
+	}
+
+	return 0;
+}
+
 static int magiskboot_cpio(int argc, char **argv) {
-	const char *cpio_file;
+	const char *target_file;
 	cpio_node_t *head = NULL;
 	bool modified = false;
 	int i;
 	int ret = 0;
+	uint8_t fmt = BOOT_FMT_UNKNOWN;
+	int fd;
+	char tmp_decomp[PATH_MAX];
+	bool is_boot_img = false;
+	boot_img_t boot;
 
+	tmp_decomp[0] = '\0';
 	if (argc < 4) bb_show_usage();
-	cpio_file = argv[2];
+	target_file = argv[2];
 
 	/* Fast-path test command */
-	if (strcmp(argv[3], "test") == 0) {
-		int fd = open_or_warn(cpio_file, O_RDONLY | O_CLOEXEC);
-		char magic[6];
+	if (strcmp(argv[3], "test") == 0 && argc == 4) {
+		char magic[8];
 		ssize_t n;
+		fd = open_or_warn(target_file, O_RDONLY | O_CLOEXEC);
 		if (fd < 0) return 1;
-		n = full_read(fd, magic, 6);
+		n = full_read(fd, magic, 8);
 		close(fd);
-		if (n == 6 && (memcmp(magic, "070701", 6) == 0 || memcmp(magic, "070702", 6) == 0)) {
+		if (n >= 6 && (memcmp(magic, "070701", 6) == 0 || memcmp(magic, "070702", 6) == 0)) {
+			printf("0\n");
+			return 0;
+		}
+		if (n >= 8 && (memcmp(magic, "ANDROID!", 8) == 0 || memcmp(magic, "VNDRBOOT", 8) == 0)) {
 			printf("0\n");
 			return 0;
 		}
 		return 1;
 	}
 
-	head = cpio_read_all(cpio_file);
+	/* Probe format of target_file */
+	fd = open_or_warn(target_file, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		uint8_t probe_hdr[4096];
+		ssize_t pn = full_read(fd, probe_hdr, sizeof(probe_hdr));
+		close(fd);
+		if (pn > 0) fmt = boot_check_fmt(probe_hdr, (size_t)pn);
+	}
+
+	if (fmt == BOOT_FMT_AOSP || fmt == BOOT_FMT_AOSP_VENDOR) {
+		int tfd;
+		is_boot_img = true;
+		if (!boot_img_parse_full(&boot, target_file, false)) return 1;
+		if (!boot.ramdisk || boot.ramdisk_size == 0) {
+			bb_error_msg("no ramdisk found in boot image '%s'", target_file);
+			boot_img_free(&boot);
+			return 1;
+		}
+		safe_strncpy(tmp_decomp, "/tmp/mb_cpiord_XXXXXX", sizeof(tmp_decomp));
+		tfd = mkstemp(tmp_decomp);
+		if (tfd < 0) {
+			boot_img_free(&boot);
+			return 1;
+		}
+		if (boot_fmt_compressed(boot.r_fmt)) {
+			bb_decompress_data(boot.r_fmt, boot.ramdisk, boot.ramdisk_size, tfd);
+		} else {
+			full_write(tfd, boot.ramdisk, boot.ramdisk_size);
+		}
+		close(tfd);
+		head = cpio_read_all(tmp_decomp);
+	} else if (boot_fmt_compressed(fmt)) {
+		void *cbuf;
+		size_t csz = 0;
+		int tfd;
+		cbuf = magiskboot_read_file(target_file, &csz);
+		if (!cbuf) return 1;
+		safe_strncpy(tmp_decomp, "/tmp/mb_decomp_XXXXXX", sizeof(tmp_decomp));
+		tfd = mkstemp(tmp_decomp);
+		if (tfd < 0) { free(cbuf); return 1; }
+		bb_decompress_data(fmt, cbuf, csz, tfd);
+		close(tfd);
+		free(cbuf);
+		head = cpio_read_all(tmp_decomp);
+	} else {
+		head = cpio_read_all(target_file);
+	}
+
+	if (!head) {
+		bb_error_msg("failed to parse CPIO archive '%s'", target_file);
+		if (tmp_decomp[0]) unlink(tmp_decomp);
+		if (is_boot_img) boot_img_free(&boot);
+		return 1;
+	}
 
 	i = 3;
 	while (i < argc) {
 		const char *arg = argv[i];
 		if (strchr(arg, ' ')) {
-			/* Quoted multi-word command, e.g. "add 0755 init path" */
 			char *copy = xstrdup(arg);
 			char *toks[16];
 			int tok_cnt = 0;
@@ -2800,16 +3825,51 @@ static int magiskboot_cpio(int argc, char **argv) {
 			free(copy);
 			i++;
 		} else {
-			/* Separate argv tokens */
 			int consumed = cpio_exec_cmd(&head, argc - i, &argv[i], &modified);
+			if (consumed < 0) {
+				ret = 1;
+				break;
+			}
 			i += (consumed > 0) ? consumed : 1;
 		}
 	}
 
 	if (modified) {
-		ret = cpio_write_all(cpio_file, head);
+		if (is_boot_img) {
+			char tmp_new_cpio[PATH_MAX];
+			char tmp_new_rd[PATH_MAX];
+
+			safe_strncpy(tmp_new_cpio, "/tmp/mb_newcpio_XXXXXX", sizeof(tmp_new_cpio));
+			close(xmkstemp(tmp_new_cpio));
+			cpio_write_all(tmp_new_cpio, head);
+
+			if (boot_fmt_compressed(boot.r_fmt)) {
+				safe_strncpy(tmp_new_rd, "/tmp/mb_newrd_XXXXXX", sizeof(tmp_new_rd));
+				close(xmkstemp(tmp_new_rd));
+				compress_file_format(tmp_new_cpio, tmp_new_rd, boot.r_fmt);
+				unlink(tmp_new_cpio);
+			} else {
+				safe_strncpy(tmp_new_rd, tmp_new_cpio, sizeof(tmp_new_rd));
+			}
+
+			if (boot_img_write_repacked_with_ramdisk(&boot, tmp_new_rd, target_file) != 0) {
+				bb_error_msg("failed to update boot image '%s'", target_file);
+				ret = 1;
+			} else {
+				printf("Successfully updated ramdisk inside '%s'\n", target_file);
+			}
+			unlink(tmp_new_rd);
+		} else if (boot_fmt_compressed(fmt)) {
+			cpio_write_all(tmp_decomp, head);
+			compress_file_format(tmp_decomp, target_file, fmt);
+			printf("Updated compressed ramdisk '%s'\n", target_file);
+		} else {
+			ret = cpio_write_all(target_file, head);
+		}
 	}
 
+	if (tmp_decomp[0]) unlink(tmp_decomp);
+	if (is_boot_img) boot_img_free(&boot);
 	cpio_free_all(head);
 	return ret;
 }
@@ -3434,17 +4494,6 @@ static int magiskboot_init_op(const char *image, const char *action, const char 
 		char tmp_new_cpio[PATH_MAX];
 		char tmp_new_rd[PATH_MAX];
 		char final_target[PATH_MAX];
-		char tmp_out_boot[PATH_MAX + 64];
-		int out_fd;
-		uint32_t page_sz;
-		size_t hdr_pad;
-		uint32_t kernel_sz = 0;
-		uint32_t ramdisk_sz = 0;
-		uint32_t second_sz;
-		uint32_t extra_sz;
-		uint32_t recov_dtbo_sz;
-		uint32_t dtb_sz;
-		uint32_t bootconfig_sz;
 
 		safe_strncpy(tmp_new_cpio, "/tmp/mb_new_cpio_XXXXXX", sizeof(tmp_new_cpio));
 		close(xmkstemp(tmp_new_cpio));
@@ -3473,150 +4522,13 @@ static int magiskboot_init_op(const char *image, const char *action, const char 
 			final_target[sizeof(final_target) - 1] = '\0';
 		}
 
-		snprintf(tmp_out_boot, sizeof(tmp_out_boot), "%s.tmp.%d", final_target, (int)getpid());
-
-		out_fd = open3_or_warn(tmp_out_boot, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-		if (out_fd < 0) {
+		if (boot_img_write_repacked_with_ramdisk(&boot, tmp_new_rd, final_target) != 0) {
 			unlink(tmp_new_rd);
 			boot_img_free(&boot);
 			return 1;
 		}
-
-		page_sz = dyn_hdr_page_size(&boot.hdr);
-		hdr_pad = align_to(boot.hdr.raw_sz, page_sz);
-		lseek(out_fd, hdr_pad, SEEK_SET);
-
-		/* 1. Write kernel section */
-		if (!dyn_hdr_is_vendor(&boot.hdr) && boot.kernel && boot.kernel_size > 0) {
-			size_t rem;
-			kernel_sz = (uint32_t)boot.kernel_size;
-			full_write(out_fd, boot.kernel, kernel_sz);
-			if (boot.kernel_dtb && boot.kernel_dtb_size > 0) {
-				full_write(out_fd, boot.kernel_dtb, boot.kernel_dtb_size);
-				kernel_sz += (uint32_t)boot.kernel_dtb_size;
-			}
-			rem = kernel_sz % page_sz;
-			if (rem > 0) {
-				static const uint8_t zeros[4096] = {0};
-				full_write(out_fd, zeros, page_sz - rem);
-			}
-			*dyn_hdr_kernel_size(&boot.hdr) = kernel_sz;
-		}
-
-		/* 2. Write new ramdisk */
-		copy_file_section(out_fd, tmp_new_rd, page_sz, &ramdisk_sz);
-		*dyn_hdr_ramdisk_size(&boot.hdr) = ramdisk_sz;
 		unlink(tmp_new_rd);
-
-		/* 3. Write remaining sections from memory */
-		second_sz = (uint32_t)boot.second_size;
-		if (boot.second && second_sz > 0) {
-			size_t rem;
-			full_write(out_fd, boot.second, second_sz);
-			rem = second_sz % page_sz;
-			if (rem > 0) {
-				static const uint8_t zeros[4096] = {0};
-				full_write(out_fd, zeros, page_sz - rem);
-			}
-		}
-
-		extra_sz = (uint32_t)boot.extra_size;
-		if (boot.extra && extra_sz > 0) {
-			size_t rem;
-			full_write(out_fd, boot.extra, extra_sz);
-			rem = extra_sz % page_sz;
-			if (rem > 0) {
-				static const uint8_t zeros[4096] = {0};
-				full_write(out_fd, zeros, page_sz - rem);
-			}
-		}
-
-		recov_dtbo_sz = (uint32_t)boot.recovery_dtbo_size;
-		if (boot.recovery_dtbo && recov_dtbo_sz > 0) {
-			size_t rem;
-			full_write(out_fd, boot.recovery_dtbo, recov_dtbo_sz);
-			rem = recov_dtbo_sz % page_sz;
-			if (rem > 0) {
-				static const uint8_t zeros[4096] = {0};
-				full_write(out_fd, zeros, page_sz - rem);
-			}
-		}
-
-		dtb_sz = (uint32_t)boot.dtb_size;
-		if (boot.dtb && dtb_sz > 0) {
-			size_t rem;
-			full_write(out_fd, boot.dtb, dtb_sz);
-			rem = dtb_sz % page_sz;
-			if (rem > 0) {
-				static const uint8_t zeros[4096] = {0};
-				full_write(out_fd, zeros, page_sz - rem);
-			}
-		}
-
-		bootconfig_sz = (uint32_t)boot.bootconfig_size;
-		if (boot.bootconfig && bootconfig_sz > 0) {
-			size_t rem;
-			full_write(out_fd, boot.bootconfig, bootconfig_sz);
-			rem = bootconfig_sz % page_sz;
-			if (rem > 0) {
-				static const uint8_t zeros[4096] = {0};
-				full_write(out_fd, zeros, page_sz - rem);
-			}
-		}
-
-		/* 4. Recalculate SHA ID */
-		dyn_hdr_recalc_id(&boot.hdr, out_fd, hdr_pad, page_sz,
-		                  kernel_sz, ramdisk_sz, second_sz, extra_sz,
-		                  recov_dtbo_sz, dtb_sz);
-
-		/* 5. Handle AVB footer */
-		if ((boot.flags & BOOT_FLAG_AVB) && boot.avb_footer) {
-			uint64_t orig_vbmeta_off = SWAP_BE64(boot.avb_footer->vbmeta_offset);
-			uint64_t orig_vbmeta_sz = SWAP_BE64(boot.avb_footer->vbmeta_size);
-			if (orig_vbmeta_sz > 0 && orig_vbmeta_off + orig_vbmeta_sz <= boot.map_sz) {
-				struct avb_footer new_footer;
-				size_t rem;
-				off_t aosp_img_size = lseek(out_fd, 0, SEEK_CUR);
-				off_t new_vbmeta_off;
-
-				rem = (size_t)aosp_img_size % 4096;
-				if (rem > 0) {
-					static const uint8_t zeros[4096] = {0};
-					full_write(out_fd, zeros, 4096 - rem);
-				}
-				new_vbmeta_off = lseek(out_fd, 0, SEEK_CUR);
-				full_write(out_fd, (const uint8_t *)boot.map_ptr + orig_vbmeta_off, orig_vbmeta_sz);
-				rem = (size_t)orig_vbmeta_sz % 4096;
-				if (rem > 0) {
-					static const uint8_t zeros[4096] = {0};
-					full_write(out_fd, zeros, 4096 - rem);
-				}
-				memcpy(&new_footer, boot.avb_footer, sizeof(new_footer));
-				new_footer.original_image_size = SWAP_BE64((uint64_t)aosp_img_size);
-				new_footer.vbmeta_offset = SWAP_BE64((uint64_t)new_vbmeta_off);
-				new_footer.vbmeta_size = boot.avb_footer->vbmeta_size;
-				full_write(out_fd, &new_footer, sizeof(new_footer));
-			}
-		}
-
-		/* 6. Write finalized header at offset 0 */
-		lseek(out_fd, 0, SEEK_SET);
-		full_write(out_fd, boot.hdr.raw, boot.hdr.raw_sz);
-
-		if (hdr_pad > boot.hdr.raw_sz) {
-			static const uint8_t zeros[4096] = {0};
-			full_write(out_fd, zeros, hdr_pad - boot.hdr.raw_sz);
-		}
-
-		close(out_fd);
 		boot_img_free(&boot);
-
-		if (rename(tmp_out_boot, final_target) != 0) {
-			bb_perror_msg("failed to update '%s'", final_target);
-			unlink(tmp_out_boot);
-			return 1;
-		}
-
 		fprintf(stderr, "[+] Successfully updated boot image init -> '%s'\n", final_target);
 		return 0;
 	}
@@ -5701,40 +6613,27 @@ static int magiskboot_info_image(const char *path) {
 		inspect_cpio_buffer(map, (size_t)sz, "");
 		break;
 
-	case BOOT_FMT_SPARSE: {
-		const struct sparse_header *sph = (const struct sparse_header *)map;
-		uint64_t unsparse_sz = (uint64_t)sph->total_blks * sph->blk_sz;
-		printf("Type:                 Android Sparse Image\n");
-		printf("Sparse Version:       %u.%u\n", sph->major_version, sph->minor_version);
-		printf("Block Size:           %u bytes\n", sph->blk_sz);
-		printf("Total Blocks:         %u\n", sph->total_blks);
-		printf("Unsparse Raw Size:    %llu bytes (%.2f MB)\n", (unsigned long long)unsparse_sz, (double)unsparse_sz / (1024 * 1024));
-		printf("Total Chunks:         %u\n", sph->total_chunks);
-		if (sph->image_checksum) printf("Checksum:             0x%08x\n", sph->image_checksum);
+	case BOOT_FMT_SPARSE:
+		inspect_sparse_details(map, (size_t)sz, "");
 		break;
-	}
+
+	case BOOT_FMT_SUPER:
+		inspect_super_details(map, (size_t)sz, "");
+		break;
 
 	case BOOT_FMT_EROFS:
-		printf("Type:                 EROFS (Enhanced Read-Only File System)\n");
-		break;
-
 	case BOOT_FMT_F2FS:
-		printf("Type:                 F2FS (Flash-Friendly File System)\n");
-		break;
-
 	case BOOT_FMT_EXT4:
-		printf("Type:                 EXT4 File System\n");
+		inspect_filesystem_details(map, (size_t)sz, fmt, "");
 		break;
 
-	case BOOT_FMT_VBMETA: {
-		const struct avb_vbmeta_image_header *vbh = (const struct avb_vbmeta_image_header *)map;
-		printf("Type:                 AVB 2.0 VBMeta Image\n");
-		printf("AVB Version:          %u.%u\n", vbh->required_libavb_version_major, vbh->required_libavb_version_minor);
-		printf("Rollback Index:       %llu\n", (unsigned long long)vbh->rollback_index);
-		printf("Release String:       %s\n", vbh->release_string);
-		printf("Flags:                0x%08x\n", vbh->flags);
+	case BOOT_FMT_SQUASHFS:
+		printf("Type:                 SquashFS File System\n");
 		break;
-	}
+
+	case BOOT_FMT_VBMETA:
+		inspect_avb_vbmeta_details(map, (size_t)sz, "");
+		break;
 
 	case BOOT_FMT_PAYLOAD:
 		printf("Type:                 Android OTA Update Payload (payload.bin)\n");
@@ -5752,18 +6651,27 @@ static int magiskboot_info_image(const char *path) {
 	case BOOT_FMT_ZSTD: {
 		char banner[256];
 		printf("Type:                 Compressed Archive / Stream (%s)\n", boot_fmt2name(fmt));
+		inspect_compression_details(map, (size_t)sz, fmt, "");
 		inspect_ramdisk_details(map, (size_t)sz, fmt, "");
 		if (extract_kernel_banner(map, (size_t)sz, fmt, banner, sizeof(banner))) {
 			printf("Linux Kernel Banner:  %s\n", banner);
 		}
+		inspect_kernel_embedded_details(map, (size_t)sz, "");
 		break;
 	}
 
 	default: {
 		char banner[256];
-		printf("Type:                 Raw / Unrecognized Binary Image\n");
-		if (scan_linux_version_banner(map, (size_t)sz, banner, sizeof(banner))) {
-			printf("Linux Kernel Banner:  %s\n", banner);
+		if ((size_t)sz >= 4096 + 4 && memcmp((const uint8_t *)map + 4096, "gDla", 4) == 0) {
+			inspect_super_details(map, (size_t)sz, "");
+		} else if ((size_t)sz >= 4 && memcmp(map, "gDla", 4) == 0) {
+			inspect_super_details(map, (size_t)sz, "");
+		} else {
+			printf("Type:                 Raw / Unrecognized Binary Image\n");
+			if (scan_linux_version_banner(map, (size_t)sz, banner, sizeof(banner))) {
+				printf("Linux Kernel Banner:  %s\n", banner);
+			}
+			inspect_kernel_embedded_details(map, (size_t)sz, "");
 		}
 		break;
 	}
@@ -5863,6 +6771,14 @@ int aimg_main(int argc, char **argv) {
 		"get-ramdisk\0"
 		"--ramdisk\0"
 		"ramdisk\0"
+		"--ramdisk-ls\0"
+		"ramdisk-ls\0"
+		"--ramdisk-cat\0"
+		"ramdisk-cat\0"
+		"--ramdisk-stat\0"
+		"ramdisk-stat\0"
+		"--ramdisk-test\0"
+		"ramdisk-test\0"
 
 		/* Packaging */
 		"--dist\0"
@@ -5960,6 +6876,14 @@ int aimg_main(int argc, char **argv) {
 		CMD_get_ramdisk_no_dash,
 		CMD_ramdisk,
 		CMD_ramdisk_no_dash,
+		CMD_ramdisk_ls,
+		CMD_ramdisk_ls_no_dash,
+		CMD_ramdisk_cat,
+		CMD_ramdisk_cat_no_dash,
+		CMD_ramdisk_stat,
+		CMD_ramdisk_stat_no_dash,
+		CMD_ramdisk_test,
+		CMD_ramdisk_test_no_dash,
 
 		CMD_dist,
 		CMD_dist_no_dash,
@@ -6275,8 +7199,72 @@ int aimg_main(int argc, char **argv) {
 		if (argc >= 3 && (strcmp(argv[2], "set") == 0 || strcmp(argv[2], "replace") == 0 || strcmp(argv[2], "inject") == 0)) {
 			return magiskboot_set_ramdisk_op(argc - 1, argv + 1);
 		}
+		if (argc >= 4 && (strcmp(argv[3], "ls") == 0 || strcmp(argv[3], "cat") == 0 || strcmp(argv[3], "chmod") == 0 ||
+		                  strcmp(argv[3], "add") == 0 || strcmp(argv[3], "rm") == 0 || strcmp(argv[3], "mkdir") == 0 ||
+		                  strcmp(argv[3], "stat") == 0 || strcmp(argv[3], "test") == 0)) {
+			char *cpio_argv[32];
+			int cpio_argc = 0;
+			int k;
+			cpio_argv[cpio_argc++] = argv[0];
+			cpio_argv[cpio_argc++] = (char *)"--cpio";
+			for (k = 2; k < argc && cpio_argc < 31; k++) {
+				cpio_argv[cpio_argc++] = argv[k];
+			}
+			cpio_argv[cpio_argc] = NULL;
+			return magiskboot_cpio(cpio_argc, cpio_argv);
+		}
 		if (argc < 3 && !strstr(cmd, "live")) bb_show_usage();
 		return magiskboot_set_ramdisk_op(argc, argv);
+
+	case CMD_ramdisk_ls:
+	case CMD_ramdisk_ls_no_dash: {
+		char *cpio_argv[5];
+		if (argc < 3) bb_show_usage();
+		cpio_argv[0] = argv[0];
+		cpio_argv[1] = (char *)"--cpio";
+		cpio_argv[2] = argv[2];
+		cpio_argv[3] = (char *)"ls";
+		cpio_argv[4] = NULL;
+		return magiskboot_cpio(4, cpio_argv);
+	}
+
+	case CMD_ramdisk_cat:
+	case CMD_ramdisk_cat_no_dash: {
+		char *cpio_argv[6];
+		if (argc < 4) bb_show_usage();
+		cpio_argv[0] = argv[0];
+		cpio_argv[1] = (char *)"--cpio";
+		cpio_argv[2] = argv[2];
+		cpio_argv[3] = (char *)"cat";
+		cpio_argv[4] = argv[3];
+		cpio_argv[5] = NULL;
+		return magiskboot_cpio(5, cpio_argv);
+	}
+
+	case CMD_ramdisk_stat:
+	case CMD_ramdisk_stat_no_dash: {
+		char *cpio_argv[6];
+		if (argc < 4) bb_show_usage();
+		cpio_argv[0] = argv[0];
+		cpio_argv[1] = (char *)"--cpio";
+		cpio_argv[2] = argv[2];
+		cpio_argv[3] = (char *)"stat";
+		cpio_argv[4] = argv[3];
+		cpio_argv[5] = NULL;
+		return magiskboot_cpio(5, cpio_argv);
+	}
+
+	case CMD_ramdisk_test:
+	case CMD_ramdisk_test_no_dash: {
+		char *cpio_argv[5];
+		if (argc < 3) bb_show_usage();
+		cpio_argv[0] = argv[0];
+		cpio_argv[1] = (char *)"--cpio";
+		cpio_argv[2] = argv[2];
+		cpio_argv[3] = (char *)"test";
+		cpio_argv[4] = NULL;
+		return magiskboot_cpio(4, cpio_argv);
+	}
 
 	case CMD_dist:
 	case CMD_dist_no_dash:

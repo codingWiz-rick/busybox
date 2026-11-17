@@ -65,6 +65,13 @@
 #define FDT_MAGIC               0xd00dfeedU
 #define ZSTD_MAGIC              0xfd2fb528U
 
+#define LP_METADATA_GEOMETRY_MAGIC 0x616c4467U /* "gDla" */
+#define LP_METADATA_HEADER_MAGIC   0x414c5030U /* "0PLA" */
+#define EROFS_SUPER_MAGIC_V1       0xe0f5e1e2U
+#define F2FS_SUPER_MAGIC           0xf2f52010U
+#define EXT4_SUPER_MAGIC           0xef53U
+#define SQUASHFS_MAGIC             0x73717368U
+
 #define MTK_HEADER_SIZE         512
 #define DHTB_HEADER_SIZE        512
 #define BLOB_HEADER_SIZE        512
@@ -101,11 +108,25 @@ typedef enum {
     BOOT_FMT_EXT4,
     BOOT_FMT_VBMETA,
     BOOT_FMT_PAYLOAD,
+    BOOT_FMT_SUPER,
+    BOOT_FMT_SQUASHFS,
 } boot_format_t;
 
 /*
- * Android Sparse Image Header
+ * Android Sparse Image Header and Chunk Constants
  */
+#define CHUNK_TYPE_RAW             0xcac1U
+#define CHUNK_TYPE_FILL            0xcac2U
+#define CHUNK_TYPE_DONT_CARE       0xcac3U
+#define CHUNK_TYPE_CRC32           0xcac4U
+
+struct chunk_header {
+    uint16_t chunk_type;
+    uint16_t reserved1;
+    uint32_t chunk_sz;    /* in blocks */
+    uint32_t total_sz;    /* in bytes including chunk_header */
+} __attribute__((packed));
+
 struct sparse_header {
     uint32_t magic;          /* 0xed26ff3a */
     uint16_t major_version;  /* 0x1 */
@@ -116,6 +137,81 @@ struct sparse_header {
     uint32_t total_blks;     /* total blocks in non-sparse image */
     uint32_t total_chunks;   /* total chunks in sparse image */
     uint32_t image_checksum; /* CRC32 or 0 */
+} __attribute__((packed));
+
+/*
+ * Android Dynamic Partitions (liblp) Super Image Structures
+ */
+struct lp_metadata_geometry {
+    uint32_t magic;                    /* LP_METADATA_GEOMETRY_MAGIC */
+    uint32_t struct_size;
+    uint8_t checksum[32];
+    uint32_t metadata_max_size;
+    uint32_t metadata_slot_count;
+    uint32_t logical_block_size;
+} __attribute__((packed));
+
+struct lp_metadata_header {
+    uint32_t magic;                    /* LP_METADATA_HEADER_MAGIC */
+    uint16_t major_version;
+    uint16_t minor_version;
+    uint32_t header_size;
+    uint8_t header_checksum[32];
+    uint32_t tables_size;
+    uint8_t tables_checksum[32];
+    struct {
+        uint32_t offset;
+        uint32_t num_entries;
+        uint32_t entry_size;
+    } partitions;
+    struct {
+        uint32_t offset;
+        uint32_t num_entries;
+        uint32_t entry_size;
+    } extents;
+    struct {
+        uint32_t offset;
+        uint32_t num_entries;
+        uint32_t entry_size;
+    } groups;
+    struct {
+        uint32_t offset;
+        uint32_t num_entries;
+        uint32_t entry_size;
+    } block_devices;
+    uint32_t flags;
+    uint8_t reserved[124];
+} __attribute__((packed));
+
+struct lp_metadata_partition {
+    char name[36];
+    uint32_t attributes;
+    uint32_t first_extent_index;
+    uint32_t num_extents;
+    uint32_t group_index;
+} __attribute__((packed));
+
+struct lp_metadata_extent {
+    uint64_t num_sectors;
+    uint32_t target_type;
+    uint64_t target_data;
+    uint32_t target_source;
+} __attribute__((packed));
+
+struct lp_metadata_group {
+    char name[36];
+    uint32_t flags;
+    uint64_t maximum_size;
+} __attribute__((packed));
+
+struct lp_metadata_block_device {
+    uint32_t first_logical_sector;
+    uint32_t alignment;
+    uint32_t alignment_offset;
+    uint32_t reserved;
+    uint64_t size;
+    char partition_name[36];
+    uint32_t flags;
 } __attribute__((packed));
 
 /*
@@ -320,7 +416,6 @@ struct blob_hdr {
 #define AVB_MAGIC_LEN               4
 #define AVB_RELEASE_STRING_SIZE     64
 #define AVB_SHA256_DIGEST_SIZE      32
-#define AVB_DESCRIPTOR_TAG_HASH     2
 
 #define AVB_VBMETA_IMAGE_FLAGS_HASHTREE_DISABLED       (1U << 0)
 #define AVB_VBMETA_IMAGE_FLAGS_VERIFICATION_DISABLED   (1U << 1)
@@ -356,8 +451,14 @@ struct avb_vbmeta_image_header {
     uint32_t flags;
     uint32_t rollback_index_location;
     uint8_t release_string[AVB_RELEASE_STRING_SIZE];
-    uint8_t reserved[80];
+    uint8_t reserved[64];
 } __attribute__((packed));
+
+#define AVB_DESCRIPTOR_TAG_PROPERTY             0ULL
+#define AVB_DESCRIPTOR_TAG_HASHTREE             1ULL
+#define AVB_DESCRIPTOR_TAG_HASH                 2ULL
+#define AVB_DESCRIPTOR_TAG_KERNEL_CMDLINE       3ULL
+#define AVB_DESCRIPTOR_TAG_CHAIN_PARTITION      4ULL
 
 struct avb_descriptor {
     uint64_t tag;
@@ -373,6 +474,45 @@ struct avb_hash_descriptor {
     uint32_t digest_len;
     uint32_t flags;
     uint8_t reserved[60];
+} __attribute__((packed));
+
+struct avb_hashtree_descriptor {
+    struct avb_descriptor parent;
+    uint32_t dm_verity_version;
+    uint64_t image_size;
+    uint64_t tree_offset;
+    uint64_t tree_size;
+    uint32_t data_block_size;
+    uint32_t hash_block_size;
+    uint32_t fec_num_roots;
+    uint64_t fec_offset;
+    uint64_t fec_size;
+    uint8_t hash_algorithm[32];
+    uint32_t partition_name_len;
+    uint32_t salt_len;
+    uint32_t root_digest_len;
+    uint32_t flags;
+    uint8_t reserved[60];
+} __attribute__((packed));
+
+struct avb_chain_partition_descriptor {
+    struct avb_descriptor parent;
+    uint32_t rollback_index_location;
+    uint32_t partition_name_len;
+    uint32_t public_key_len;
+    uint8_t reserved[64];
+} __attribute__((packed));
+
+struct avb_kernel_cmdline_descriptor {
+    struct avb_descriptor parent;
+    uint32_t flags;
+    uint32_t kernel_cmdline_length;
+} __attribute__((packed));
+
+struct avb_property_descriptor {
+    struct avb_descriptor parent;
+    uint64_t key_num_bytes;
+    uint64_t value_num_bytes;
 } __attribute__((packed));
 
 /*
