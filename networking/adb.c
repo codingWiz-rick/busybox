@@ -19,7 +19,7 @@
 
 //applet:IF_ADB(APPLET(adb, BB_DIR_USR_BIN, BB_SUID_DROP))
 
-//kbuild:lib-$(CONFIG_ADB) += adb.o
+//kbuild:lib-$(CONFIG_ADB) += adb.o openssl_prune.o
 
 //usage:#define adb_trivial_usage
 //usage:       "[-s <host:port>] <command> [args...]"
@@ -1422,6 +1422,7 @@ static int adb_keygen(const char *custom_path)
  * ========================================================================= */
 
 int adb_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+extern void openssl_prune_anchor(void);
 int adb_main(int argc, char **argv)
 {
 	const char *target_device = NULL;
@@ -1438,6 +1439,8 @@ int adb_main(int argc, char **argv)
 	size_t hlen;
 	const char *lpath;
 	const char *rpath;
+
+	openssl_prune_anchor();
 
 	if (argc < 2)
 		bb_show_usage();

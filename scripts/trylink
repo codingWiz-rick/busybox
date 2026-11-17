@@ -207,6 +207,26 @@ done
 
 # Make the binary with final, minimal list of libs
 echo "Final link with: ${LDLIBS:-<none>}"
+
+# Strip unneeded and unwind sections (.eh_frame, .comment, .note) from external archives
+if test "$LDLIBS"; then
+    STRIP_TOOL="`echo "$CC" | sed 's/gcc$/strip/'`"
+    test -x "$STRIP_TOOL" || STRIP_TOOL="${STRIP:-strip}"
+    mkdir -p .lib_stripped
+    for one in $LDLIBS; do
+	libpath=`$CC $CFLAGS $LDFLAGS -print-file-name="lib${one}.a" 2>/dev/null`
+	if test -f "$libpath"; then
+	    cp -f "$libpath" ".lib_stripped/lib${one}.a"
+	    $STRIP_TOOL --strip-unneeded \
+		--remove-section=.note \
+		--remove-section=.comment \
+		--remove-section=.eh_frame \
+		--remove-section=.eh_frame_hdr \
+		".lib_stripped/lib${one}.a" 2>/dev/null
+	fi
+    done
+    LDFLAGS="-L.lib_stripped $LDFLAGS"
+fi
 l_list=`echo " $LDLIBS $CONFIG_EXTRA_LDLIBS " | sed -e 's: \([^- ][^ ]*\): -l\1:g' -e 's/^ *//'`
 test x"$l_list" != x"" && l_list="$START_GROUP $l_list $END_GROUP"
 # --verbose gives us gobs of info to stdout (e.g. linker script used)

@@ -1,0 +1,38 @@
+/* vi: set sw=4 ts=4: */
+/*
+ * OpenSSL 3.x algorithm pruning stubs for static BusyBox builds
+ *
+ * Eliminates large precomputed curve tables and unneeded standalone hashes:
+ * - ecp_sm2p256_table.o (524 KB) via EC_GFp_sm2p256_method stub
+ * - sm3.o and sm3_prov.o via ossl_sm3_functions stub
+ * - ripemd.o and ripemd_prov.o via ossl_ripemd160_functions stub
+ *
+ * Licensed under GPLv2 or later.
+ */
+
+#include "libbb.h"
+
+/* Anchor to ensure openssl_prune.o is extracted from networking/lib.a */
+void openssl_prune_anchor(void);
+void openssl_prune_anchor(void)
+{
+}
+
+/* Generic empty dispatch table */
+static const void *const dummy_dispatch[] = { (void *)0, (void *)0 };
+
+/*
+ * 1. Stub out SM2 curve method (Chinese GM/T 0003-2012).
+ * Eliminates ecp_sm2p256.o and ecp_sm2p256_table.o (524 KB table).
+ */
+const void *EC_GFp_sm2p256_method(void);
+const void *EC_GFp_sm2p256_method(void)
+{
+	return (void *)0;
+}
+
+/*
+ * 2. Self-contained hash stubs (never used by ADB TLS / RSA)
+ */
+const void *const ossl_sm3_functions = dummy_dispatch;
+const void *const ossl_ripemd160_functions = dummy_dispatch;
