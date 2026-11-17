@@ -70,6 +70,11 @@
 //usage:     "\n	--set-ramdisk <boot> <rd>     Inject/replace ramdisk in boot image (--live, --install)"
 //usage:     "\n	--extract-ramdisk <boot> [o]  Extract ramdisk (auto-decompress to cpio) from boot image"
 //usage:     "\n"
+//usage:     "\nAnyKernel & Live Partition Operations:"
+//usage:     "\n	--flash-kernel <img|rec> [prt] Spliced live kernel flashing with AVB & DTB preservation"
+//usage:     "\n	--patch-cmdline [boot|file]   In-place boot header cmdline modifier (+add, -rm, key=val)"
+//usage:     "\n	--patch-fstab <boot|file>     In-place fstab modifier (boot ramdisk or text file)"
+//usage:     "\n"
 //usage:     "\nPackaging:"
 //usage:     "\n	--dist <out.zip> [opts]       Create universal AnyKernel3 or Magisk/KSU module ZIP"
 //usage:     "\n	--zip <file.zip> <act> [...]  ZIP archive operations (create, list, extract)"
@@ -4589,6 +4594,35 @@ static int fstab_print(const char *file) {
 	return 0;
 }
 
+static char *replace_and_normalize_commas(const char *line, const char *pos, const char *old_opt, const char *new_opt) {
+	size_t prefix_len = pos - line;
+	size_t old_len = strlen(old_opt);
+	const char *suffix = pos + old_len;
+	const char *rep = (new_opt && strcmp(new_opt, "-") != 0 && strcmp(new_opt, "none") != 0) ? new_opt : "";
+	char *raw = xasprintf("%.*s%s%s", (int)prefix_len, line, rep, suffix);
+	char *clean = xmalloc(strlen(raw) + 1);
+	char *r = raw, *w = clean;
+
+	while (*r) {
+		if (*r == ',') {
+			/* Skip duplicate commas, leading comma, or comma directly preceded by space/tab */
+			if (w == clean || *(w - 1) == ' ' || *(w - 1) == '\t' || *(w - 1) == ',') {
+				r++;
+				continue;
+			}
+			/* Skip trailing comma before whitespace or at line end */
+			if (*(r + 1) == ' ' || *(r + 1) == '\t' || *(r + 1) == '\0') {
+				r++;
+				continue;
+			}
+		}
+		*w++ = *r++;
+	}
+	*w = '\0';
+	free(raw);
+	return clean;
+}
+
 static int fstab_patch(const char *file, const char *target_mnt, const char *old_opt, const char *new_opt) {
 	FILE *fp;
 	char *line;
@@ -4610,7 +4644,9 @@ static int fstab_patch(const char *file, const char *target_mnt, const char *old
 
 	while ((line = xmalloc_fgetline(fp)) != NULL) {
 		char *p = skip_whitespace(line);
-		char *dev, *mnt;
+		char *copy_line;
+		char *mnt;
+		bool match = false;
 
 		if (*p == '#' || *p == '\0') {
 			fprintf(out_fp, "%s\n", line);
@@ -4618,25 +4654,31 @@ static int fstab_patch(const char *file, const char *target_mnt, const char *old
 			continue;
 		}
 
-		dev = strtok_r(p, " \t", &p);
-		mnt = strtok_r(NULL, " \t", &p);
+		copy_line = xstrdup(line);
+		p = skip_whitespace(copy_line);
+		strtok(p, " \t"); /* skip block device field */
+		mnt = strtok(NULL, " \t");
 
-		if (dev && mnt && strcmp(mnt, target_mnt) == 0 && old_opt && old_opt[0]) {
+		if (!target_mnt || strcmp(target_mnt, "*") == 0 || strcmp(target_mnt, "any") == 0) {
+			match = true;
+		} else if (mnt && strcmp(mnt, target_mnt) == 0) {
+			match = true;
+		}
+
+		if (match && old_opt && old_opt[0]) {
 			char *pos = strstr(line, old_opt);
 			if (pos) {
-				size_t prefix_len = pos - line;
-				size_t old_len = strlen(old_opt);
-				fwrite(line, 1, prefix_len, out_fp);
-				if (new_opt && new_opt[0] && strcmp(new_opt, "-") != 0 && strcmp(new_opt, "none") != 0) {
-					fputs(new_opt, out_fp);
-				}
-				fprintf(out_fp, "%s\n", pos + old_len);
+				char *clean = replace_and_normalize_commas(line, pos, old_opt, new_opt);
+				fprintf(out_fp, "%s\n", clean);
 				count++;
-				printf("[+] Patched %s on '%s': '%s' -> '%s'\n", target_mnt, file, old_opt, new_opt ? new_opt : "");
+				printf("[+] Patched %s on '%s': '%s' -> '%s'\n", target_mnt ? target_mnt : "*", file, old_opt, new_opt ? new_opt : "");
+				free(clean);
+				free(copy_line);
 				free(line);
 				continue;
 			}
 		}
+		free(copy_line);
 		fprintf(out_fp, "%s\n", line);
 		free(line);
 	}
@@ -4649,7 +4691,7 @@ static int fstab_patch(const char *file, const char *target_mnt, const char *old
 		return 0;
 	} else {
 		unlink(out_path);
-		printf("[-] Notice: Target '%s' with option '%s' not found in '%s'\n", target_mnt, old_opt, file);
+		printf("[-] Notice: Target '%s' with option '%s' not found in '%s'\n", target_mnt ? target_mnt : "*", old_opt, file);
 		return 0;
 	}
 }
@@ -5901,6 +5943,774 @@ cleanup:
 }
 
 /* =========================================================================
+ * 11b. AnyKernel Native Engine: Live Kernel Flashing, Cmdline & Fstab Patching
+ * ========================================================================= */
+
+struct dybuf {
+	char *buf;
+	size_t len;
+	size_t cap;
+};
+
+static void dybuf_add_line(struct dybuf *d, const char *line) {
+	size_t llen = strlen(line);
+	if (d->len + llen + 2 > d->cap) {
+		d->cap = (d->len + llen + 2 + 1024) * 2;
+		d->buf = xrealloc(d->buf, d->cap);
+	}
+	memcpy(d->buf + d->len, line, llen);
+	d->len += llen;
+	d->buf[d->len++] = '\n';
+	d->buf[d->len] = '\0';
+}
+
+static int fstab_buffer_patch(cpio_node_t *node, const char *target_mnt, const char *old_opt, const char *new_opt) {
+	char *orig;
+	char *saveptr = NULL;
+	char *line;
+	struct dybuf out;
+	int count = 0;
+
+	if (!node || !node->data || node->filesize == 0) return 0;
+
+	memset(&out, 0, sizeof(out));
+	orig = xstrndup((const char *)node->data, node->filesize);
+	line = strtok_r(orig, "\r\n", &saveptr);
+
+	while (line) {
+		char *p = skip_whitespace(line);
+		char *copy_line;
+		char *mnt;
+		bool match = false;
+
+		if (*p == '#' || *p == '\0') {
+			dybuf_add_line(&out, line);
+			line = strtok_r(NULL, "\r\n", &saveptr);
+			continue;
+		}
+
+		copy_line = xstrdup(line);
+		p = skip_whitespace(copy_line);
+		strtok(p, " \t"); /* skip block device field */
+		mnt = strtok(NULL, " \t");
+
+		if (!target_mnt || strcmp(target_mnt, "*") == 0 || strcmp(target_mnt, "any") == 0) {
+			match = true;
+		} else if (mnt && strcmp(mnt, target_mnt) == 0) {
+			match = true;
+		}
+
+		if (match && old_opt && old_opt[0]) {
+			char *pos = strstr(line, old_opt);
+			if (pos) {
+				char *new_line = replace_and_normalize_commas(line, pos, old_opt, new_opt);
+				dybuf_add_line(&out, new_line);
+				free(new_line);
+				count++;
+				free(copy_line);
+				line = strtok_r(NULL, "\r\n", &saveptr);
+				continue;
+			}
+		}
+
+		free(copy_line);
+		dybuf_add_line(&out, line);
+		line = strtok_r(NULL, "\r\n", &saveptr);
+	}
+
+	free(orig);
+
+	if (count > 0 && out.buf) {
+		free(node->data);
+		node->data = out.buf;
+		node->filesize = (uint32_t)out.len;
+	} else {
+		free(out.buf);
+	}
+
+	return count;
+}
+
+static bool is_block_device_node(const char *path) {
+	struct stat st;
+	if (path && stat(path, &st) == 0 && S_ISBLK(st.st_mode))
+		return true;
+	return false;
+}
+
+static int magiskboot_flash_kernel_op(int argc, char **argv) {
+	const char *kernel_file = NULL;
+	const char *part_name = NULL;
+	const char *dtb_file = NULL;
+	bool backup = false;
+	bool verify = true;
+	bool skip_comp = false;
+	char target_path[PATH_MAX];
+	char repacked_img[PATH_MAX];
+	char tmp_work_dir[256];
+	char old_cwd[512];
+	char abs_kernel[PATH_MAX];
+	char abs_dtb[PATH_MAX];
+	struct flash_target_geometry geom;
+	struct stat st_k;
+	int i;
+	int ret = 0;
+	bool has_magisk = false;
+
+	target_path[0] = '\0';
+	abs_kernel[0] = '\0';
+	abs_dtb[0] = '\0';
+
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--backup") == 0) {
+			backup = true;
+		} else if (strcmp(argv[i], "--no-verify") == 0) {
+			verify = false;
+		} else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-comp") == 0) {
+			skip_comp = true;
+		} else if (strcmp(argv[i], "--dtb") == 0 && i + 1 < argc) {
+			dtb_file = argv[++i];
+		} else if (argv[i][0] != '-') {
+			if (!kernel_file) {
+				kernel_file = argv[i];
+			} else if (!part_name) {
+				part_name = argv[i];
+			}
+		}
+	}
+
+	if (!kernel_file) {
+		bb_error_msg("usage: aimg --flash-kernel <kernel_img> [partition_or_auto] [--backup] [--no-verify] [--dtb <dtb>]");
+		return 1;
+	}
+
+	if (stat(kernel_file, &st_k) != 0 || !S_ISREG(st_k.st_mode) || st_k.st_size < 1024) {
+		bb_error_msg("cannot access valid kernel image '%s'", kernel_file);
+		return 1;
+	}
+
+	if (!realpath(kernel_file, abs_kernel)) {
+		safe_strncpy(abs_kernel, kernel_file, sizeof(abs_kernel));
+	}
+	if (dtb_file && !realpath(dtb_file, abs_dtb)) {
+		safe_strncpy(abs_dtb, dtb_file, sizeof(abs_dtb));
+	}
+
+	/* Resolve target partition */
+	if (!part_name || strcmp(part_name, "auto") == 0 || strcmp(part_name, "boot") == 0) {
+		if (flash_find_partition("boot", target_path, sizeof(target_path)) != 0) {
+			bb_error_msg("failed to auto-detect target boot partition");
+			return 1;
+		}
+	} else if (part_name[0] == '/') {
+		safe_strncpy(target_path, part_name, sizeof(target_path));
+		if (access(target_path, F_OK) != 0) {
+			bb_error_msg("target partition node '%s' does not exist", target_path);
+			return 1;
+		}
+	} else {
+		if (flash_find_partition(part_name, target_path, sizeof(target_path)) != 0) {
+			bb_error_msg("failed to resolve partition '%s'", part_name);
+			return 1;
+		}
+	}
+
+	/* Probe target storage geometry and AVB 2.0 footer */
+	if (flash_probe_geometry(target_path, &geom) != 0) {
+		bb_error_msg("failed to probe target partition '%s'", target_path);
+		return 1;
+	}
+
+	printf("======================================================================\n");
+	printf("  AnyKernel Flash Engine: Live Kernel Splicing & Flashing\n");
+	printf("======================================================================\n");
+	printf("  • Source Kernel  : %s (%lld bytes, %.2f MB)\n", abs_kernel,
+	       (long long)st_k.st_size, (double)st_k.st_size / (1024.0 * 1024.0));
+	if (abs_dtb[0]) {
+		printf("  • Source DTB     : %s\n", abs_dtb);
+	}
+	printf("  • Target Node    : %s (%s)\n", target_path,
+	       geom.is_block_device ? "Block Device" : "Image File");
+	if (geom.capacity_bytes > 0) {
+		printf("  • Target Capacity: %llu bytes (%.2f MB)\n",
+		       (unsigned long long)geom.capacity_bytes,
+		       (double)geom.capacity_bytes / (1024.0 * 1024.0));
+	}
+	if (geom.has_avb_footer) {
+		printf("  • AVB 2.0 Footer : Detected (VBMeta Offset: 0x%llx)\n",
+		       (unsigned long long)geom.avb_vbmeta_offset);
+	}
+
+	if (!getcwd(old_cwd, sizeof(old_cwd))) {
+		strcpy(old_cwd, ".");
+	}
+
+	safe_strncpy(tmp_work_dir, "/tmp/mb_flk_XXXXXX", sizeof(tmp_work_dir));
+	if (!mkdtemp(tmp_work_dir)) {
+		bb_perror_msg("cannot create temporary directory '%s'", tmp_work_dir);
+		return 1;
+	}
+
+	printf("[*] Unpacking current target boot image...\n");
+	chdir(tmp_work_dir);
+	if (magiskboot_unpack(target_path, true, true, false, false) != 0) {
+		bb_error_msg("failed to unpack target image '%s'", target_path);
+		ret = 1;
+		goto cleanup_flk;
+	}
+
+	/* Check if Magisk is present in the target boot image */
+	if (access(".backup/.magisk", F_OK) == 0) {
+		has_magisk = true;
+	} else if (access(RAMDISK_FILE, R_OK) == 0) {
+		int rfd = open(RAMDISK_FILE, O_RDONLY | O_CLOEXEC);
+		if (rfd >= 0) {
+			char rhead[512];
+			ssize_t rn = read(rfd, rhead, sizeof(rhead) - 1);
+			close(rfd);
+			if (rn > 0) {
+				rhead[rn] = '\0';
+				if (strstr(rhead, "magisk") || strstr(rhead, "overlay.d"))
+					has_magisk = true;
+			}
+		}
+	}
+
+	/* Remove previous kernel and dtb components from staging */
+	unlink(KERNEL_FILE);
+	unlink("kernel.gz");
+	unlink("kernel.xz");
+	unlink("kernel.lz4");
+	unlink("kernel.bz2");
+	unlink("kernel.zst");
+
+	/* Stage new kernel */
+	if (copy_file(abs_kernel, KERNEL_FILE, FILEUTILS_FORCE) != 0) {
+		bb_perror_msg("failed to stage kernel file");
+		ret = 1;
+		goto cleanup_flk;
+	}
+
+	/* AnyKernel SAR Magisk check: skip_initramfs -> want_initramfs */
+	if (has_magisk) {
+		printf("[*] Magisk detected in target boot image: auditing kernel for SAR patch...\n");
+		if (magiskboot_hexpatch(KERNEL_FILE, "736b69705f696e697472616d6673", "77616e745f696e697472616d6673") == 0) {
+			printf("[+] Patched kernel 'skip_initramfs' -> 'want_initramfs' (Magisk SAR preserved)\n");
+		}
+		if (access(DTB_FILE, R_OK) == 0) {
+			char *dtb_args[] = { (char *)"dtb", (char *)DTB_FILE, (char *)"patch", NULL };
+			magiskboot_dtb(3, dtb_args);
+		}
+	}
+
+	/* Stage custom DTB if provided */
+	if (abs_dtb[0]) {
+		unlink(DTB_FILE);
+		unlink(KER_DTB_FILE);
+		if (copy_file(abs_dtb, DTB_FILE, FILEUTILS_FORCE) != 0) {
+			bb_perror_msg("failed to stage custom DTB file");
+			ret = 1;
+			goto cleanup_flk;
+		}
+		printf("[+] Custom DTB staged -> %s\n", DTB_FILE);
+	}
+
+	printf("[*] Repacking boot image with updated kernel...\n");
+	snprintf(repacked_img, sizeof(repacked_img), "%s/new-boot.img", tmp_work_dir);
+	if (magiskboot_repack(target_path, repacked_img, skip_comp) != 0) {
+		bb_error_msg("failed to repack boot image");
+		ret = 1;
+		goto cleanup_flk;
+	}
+
+	{
+		struct stat st_rep;
+		unsigned int flash_flags = 0;
+
+		if (stat(repacked_img, &st_rep) != 0) {
+			bb_error_msg("repacked boot image is missing");
+			ret = 1;
+			goto cleanup_flk;
+		}
+
+		if (geom.capacity_bytes > 0 && (uint64_t)st_rep.st_size > geom.capacity_bytes) {
+			bb_error_msg("CRITICAL: Repacked boot image size (%lld B) exceeds partition capacity (%llu B)!",
+			             (long long)st_rep.st_size, (unsigned long long)geom.capacity_bytes);
+			ret = 1;
+			goto cleanup_flk;
+		}
+
+		if (verify) flash_flags |= FLASH_OPT_VERIFY_READ;
+		if (backup) flash_flags |= FLASH_OPT_BACKUP;
+
+		printf("[*] Flashing spliced boot image to %s...\n", target_path);
+		if (flash_partition_image(repacked_img, target_path, flash_flags) != 0) {
+			bb_error_msg("failed to flash spliced image to %s", target_path);
+			ret = 1;
+			goto cleanup_flk;
+		}
+
+		printf("======================================================================\n");
+		printf("[✓] SUCCESS: Kernel spliced and flashed successfully to %s\n", target_path);
+		printf("======================================================================\n");
+	}
+
+cleanup_flk:
+	chdir(old_cwd);
+	remove_file(tmp_work_dir, FILEUTILS_RECUR | FILEUTILS_FORCE);
+	return ret;
+}
+
+static int magiskboot_patch_cmdline_op(int argc, char **argv) {
+	const char *target = NULL;
+	char discovered_boot[PATH_MAX];
+	int opt_idx = 2;
+	int fd;
+	uint8_t hdr_buf[4096];
+	ssize_t nr;
+	bool is_boot = false;
+	bool is_vnd = false;
+	uint32_t header_ver = 0;
+	uint32_t max_cmd_len = 0;
+	char cur_cmdline[4096];
+	char **tokens = NULL;
+	size_t num_tok = 0, cap_tok = 256;
+	char *tok;
+	bool modified = false;
+	int a;
+	char new_cmdline[4096];
+	size_t t;
+	bool first = true;
+	struct stat st_tgt;
+
+	if (argc < 3) {
+		bb_error_msg("usage: aimg --patch-cmdline [boot.img|dev|--live] <key=val | +key[=val] | -key>...");
+		return 1;
+	}
+
+	if (strcmp(argv[2], "--live") == 0) {
+		opt_idx = 3;
+	} else if (argv[2][0] == '+' || argv[2][0] == '-' || strchr(argv[2], '=')) {
+		opt_idx = 2;
+	} else if (access(argv[2], F_OK) == 0) {
+		target = argv[2];
+		opt_idx = 3;
+	} else {
+		if (flash_find_partition(argv[2], discovered_boot, sizeof(discovered_boot)) == 0) {
+			target = discovered_boot;
+			opt_idx = 3;
+		} else {
+			opt_idx = 2;
+		}
+	}
+
+	if (!target) {
+		if (find_target_boot_image(discovered_boot, sizeof(discovered_boot)) != 0) {
+			bb_error_msg("failed to auto-detect target boot partition");
+			return 1;
+		}
+		target = discovered_boot;
+		printf("[+] Auto-detected live boot target: %s\n", target);
+	}
+
+	fd = open(target, O_RDWR | O_CLOEXEC);
+	if (fd < 0 && (errno == EACCES || errno == EROFS) && is_block_device_node(target)) {
+		int ro = 0;
+		int rfd = open(target, O_RDONLY | O_CLOEXEC);
+		if (rfd >= 0) {
+			ioctl(rfd, BLKROSET, &ro);
+			close(rfd);
+			fd = open(target, O_RDWR | O_CLOEXEC);
+		}
+	}
+	if (fd < 0) {
+		fd = open_or_warn(target, O_RDONLY | O_CLOEXEC);
+		if (fd < 0) return 1;
+	}
+
+	memset(hdr_buf, 0, sizeof(hdr_buf));
+	nr = full_read(fd, hdr_buf, sizeof(hdr_buf));
+	if (nr < 64) {
+		close(fd);
+		if (opt_idx >= argc) return cmdline_print(target);
+		bb_error_msg("cannot read header from '%s'", target);
+		return 1;
+	}
+
+	if (memcmp(hdr_buf, BOOT_MAGIC, BOOT_MAGIC_SIZE) == 0) {
+		is_boot = true;
+	} else if (memcmp(hdr_buf, VENDOR_BOOT_MAGIC, VENDOR_BOOT_MAGIC_SIZE) == 0) {
+		is_vnd = true;
+	}
+
+	/* If not an AOSP boot header, fallback to plain text file handler */
+	if (!is_boot && !is_vnd) {
+		close(fd);
+		if (opt_idx >= argc) return cmdline_print(target);
+		for (a = opt_idx; a < argc; a++) {
+			const char *expr = argv[a];
+			if (expr[0] == '-') {
+				cmdline_modify(target, "rm", expr + 1, NULL);
+			} else {
+				const char *arg_str = (expr[0] == '+') ? expr + 1 : expr;
+				char *eq = strchr(arg_str, '=');
+				if (eq) {
+					char *k = xstrndup(arg_str, eq - arg_str);
+					cmdline_modify(target, "patch", k, eq + 1);
+					free(k);
+				} else {
+					cmdline_modify(target, "add", arg_str, NULL);
+				}
+			}
+		}
+		return 0;
+	}
+
+	/* Extract current command line from AOSP boot header */
+	memset(cur_cmdline, 0, sizeof(cur_cmdline));
+	if (is_boot) {
+		struct boot_img_hdr_v0 *h0 = (struct boot_img_hdr_v0 *)hdr_buf;
+		header_ver = SWAP_LE32(h0->header_version);
+		if (header_ver < 3) {
+			snprintf(cur_cmdline, sizeof(cur_cmdline), "%.*s%.*s",
+			         BOOT_ARGS_SIZE, h0->cmdline,
+			         BOOT_EXTRA_ARGS_SIZE, h0->extra_cmdline);
+			max_cmd_len = BOOT_ARGS_SIZE + BOOT_EXTRA_ARGS_SIZE - 2;
+		} else {
+			struct boot_img_hdr_v3 *h3 = (struct boot_img_hdr_v3 *)hdr_buf;
+			snprintf(cur_cmdline, sizeof(cur_cmdline), "%.*s",
+			         (int)sizeof(h3->cmdline), h3->cmdline);
+			max_cmd_len = sizeof(h3->cmdline) - 1;
+		}
+	} else {
+		struct boot_img_hdr_vnd_v3 *hv = (struct boot_img_hdr_vnd_v3 *)hdr_buf;
+		snprintf(cur_cmdline, sizeof(cur_cmdline), "%.*s",
+		         (int)sizeof(hv->cmdline), hv->cmdline);
+		max_cmd_len = sizeof(hv->cmdline) - 1;
+	}
+	trim(cur_cmdline);
+
+	/* If no modifications provided, print current cmdline */
+	if (opt_idx >= argc) {
+		printf("======================================================================\n");
+		printf("  Kernel Command Line Inspector: %s (Header v%u)\n", target, header_ver);
+		printf("======================================================================\n");
+		printf("  Raw: %s\n", cur_cmdline);
+		printf("======================================================================\n");
+		close(fd);
+		return 0;
+	}
+
+	printf("======================================================================\n");
+	printf("  AnyKernel In-Place Command Line Patcher: %s\n", target);
+	printf("======================================================================\n");
+	printf("  • Original cmdline: %s\n", cur_cmdline);
+
+	tokens = xmalloc(cap_tok * sizeof(char *));
+	tok = strtok(cur_cmdline, " \t\r\n");
+	while (tok) {
+		tokens[num_tok++] = xstrdup(tok);
+		tok = strtok(NULL, " \t\r\n");
+	}
+
+	for (a = opt_idx; a < argc; a++) {
+		const char *expr = argv[a];
+		if (expr[0] == '-') {
+			const char *key = expr + 1;
+			size_t klen = strlen(key);
+			for (t = 0; t < num_tok; t++) {
+				if (!tokens[t]) continue;
+				if (strcmp(tokens[t], key) == 0 ||
+				    (strncmp(tokens[t], key, klen) == 0 && tokens[t][klen] == '=')) {
+					printf("  [+] Removed parameter: '%s'\n", tokens[t]);
+					free(tokens[t]);
+					tokens[t] = NULL;
+					modified = true;
+				}
+			}
+		} else {
+			const char *arg_str = (expr[0] == '+') ? expr + 1 : expr;
+			char *eq = strchr(arg_str, '=');
+			char *key;
+			size_t klen;
+			bool found = false;
+
+			if (eq) {
+				klen = eq - arg_str;
+				key = xstrndup(arg_str, klen);
+			} else {
+				key = xstrdup(arg_str);
+				klen = strlen(key);
+			}
+
+			for (t = 0; t < num_tok; t++) {
+				if (!tokens[t]) continue;
+				if (strcmp(tokens[t], key) == 0 ||
+				    (strncmp(tokens[t], key, klen) == 0 && tokens[t][klen] == '=')) {
+					printf("  [+] Replaced parameter: '%s' -> '%s'\n", tokens[t], arg_str);
+					free(tokens[t]);
+					tokens[t] = xstrdup(arg_str);
+					found = true;
+					modified = true;
+					break;
+				}
+			}
+			if (!found) {
+				if (num_tok >= cap_tok) {
+					cap_tok *= 2;
+					tokens = xrealloc(tokens, cap_tok * sizeof(char *));
+				}
+				tokens[num_tok++] = xstrdup(arg_str);
+				printf("  [+] Added parameter: '%s'\n", arg_str);
+				modified = true;
+			}
+			free(key);
+		}
+	}
+
+	new_cmdline[0] = '\0';
+	for (t = 0; t < num_tok; t++) {
+		if (!tokens[t]) continue;
+		if (!first) strncat(new_cmdline, " ", sizeof(new_cmdline) - strlen(new_cmdline) - 1);
+		strncat(new_cmdline, tokens[t], sizeof(new_cmdline) - strlen(new_cmdline) - 1);
+		first = false;
+		free(tokens[t]);
+	}
+	free(tokens);
+
+	if (!modified) {
+		printf("[-] Notice: cmdline not modified\n");
+		close(fd);
+		return 0;
+	}
+
+	if (strlen(new_cmdline) > max_cmd_len) {
+		bb_error_msg("new cmdline length (%zu) exceeds header capacity (%u)",
+		             strlen(new_cmdline), max_cmd_len);
+		close(fd);
+		return 1;
+	}
+
+	/* Store back into header */
+	if (is_boot) {
+		struct boot_img_hdr_v0 *h0 = (struct boot_img_hdr_v0 *)hdr_buf;
+		if (header_ver < 3) {
+			memset(h0->cmdline, 0, sizeof(h0->cmdline));
+			memset(h0->extra_cmdline, 0, sizeof(h0->extra_cmdline));
+			if (strlen(new_cmdline) < sizeof(h0->cmdline)) {
+				safe_strncpy(h0->cmdline, new_cmdline, sizeof(h0->cmdline));
+			} else {
+				safe_strncpy(h0->cmdline, new_cmdline, sizeof(h0->cmdline));
+				safe_strncpy(h0->extra_cmdline, new_cmdline + sizeof(h0->cmdline) - 1, sizeof(h0->extra_cmdline));
+			}
+		} else {
+			struct boot_img_hdr_v3 *h3 = (struct boot_img_hdr_v3 *)hdr_buf;
+			memset(h3->cmdline, 0, sizeof(h3->cmdline));
+			safe_strncpy(h3->cmdline, new_cmdline, sizeof(h3->cmdline));
+		}
+	} else {
+		struct boot_img_hdr_vnd_v3 *hv = (struct boot_img_hdr_vnd_v3 *)hdr_buf;
+		memset(hv->cmdline, 0, sizeof(hv->cmdline));
+		safe_strncpy(hv->cmdline, new_cmdline, sizeof(hv->cmdline));
+	}
+
+	if (fstat(fd, &st_tgt) == 0 && S_ISBLK(st_tgt.st_mode)) {
+		int ro = 0;
+		ioctl(fd, BLKROSET, &ro);
+	}
+
+	if (lseek(fd, 0, SEEK_SET) < 0 || full_write(fd, hdr_buf, nr) != nr) {
+		bb_perror_msg("failed to write updated header to %s", target);
+		close(fd);
+		return 1;
+	}
+
+	fsync(fd);
+	if (fstat(fd, &st_tgt) == 0 && S_ISBLK(st_tgt.st_mode)) {
+		ioctl(fd, BLKFLSBUF, 0);
+	}
+	close(fd);
+
+	printf("  • Updated cmdline : %s\n", new_cmdline);
+	printf("[✓] SUCCESS: Kernel command line updated in-place on %s\n", target);
+	printf("======================================================================\n");
+	return 0;
+}
+
+static int magiskboot_patch_fstab_op(int argc, char **argv) {
+	bool live = false;
+	const char *target = NULL;
+	char discovered_boot[PATH_MAX];
+	int arg_idx = 2;
+	int tfd;
+	char magic[8];
+	bool is_boot = false;
+	ssize_t mn;
+
+	if (argc < 4 && (argc < 3 || strcmp(argv[2], "--live") != 0)) {
+		bb_error_msg("usage: aimg --patch-fstab <boot.img|fstab|--live> <mount|pattern> <old_opt|replacement> [new_opt]");
+		return 1;
+	}
+
+	if (strcmp(argv[2], "--live") == 0) {
+		live = true;
+		arg_idx = 3;
+	} else if (argc >= 4 && strcmp(argv[3], "--live") == 0) {
+		live = true;
+		target = argv[2];
+		arg_idx = 4;
+	} else {
+		target = argv[2];
+		arg_idx = 3;
+	}
+
+	if (live || !target) {
+		if (find_target_boot_image(discovered_boot, sizeof(discovered_boot)) != 0) {
+			bb_error_msg("failed to auto-detect target boot partition");
+			return 1;
+		}
+		target = discovered_boot;
+		printf("[+] Auto-detected live boot target: %s\n", target);
+	}
+
+	memset(magic, 0, sizeof(magic));
+	tfd = open(target, O_RDONLY | O_CLOEXEC);
+	if (tfd >= 0) {
+		mn = full_read(tfd, magic, sizeof(magic));
+		close(tfd);
+		if (mn == (ssize_t)sizeof(magic)) {
+			if (memcmp(magic, BOOT_MAGIC, BOOT_MAGIC_SIZE) == 0 ||
+			    memcmp(magic, VENDOR_BOOT_MAGIC, VENDOR_BOOT_MAGIC_SIZE) == 0) {
+				is_boot = true;
+			}
+		}
+	}
+
+	/* Plain text fstab handling */
+	if (!is_boot) {
+		if (argc - arg_idx >= 3) {
+			return fstab_patch(target, argv[arg_idx], argv[arg_idx + 1], argv[arg_idx + 2]);
+		} else if (argc - arg_idx == 2) {
+			return fstab_patch(target, "*", argv[arg_idx], argv[arg_idx + 1]);
+		} else if (argc - arg_idx == 1) {
+			return fstab_patch(target, "*", argv[arg_idx], "");
+		}
+		return 1;
+	}
+
+	/* Boot image / partition ramdisk fstab handling */
+	{
+		char tmp_dir[256];
+		char old_cwd[512];
+		char repacked_img[PATH_MAX];
+		int ret = 0;
+		int modified_count = 0;
+		cpio_node_t *head;
+		cpio_node_t *cur;
+
+		if (!getcwd(old_cwd, sizeof(old_cwd))) {
+			strcpy(old_cwd, ".");
+		}
+
+		safe_strncpy(tmp_dir, "/tmp/mb_pfst_XXXXXX", sizeof(tmp_dir));
+		if (!mkdtemp(tmp_dir)) {
+			bb_perror_msg("cannot create temporary directory '%s'", tmp_dir);
+			return 1;
+		}
+
+		printf("[*] Unpacking boot image ramdisk to patch fstab: %s...\n", target);
+		chdir(tmp_dir);
+		if (magiskboot_unpack(target, true, false, false, false) != 0) {
+			bb_error_msg("failed to unpack boot image '%s'", target);
+			ret = 1;
+			goto cleanup_pfst;
+		}
+
+		if (access(RAMDISK_FILE, R_OK) != 0) {
+			bb_error_msg("no ramdisk found in boot image '%s'", target);
+			ret = 1;
+			goto cleanup_pfst;
+		}
+
+		head = cpio_read_all(RAMDISK_FILE);
+		if (!head) {
+			bb_error_msg("failed to parse ramdisk CPIO archive");
+			ret = 1;
+			goto cleanup_pfst;
+		}
+
+		for (cur = head; cur; cur = cur->next) {
+			if (strstr(cur->name, "fstab") != NULL && cur->data && cur->filesize > 0) {
+				int mods = 0;
+				if (argc - arg_idx >= 3) {
+					mods = fstab_buffer_patch(cur, argv[arg_idx], argv[arg_idx + 1], argv[arg_idx + 2]);
+				} else if (argc - arg_idx == 2) {
+					mods = fstab_buffer_patch(cur, "*", argv[arg_idx], argv[arg_idx + 1]);
+				} else if (argc - arg_idx == 1) {
+					mods = fstab_buffer_patch(cur, "*", argv[arg_idx], "");
+				}
+				if (mods > 0) {
+					printf("  [+] Applied %d patch(es) to ramdisk fstab: %s\n", mods, cur->name);
+					modified_count += mods;
+				}
+			}
+		}
+
+		if (modified_count == 0) {
+			printf("[-] Notice: No matching fstab entries were found to modify in ramdisk\n");
+			cpio_free_all(head);
+			goto cleanup_pfst;
+		}
+
+		printf("[*] Repacking ramdisk CPIO archive with updated fstab entries...\n");
+		if (cpio_write_all(RAMDISK_FILE, head) != 0) {
+			bb_error_msg("failed to write patched ramdisk");
+			cpio_free_all(head);
+			ret = 1;
+			goto cleanup_pfst;
+		}
+		cpio_free_all(head);
+
+		unlink("ramdisk.cpio.gz");
+		unlink("ramdisk.cpio.xz");
+		unlink("ramdisk.cpio.lz4");
+		unlink("ramdisk.cpio.bz2");
+		unlink("ramdisk.cpio.zst");
+
+		printf("[*] Repacking boot image...\n");
+		snprintf(repacked_img, sizeof(repacked_img), "%s/new-boot.img", tmp_dir);
+		if (magiskboot_repack(target, repacked_img, false) != 0) {
+			bb_error_msg("failed to repack boot image");
+			ret = 1;
+			goto cleanup_pfst;
+		}
+
+		if (live || is_block_device_node(target)) {
+			printf("[*] Flashing updated boot image directly to %s...\n", target);
+			if (flash_partition_image(repacked_img, target, FLASH_OPT_VERIFY_READ) != 0) {
+				bb_error_msg("failed to flash updated boot image to %s", target);
+				ret = 1;
+				goto cleanup_pfst;
+			}
+			printf("[✓] SUCCESS: Flashed patched fstab directly to %s\n", target);
+		} else {
+			chdir(old_cwd);
+			if (copy_file(repacked_img, target, FILEUTILS_FORCE) != 0) {
+				bb_perror_msg("failed to write output image '%s'", target);
+				ret = 1;
+				goto cleanup_pfst;
+			}
+			printf("[✓] SUCCESS: Updated fstab inside boot image '%s'\n", target);
+		}
+
+cleanup_pfst:
+		chdir(old_cwd);
+		remove_file(tmp_dir, FILEUTILS_RECUR | FILEUTILS_FORCE);
+		return ret;
+	}
+}
+
+/* =========================================================================
  * 12. Android OTA Payload (payload.bin / CrAU) Engine
  * ========================================================================= */
 
@@ -6792,6 +7602,16 @@ int aimg_main(int argc, char **argv) {
 		"--module\0"
 		"module\0"
 
+		/* AnyKernel Engine */
+		"--flash-kernel\0"
+		"flash-kernel\0"
+		"--set-kernel\0"
+		"set-kernel\0"
+		"--patch-cmdline\0"
+		"patch-cmdline\0"
+		"--patch-fstab\0"
+		"patch-fstab\0"
+
 		/* Help */
 		"-h\0"
 		"--help\0"
@@ -6894,6 +7714,15 @@ int aimg_main(int argc, char **argv) {
 		CMD_kernel_no_dash,
 		CMD_module,
 		CMD_module_no_dash,
+
+		CMD_flash_kernel,
+		CMD_flash_kernel_no_dash,
+		CMD_set_kernel,
+		CMD_set_kernel_no_dash,
+		CMD_patch_cmdline,
+		CMD_patch_cmdline_no_dash,
+		CMD_patch_fstab,
+		CMD_patch_fstab_no_dash,
 
 		CMD_h,
 		CMD_help,
@@ -7291,6 +8120,23 @@ int aimg_main(int argc, char **argv) {
 			return magiskboot_add_module_op(argc - 1, argv + 1);
 		}
 		return magiskboot_module_op(argc, argv);
+
+	case CMD_flash_kernel:
+	case CMD_flash_kernel_no_dash:
+	case CMD_set_kernel:
+	case CMD_set_kernel_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_flash_kernel_op(argc, argv);
+
+	case CMD_patch_cmdline:
+	case CMD_patch_cmdline_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_patch_cmdline_op(argc, argv);
+
+	case CMD_patch_fstab:
+	case CMD_patch_fstab_no_dash:
+		if (argc < 3) bb_show_usage();
+		return magiskboot_patch_fstab_op(argc, argv);
 
 	case CMD_h:
 	case CMD_help:
