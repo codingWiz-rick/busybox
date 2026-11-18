@@ -528,10 +528,76 @@ Zero-dependency silicon hardware diagnostic and machine-code analysis suite desi
   * Coulomb counter current sense and ADC equations (`1.49 uV / Rsense` and `152.58 uV ADC`).
   * Active silicon core power estimation profiles (Sleep, LITTLE Eco, BIG Burst, Adreno 3D GPU).
 * **`socprobe mmio [filter]`**:
-  * In-memory physical MMIO register map covering 31 hardware silicon blocks: GCC, TLMM, SPMI, QFPROM, PSHOLD, TSENS, SDHC, UFSHC, UFS-ICE, GENI-I2C, DWC3 USB, Adreno GPU, MDSS/DPU, MIPI DSI, LPASS Audio, Crypto Engine, APCS, and CPUFreq-HW.
+  * In-memory physical MMIO register map covering 56+ hardware silicon blocks: GCC, TLMM, SPMI, QFPROM, PSHOLD, TSENS, SDHC, UFSHC, UFS-ICE, GENI-I2C, DWC3 USB, Adreno GPU, MDSS/DPU, MIPI DSI, LPASS Audio, Crypto Engine, APCS, CPUFreq-HW, CSIPHY, CSID, IFE, BPS, IPE, aDSP, cDSP, mDSP, IPA, SNOC, CNOC, MMNOC, BIMC, CE5 Crypto, BAM DMA, HWKM, UFS ICE, CPR, TSENS ROSC, Soundwire, SLIMbus, and HTP NPU.
+* **`socprobe clock` / `clk`**:
+  * Qualcomm Global Clock Controller (GCC) & RPM clock tree architecture.
+  * Root Clock Generator (RCGR) layout: `CMD_RCGR` (+0x0000: Root enable, frequency switch update, root off status), `CFG_RCGR` (+0x0004: clock source select XO/GPLL, divider ratio, bypass/MND mode), `M_RCGR`, `N_RCGR`, `D_RCGR` fractional multiplier polynomials.
+  * Clock Branch Control (CBCR) layout: `CLK_ENABLE`, `CLK_OFF` hardware gate status.
+  * Core clock branches: Storage (`GCC_SDCC1/2_APPS`), SuperSpeed USB (`GCC_USB30_MASTER`), Bus Wrappers (`GCC_QUPV3_WRAP_0_M/S_AHB`), Camera (`GCC_CAMSS_TOP_AHB`), Display (`GCC_DISP_AHB`), GPU (`GCC_GPU_CFG_AHB`), Crypto Core (`GCC_CRYPTO_CLK`), and CPU Dynamic PLL (`APCS_CPU_PLL_CLK`).
+* **`socprobe rosc` / `ring` / `cpr`**:
+  * Silicon Ring Oscillators (ROSC) & Silicon Aging / Transistor Degradation Monitors.
+  * Core Power Reduction (CPR) Adaptive Voltage Scaling (AVS) controller (`0x090D8000` / `0x01668000`).
+  * On-die ring oscillator banks: Inverter delay chains (High/Std/Low-VT thresholds), NAND2/NOR2 logic delay chains for silicon speed binning, Pass-gate delay lines (contact and routing resistance), and interconnect capacitive delay lines.
+  * Hardware control registers: `CPR_CONFIG` (open/closed loop mode), `CPR_STEP_QUOT_MIN/MAX`, `CPR_RESULT_0` (measured error delta & PMIC step recommendation), and `CPR_ROSC_MASK`.
+  * TSENS thermal-dependent ring oscillators calibrated against TCXO crystal.
+* **`socprobe crypto` / `ce`**:
+  * Qualcomm Crypto Core (CE v5) Hardware Accelerator (`0x00700000`), BAM Dedicated Crypto DMA (`0x00704000`), Hardware Key Manager (`0x00730000`), and UFS Inline Crypto Engine (`0x01D88000`).
+  * Hardware cryptographic primitives: AES-128/192/256 (ECB, CBC, CTR, XTS, CCM, GCM), SHA-1, SHA-256, SHA-384, SHA-512, HMAC-SHA256, and 3DES.
+  * Silicon registers: `CRYPTO_CONFIG`, `CRYPTO_ENGINES_AVAIL`, `CRYPTO_STATUS`, `CRYPTO_AUTH_SEG_CFG`, `CRYPTO_ENCR_SEG_CFG`, `CRYPTO_ENCR_KEY0..7` (TrustZone secured), `CRYPTO_AUTH_IV0..3`, and `ICE_REGS_CONTROL`.
+* **`socprobe ai` / `npu` / `htp`**:
+  * Hexagon Tensor Processor (HTP) & HMX Matrix Engines (`0x08380000`) within Hexagon cDSP compute subsystem (`0x08300000`).
+  * Hardware compute engines: INT8, INT16, FP16, and BFLOAT16 GEMM Matrix dot-product; 1024-bit HVX SIMD vector registers (`V0`-`V31`, 128 parallel 8-bit MACs/cycle); on-die hardware ReLU, LeakyReLU, Sigmoid, and GELU activation interpolation.
+  * Registers: `HTP_CORE_CFG` (clock gate, precision mode), `HTP_STATUS`, `HTP_DMA_SRC/DST_PTR` (64-bit tensor DMA addresses), `HTP_TENSOR_DIM_M_N_K` (GEMM dimensions), `HTP_ACCUM_CTRL`, and `HVX_VECTOR_CFG`.
+  * Adreno GPU machine learning FP16 dot-product accelerators (`dot2acc` / `dot4acc`).
+* **`socprobe pmu` / `perf`**:
+  * Pure inline assembly audit of ARMv8 architectural Performance Monitor Unit (PMU) registers with `sigsetjmp` / `SIGILL` trap recovery:
+    * `PMCR_EL0`: Performance Monitors Control Register (hardware counter count, cycle prescaler, enable).
+    * `PMCCNTR_EL0`: 64-bit Hardware Cycle Counter (live hardware execution cycles).
+    * `PMUSERENR_EL0`: Userland Access Control Register (detects whether kernel allows EL0 unprivileged cycle/event reads).
+    * `PMCNTENSET_EL0`: Counter Enable Set Register (Cycle counter & Event counters 0-30).
+    * `PMCCFILTR_EL0`: Cycle Counter Filter (EL0/EL1/EL2/EL3 execution filters).
+  * Architectural event catalog: `L1I_CACHE_REFILL` (0x0001), `L1D_CACHE_REFILL` (0x0003), `L1D_CACHE` (0x0004), `INST_RETIRED` (0x0008), `BR_MIS_PRED` (0x0010), `CPU_CYCLES` (0x0011), `L2D_CACHE` (0x0016), `L2D_CACHE_REFILL` (0x0017), `MEM_ACCESS` (0x0023).
+* **`socprobe ardp`**:
+  * Hexagon Audio Routing DSP (ARDP) & Low-Power Audio Subsystem (LPASS `0x062D0000`).
+  * Digital bus controllers: MIPI Soundwire v1.1 master (`0x06280000`) for digital microphones and smart amplifiers; SLIMbus serial interconnect (`0x062DC000`).
+  * Audio Front-End (AFE) PCM routing crossbar, acoustic echo cancellation (AEC), noise suppression, and multi-channel circular DMA rings.
+* **`socprobe smi`**:
+  * System Management Interface & Shared Memory Interconnect.
+  * Inter-Processor Communication (IPC): APCS IPC hardware doorbells (`0x090B5000`) triggering interrupts to aDSP, cDSP, mDSP, and RPM.
+  * Shared Memory Point-to-Point (SMP2P `0x0163C000`) 32-bit cross-core lockless status signaling.
+  * Physical Shared Memory (SMEM) 2 MB reserved DRAM carveout (`0x86000000` - `0x861FFFFF`).
+* **`socprobe psci` / `tz`**:
+  * ARM SMCCC (Secure Monitor Call Calling Convention) register protocol (`X0-X7` input, `X0-X3` return).
+  * 14 standard PSCI function IDs: `PSCI_VERSION` (0x84000000), `CPU_SUSPEND` (0x84000001 / 0xC4000001), `CPU_OFF` (0x84000002), `CPU_ON` (0x84000003 / 0xC4000003), `AFFINITY_INFO` (0x84000004 / 0xC4000004), `SYSTEM_OFF` (0x84000008), `SYSTEM_RESET` (0x84000009), `SYSTEM_RESET2` (0x84000012 / 0xC4000012), and `MEM_PROTECT` (0x84000013).
+  * Qualcomm QSEE/SCM SIP IDs: `TZ_SCM_CMD_SIP` (0x02000101), `TZ_QFPROM_READ_FUSE` (0x02000200), `TZ_QFPROM_WRITE_FUSE` (0x02000300), `TZ_PIL_PAS_AUTH_RESET` (0x02000400), `TZ_MEM_PROTECT_XPU` (0x02000800), and `TZ_SMMU_SECURE_CFG` (0x02000900).
+* **`socprobe isp` / `camera`**:
+  * Qualcomm Spectra Dual IFE, CSID/CSIPHY 4-lane MIPI receivers, ICP, BPS, and IPE processing pipeline.
+  * In-memory Hardware Lookup Tables (LUTs):
+    1. **3D-LUT Color Transform**: 17x17x17 tetrahedral mesh (4,913 RGB calibration nodes) for DCI-P3, sRGB, Rec.2020 HDR color space mapping.
+    2. **Gamma Correction LUT**: 512 entries per color channel (R, G, B) x 14-bit depth for perceptual non-linear luminance mapping.
+    3. **Lens Shading Correction (LSC)**: 17x13 spatial mesh compensating for optical vignetting and chromatic falloff.
+    4. **Color Correction Matrix (CCM)**: 3x3 floating-point sensor cross-talk and white balance matrix.
+    5. **Bad Pixel Correction (BPC) & Demosaic**: Raw Bayer pixel defect detection and interpolation registers.
+* **`socprobe dsp`**:
+  * Qualcomm Hexagon QDSP6 v66/v68 processors:
+    * **aDSP (Audio DSP)**: Base `0x062D0000`, LPASS (Low-Power Audio Subsystem) for hardware MP3/AAC/FLAC decoding, voice processing, and Soundwire.
+    * **cDSP (Compute / AI DSP)**: Base `0x08300000`, Hexagon QDSP6 v68 featuring **HVX** (1024-bit SIMD vector extensions) and **HMX** (INT8/FP16 Tensor NPU matrix accelerator) for on-device AI, NNAPI, and computer vision.
+    * **mDSP (Modem Subsystem)**: Base `0x04080000`, 4G/5G Baseband Processor authenticated via TrustZone PIL PAS (SMC `0x02000400`).
+  * **IPA (IP Accelerator) Network Offload Engine**:
+    * Physical MMIO window `0x01E40000 - 0x01EBFFFF` (768 KB).
+    * Hardware IPv4/IPv6 packet routing, NAT translation, header insertion/removal, and hardware firewall rules.
+    * GSI (Generic Software Interface) DMA ring buffers for zero-copy CPU-to-modem packet handoff.
+* **`socprobe adc` / `a2d`**:
+  * Qualcomm PMIC VADC / ADC5 15-bit / 16-bit Sigma-Delta Analog-to-Digital Converter (SPMI 0x3100 / 0x3C00).
+  * Analog input multiplexer channels: VBAT (1/3 prescaler), VPH_PWR (1/3 prescaler), VDD_MSM (1/1 prescaler), USB_IN (1/16 prescaler), DIE_TEMP (on-die junction), and XO/PMIC/PA/SYS thermistors.
+  * Conversion and timing registers: `ADC_DIG_PARAM` (decimation ratio), `ADC_FAST_AVG` (sample averaging), `ADC_CH_SEL_CTL`, `ADC_EN_CTL`, `ADC_CONV_REQ`, and 16-bit result registers (`ADC_DATA_LOW` / `ADC_DATA_HIGH`).
+* **`socprobe noc` / `traffic`**:
+  * System Interconnect Fabrics: System NoC (SNOC), Config NoC (CNOC), Multimedia NoC (MMNOC), and BIMC LPDDR4x memory controller arbiter.
+  * Traffic Quality of Service (QoS): Port priority levels (0 - 15), dynamic urgency forwarding for real-time display, and token-bucket bandwidth limiters.
+  * Hardware Bandwidth Monitors (BWMON): Real-time Adreno GPU and CPU memory bus monitors with hardware sampling windows and throttling interrupts.
 * **`socprobe disasm <HEX...>`**:
   * Pure C zero-dependency AArch64 machine-code instruction disassembler.
-  * Decodes raw 32-bit machine instructions into assembly mnemonics: MRS/MSR (system registers), ADRP/ADR (PC-relative), LDR/STR (32/64-bit load/store), ADD/SUB, B/BL/BLR/RET, and SMC/HVC (TrustZone & PSCI power management calls).
+  * Decodes raw 32-bit machine instructions into assembly mnemonics: MRS/MSR (system registers including PMU counters), ADRP/ADR (PC-relative), LDR/STR (32/64-bit load/store), ADD/SUB, B/BL/BLR/RET, and SMC/HVC calls with automatic ARM SMCCC / PSCI / TrustZone function annotations.
 
 ```bash
 # Display silicon hardware telemetry overview with zero filesystem dependencies
@@ -543,16 +609,55 @@ busybox socprobe cpu
 # Measure real-time core clock frequency via assembly timing loop
 busybox socprobe pll
 
+# View GCC/RPM clock tree, RCGR dividers & CBCR branch registers
+busybox socprobe clock
+
 # View SPMI PMIC voltage regulator specifications and registers
 busybox socprobe pmic
 
-# Inspect PMIC voltage step equations and power dissipation models
+# Inspect PMIC voltage step equations and power models
 busybox socprobe volt
 
-# View in-memory physical MMIO hardware memory map
+# View in-memory physical MMIO hardware memory map (56+ blocks)
 busybox socprobe mmio
 
-# Disassemble raw AArch64 machine instructions
+# Filter MMIO hardware blocks by name or subsystem
+busybox socprobe mmio crypto
+
+# Inspect ARM SMCCC PSCI and TrustZone SMC call registers and SIP IDs
+busybox socprobe psci
+
+# View Spectra ISP pipeline, CSID/CSIPHY, and 3D/Gamma/LSC hardware LUTs
+busybox socprobe isp
+
+# Probe Hexagon DSPs (aDSP, cDSP HVX/HMX AI NPU) and IPA network offloader
+busybox socprobe dsp
+
+# Inspect Audio Routing DSP (ARDP), Soundwire & SLIMbus registers
+busybox socprobe ardp
+
+# Inspect PMIC VADC / ADC5 analog-to-digital conversion channels and registers
+busybox socprobe adc
+
+# View System NoC interconnects, QoS arbiters, and BWMON bandwidth monitors
+busybox socprobe noc
+
+# Inspect System Management Interface (SMI) & shared memory mailboxes
+busybox socprobe smi
+
+# Probe Silicon Ring Oscillators (ROSC), Aging & CPR/TSENS sensors
+busybox socprobe rosc
+
+# Inspect Qualcomm Crypto Engine (CE v5), HWKM & Inline Crypto Engine (ICE)
+busybox socprobe crypto
+
+# View Hexagon Tensor Processor (HTP / HMX) & AI accelerators
+busybox socprobe ai
+
+# Audit ARMv8 PMU hardware performance counter registers via inline assembly
+busybox socprobe pmu
+
+# Disassemble raw AArch64 machine instructions (with automatic SMC & PMU annotations)
 busybox socprobe disasm d5380000 d4000003 90000800 91000021 b9400000 d65f03c0
 ```
 
