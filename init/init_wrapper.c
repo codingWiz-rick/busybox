@@ -101,6 +101,20 @@ static inline ssize_t full_write(int fd, const void *buf, size_t len)
 #define KEY_MAX 0x2ff
 #endif
 
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
+
+#ifndef __NR_memfd_create
+# if defined(__aarch64__)
+#  define __NR_memfd_create 279
+# elif defined(__x86_64__)
+#  define __NR_memfd_create 319
+# elif defined(__arm__)
+#  define __NR_memfd_create 385
+# endif
+#endif
+
 #define TAG "<6>early-init: "
 #define TAG_ERR "<3>early-init: [ERROR] "
 #define TAG_WARN "<4>early-init: [WARN] "
@@ -127,6 +141,24 @@ static const char * const modules_load_configs[] = {
 	"/modules.load",
 	NULL
 };
+
+static int create_memfd(const char *name)
+{
+	int fd = -1;
+#if defined(SYS_memfd_create)
+	fd = syscall(SYS_memfd_create, name, MFD_CLOEXEC);
+#elif defined(__NR_memfd_create)
+	fd = syscall(__NR_memfd_create, name, MFD_CLOEXEC);
+#endif
+	if (fd < 0) {
+#ifdef O_TMPFILE
+		fd = open("/dev/shm", O_TMPFILE | O_RDWR | O_CLOEXEC, 0700);
+		if (fd < 0)
+			fd = open("/tmp", O_TMPFILE | O_RDWR | O_CLOEXEC, 0700);
+#endif
+	}
+	return fd;
+}
 
 static void kmsg_puts(const char *level, const char *msg)
 {
@@ -362,12 +394,34 @@ static void extract_module_params(const char *cmdline, const char *mod_stem, cha
 	}
 }
 
+static void get_module_stem(const char *path, char *stem, size_t stem_sz)
+{
+	const char *slash = strrchr(path, '/');
+	const char *base = slash ? (slash + 1) : path;
+	char *dot;
+
+	snprintf(stem, stem_sz, "%s", base);
+	dot = strstr(stem, ".ko");
+	if (dot)
+		*dot = '\0';
+}
+
 static int load_single_module(const char *mod_path, const char *params)
 {
 	int fd;
 	const char *mod_params;
-	long ret;
+	long ret = -1;
 	char msg[256];
+	char magic[6];
+	char stem[64];
+	ssize_t nmagic;
+	bool is_compressed = false;
+	const char *fmt_name = "Compressed";
+	size_t decomp_sz = 0;
+	void *decomp_buf = NULL;
+	int mfd = -1;
+
+	mod_params = params ? params : "";
 
 	fd = open(mod_path, O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
@@ -376,26 +430,109 @@ static int load_single_module(const char *mod_path, const char *params)
 		return -1;
 	}
 
-	mod_params = params ? params : "";
-	ret = syscall(SYS_finit_module, fd, mod_params, 0);
+	memset(magic, 0, sizeof(magic));
+	nmagic = read(fd, magic, sizeof(magic));
+	close(fd);
 
-	if (ret != 0 && errno == ENOSYS) {
-		struct stat st;
-		if (fstat(fd, &st) == 0 && st.st_size > 0) {
-			void *buf = malloc((size_t)st.st_size);
-			if (buf) {
-				if (read(fd, buf, (size_t)st.st_size) == st.st_size) {
-					ret = syscall(SYS_init_module, buf, (unsigned long)st.st_size, mod_params);
-				}
-				free(buf);
-			}
+	if (nmagic >= 2) {
+		/* Gzip magic: 1f 8b */
+		if ((uint8_t)magic[0] == 0x1f && (uint8_t)magic[1] == 0x8b) {
+			is_compressed = true;
+			fmt_name = "Gzip";
+		}
+		/* XZ magic: fd 37 7a 58 5a 00 */
+		else if (nmagic >= 6 && (uint8_t)magic[0] == 0xfd && magic[1] == '7' &&
+		         magic[2] == 'z' && magic[3] == 'X' && magic[4] == 'Z' && magic[5] == 0x00) {
+			is_compressed = true;
+			fmt_name = "XZ";
+		}
+		/* Bzip2 magic: 'B' 'Z' */
+		else if (magic[0] == 'B' && magic[1] == 'Z') {
+			is_compressed = true;
+			fmt_name = "Bzip2";
 		}
 	}
 
-	close(fd);
+	if (is_compressed) {
+		snprintf(msg, sizeof(msg), "Found %s module '%s', decompressing into RAM...", fmt_name, mod_path);
+		kmsg_puts(TAG, msg);
+
+		decomp_buf = xmalloc_open_zipped_read_close(mod_path, &decomp_sz);
+
+		if (!decomp_buf || decomp_sz == 0) {
+			snprintf(msg, sizeof(msg), "Failed to decompress module '%s' (errno=%d: %s)",
+				mod_path, errno, strerror(errno));
+			kmsg_puts(TAG_ERR, msg);
+			free(decomp_buf);
+			return -1;
+		}
+
+		/* Verify valid ELF header before kernel injection */
+		if (decomp_sz >= 4) {
+			const unsigned char *elf = (const unsigned char *)decomp_buf;
+			if (elf[0] != 0x7f || elf[1] != 'E' || elf[2] != 'L' || elf[3] != 'F') {
+				snprintf(msg, sizeof(msg), "Decompressed module '%s' is not a valid ELF binary (magic: %02x %02x %02x %02x)",
+					mod_path, elf[0], elf[1], elf[2], elf[3]);
+				kmsg_puts(TAG_ERR, msg);
+				free(decomp_buf);
+				return -1;
+			}
+		}
+
+		snprintf(msg, sizeof(msg), "Decompressed '%s' (%zu bytes in RAM, valid ELF). Loading via in-memory memfd...",
+			mod_path, decomp_sz);
+		kmsg_puts(TAG, msg);
+
+		/* Fast path: stream into anonymous in-memory memfd for sys_finit_module */
+		get_module_stem(mod_path, stem, sizeof(stem));
+		mfd = create_memfd(stem);
+		if (mfd >= 0) {
+			full_write(mfd, decomp_buf, decomp_sz);
+			lseek(mfd, 0, SEEK_SET);
+			ret = syscall(SYS_finit_module, mfd, mod_params, 0);
+			close(mfd);
+		}
+
+		/* Direct in-memory buffer fallback: sys_init_module */
+		if (ret != 0 && (errno == ENOSYS || mfd < 0)) {
+			ret = syscall(SYS_init_module, decomp_buf, (unsigned long)decomp_sz, mod_params);
+		}
+
+		free(decomp_buf);
+	} else {
+		/* Plain uncompressed ELF .ko */
+		snprintf(msg, sizeof(msg), "Loading uncompressed module '%s' via finit_module...", mod_path);
+		kmsg_puts(TAG, msg);
+
+		fd = open(mod_path, O_RDONLY | O_CLOEXEC);
+		if (fd < 0) {
+			snprintf(msg, sizeof(msg), "Failed to reopen module '%s': %s", mod_path, strerror(errno));
+			kmsg_puts(TAG_WARN, msg);
+			return -1;
+		}
+
+		ret = syscall(SYS_finit_module, fd, mod_params, 0);
+
+		if (ret != 0 && errno == ENOSYS) {
+			struct stat st;
+			if (fstat(fd, &st) == 0 && st.st_size > 0) {
+				void *buf = malloc((size_t)st.st_size);
+				if (buf) {
+					if (read(fd, buf, (size_t)st.st_size) == st.st_size) {
+						ret = syscall(SYS_init_module, buf, (unsigned long)st.st_size, mod_params);
+					}
+					free(buf);
+				}
+			}
+		}
+		close(fd);
+	}
 
 	if (ret == 0 || errno == EEXIST) {
-		snprintf(msg, sizeof(msg), "Loaded module '%s' %s", mod_path, (errno == EEXIST) ? "(already loaded)" : "successfully");
+		snprintf(msg, sizeof(msg), "Loaded module '%s'%s %s",
+			mod_path,
+			is_compressed ? " (decompressed in RAM)" : "",
+			(errno == EEXIST) ? "(already loaded)" : "successfully");
 		kmsg_puts(TAG, msg);
 		return 0;
 	} else {
@@ -407,8 +544,9 @@ static int load_single_module(const char *mod_path, const char *params)
 
 static bool resolve_module_path(const char *name, char *out_path, size_t out_sz)
 {
-	char file_name[128];
-	int i;
+	static const char * const exts[] = { "", ".xz", ".gz" };
+	char base_name[128];
+	int i, j;
 
 	if (access(name, R_OK) == 0) {
 		snprintf(out_path, out_sz, "%s", name);
@@ -416,36 +554,26 @@ static bool resolve_module_path(const char *name, char *out_path, size_t out_sz)
 	}
 
 	if (strstr(name, ".ko") == NULL) {
-		snprintf(file_name, sizeof(file_name), "%s.ko", name);
+		snprintf(base_name, sizeof(base_name), "%s.ko", name);
 	} else {
-		snprintf(file_name, sizeof(file_name), "%s", name);
+		snprintf(base_name, sizeof(base_name), "%s", name);
 	}
 
 	for (i = 0; search_dirs[i] != NULL; i++) {
-		char cand[256];
-		if (strcmp(search_dirs[i], "/") == 0) {
-			snprintf(cand, sizeof(cand), "/%s", file_name);
-		} else {
-			snprintf(cand, sizeof(cand), "%s/%s", search_dirs[i], file_name);
-		}
-		if (access(cand, R_OK) == 0) {
-			snprintf(out_path, out_sz, "%s", cand);
-			return true;
+		for (j = 0; j < (int)ARRAY_SIZE(exts); j++) {
+			char cand[256];
+			if (strcmp(search_dirs[i], "/") == 0) {
+				snprintf(cand, sizeof(cand), "/%s%s", base_name, exts[j]);
+			} else {
+				snprintf(cand, sizeof(cand), "%s/%s%s", search_dirs[i], base_name, exts[j]);
+			}
+			if (access(cand, R_OK) == 0) {
+				snprintf(out_path, out_sz, "%s", cand);
+				return true;
+			}
 		}
 	}
 	return false;
-}
-
-static void get_module_stem(const char *path, char *stem, size_t stem_sz)
-{
-	const char *slash = strrchr(path, '/');
-	const char *base = slash ? (slash + 1) : path;
-	char *dot;
-
-	snprintf(stem, stem_sz, "%s", base);
-	dot = strstr(stem, ".ko");
-	if (dot)
-		*dot = '\0';
 }
 
 static int load_modules_from_config(const char *cfg_path, const char *cmdline)
@@ -496,6 +624,17 @@ static int load_modules_from_config(const char *cfg_path, const char *cmdline)
 	return loaded;
 }
 
+static bool is_module_filename(const char *name)
+{
+	const char *dot_ko = strstr(name, ".ko");
+	const char *after_ko;
+
+	if (!dot_ko)
+		return false;
+	after_ko = dot_ko + 3;
+	return (*after_ko == '\0' || strcmp(after_ko, ".xz") == 0 || strcmp(after_ko, ".gz") == 0);
+}
+
 static int scan_and_load_directory_modules(const char *cmdline)
 {
 	int loaded = 0;
@@ -508,12 +647,11 @@ static int scan_and_load_directory_modules(const char *cmdline)
 			continue;
 
 		while ((de = readdir(d)) != NULL) {
-			char *ext = strstr(de->d_name, ".ko");
 			char full[512];
 			char stem[64];
 			char params[256];
 
-			if (!ext || strcmp(ext, ".ko") != 0)
+			if (!is_module_filename(de->d_name))
 				continue;
 
 			if (strcmp(search_dirs[i], "/") == 0) {
