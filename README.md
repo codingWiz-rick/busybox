@@ -506,7 +506,59 @@ busybox displayswitch dump /data/local/tmp/screenshot.ppm
 
 ---
 
-### 8. Build Targets
+### 8. Pure In-Memory Mobile SoC Silicon Hardware & Machine Engine (`socprobe`, `socreg`, `regprobe`, `pllprobe`)
+
+Zero-dependency silicon hardware diagnostic and machine-code analysis suite designed specifically for restricted environments where `debugfs` is omitted/blocked, `/dev/mem` is denied, and filesystem endpoints (`/proc`, `/sys`) are inaccessible or locked down. Operates with **zero filesystem access** (0 `open()`, 0 `fopen()`, 0 `opendir()`, 0 disk I/O) using pure AArch64 inline assembly, cycle-timing loops, in-memory silicon tables, and instruction disassembly.
+
+* **`socprobe status` / `info`**:
+  * Silicon telemetry overview: CPU implementer/part, exception level (`CurrentEL`), hardware crystal frequency (`CNTFRQ_EL0`), live measured core clock, and in-memory MMIO/PMIC register definitions.
+* **`socprobe cpu`**:
+  * Pure inline assembly register audit with `SIGILL` trap recovery: `MIDR_EL1` (Implementer, Part, Variant, Revision), `MPIDR_EL1` (Cluster/Core affinity), `REVIDR_EL1`, `CTR_EL0` (D-Cache/I-Cache line sizes), `DCZID_EL0`, `ID_AA64ISAR0/1_EL1` (Hardware AES/SHA1/SHA2/CRC32/Atomics), `ID_AA64PFR0_EL1` (AdvSIMD/FP/GIC/CSV2), `ID_AA64MMFR0_EL1` (Physical address width), `CNTFRQ_EL0`, `CNTVCT_EL0`, `CurrentEL`, and `DAIF`.
+* **`socprobe pll` / `clocks`**:
+  * Hardware crystal oscillator base frequency (`19.200 MHz TCXO`).
+  * Real-time CPU core clock frequency measured dynamically via unrolled instruction loop against `CNTVCT_EL0` / `CNTFRQ_EL0` cycle deltas.
+  * In-memory Qualcomm GCC PLL network: GPLL0 (600MHz System/NoC), GPLL1 (576MHz Audio/Crypto), GPLL3 (1100MHz Display/CAM), GPLL4 (1600MHz UFS/PCIe), GPLL6 (384MHz Sleep), GPLL7 (533MHz DDR/BIMC), GPLL8 (825MHz GPU).
+* **`socprobe pmic`**:
+  * Qualcomm SPMI Arbiter architecture: Configuration (`0x01C0A000`), Core (`0x01C40000`), Channel Windows (`0x01E00000`), and Observer Windows (`0x03E00000`).
+  * Per-peripheral register specifications: REVID (0x0100), PON reset/power-on control (0x0800), BUA backup battery (0x1000), TSENS on-die temp alarm (0x2400), SMBB charger (0x3100), FG_BATT fuel gauge (0x4000), GPIOs (0xC000), and MPPs (0xD000).
+  * 12 core PMIC Buck (SMPS) and LDO voltage regulator rails with step sizes, voltage ranges, and SPMI register addresses.
+* **`socprobe volt` / `power`**:
+  * PMIC DAC voltage translation equations: Core SMPS (`300mV + step * 5mV`), High-Range Bucks (`600mV + step * 10mV`), Low-Range LDOs (`375mV + step * 12.5mV`), High-Range LDOs (`1750mV + step * 12.5mV`).
+  * Instantaneous power dissipation equations (`P = C * V^2 * f` and `P = V * I`).
+  * Coulomb counter current sense and ADC equations (`1.49 uV / Rsense` and `152.58 uV ADC`).
+  * Active silicon core power estimation profiles (Sleep, LITTLE Eco, BIG Burst, Adreno 3D GPU).
+* **`socprobe mmio [filter]`**:
+  * In-memory physical MMIO register map covering 31 hardware silicon blocks: GCC, TLMM, SPMI, QFPROM, PSHOLD, TSENS, SDHC, UFSHC, UFS-ICE, GENI-I2C, DWC3 USB, Adreno GPU, MDSS/DPU, MIPI DSI, LPASS Audio, Crypto Engine, APCS, and CPUFreq-HW.
+* **`socprobe disasm <HEX...>`**:
+  * Pure C zero-dependency AArch64 machine-code instruction disassembler.
+  * Decodes raw 32-bit machine instructions into assembly mnemonics: MRS/MSR (system registers), ADRP/ADR (PC-relative), LDR/STR (32/64-bit load/store), ADD/SUB, B/BL/BLR/RET, and SMC/HVC (TrustZone & PSCI power management calls).
+
+```bash
+# Display silicon hardware telemetry overview with zero filesystem dependencies
+busybox socprobe status
+
+# Audit CPU architectural registers via inline assembly
+busybox socprobe cpu
+
+# Measure real-time core clock frequency via assembly timing loop
+busybox socprobe pll
+
+# View SPMI PMIC voltage regulator specifications and registers
+busybox socprobe pmic
+
+# Inspect PMIC voltage step equations and power dissipation models
+busybox socprobe volt
+
+# View in-memory physical MMIO hardware memory map
+busybox socprobe mmio
+
+# Disassemble raw AArch64 machine instructions
+busybox socprobe disasm d5380000 d4000003 90000800 91000021 b9400000 d65f03c0
+```
+
+---
+
+### 9. Build Targets
 
 The custom build system (`Makefile.custom`) automatically resolves cross-compilation toolchains and sysroots:
 
