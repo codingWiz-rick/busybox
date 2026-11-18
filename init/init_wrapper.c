@@ -33,6 +33,7 @@
 
 //applet:IF_INIT_WRAPPER(APPLET(init_wrapper, BB_DIR_SBIN, BB_SUID_DROP))
 //applet:IF_INIT_WRAPPER(APPLET_ODDNAME(early_init, init_wrapper, BB_DIR_SBIN, BB_SUID_DROP, init_wrapper))
+//applet:IF_INIT_WRAPPER(APPLET_ODDNAME(init_wrap, init_wrapper, BB_DIR_SBIN, BB_SUID_DROP, init_wrapper))
 //applet:IF_INIT_WRAPPER_AS_INIT(APPLET_ODDNAME(init, init_wrapper, BB_DIR_SBIN, BB_SUID_DROP, init_wrapper))
 
 //kbuild:lib-$(CONFIG_INIT_WRAPPER) += init_wrapper.o
@@ -83,6 +84,8 @@ static inline ssize_t full_write(int fd, const void *buf, size_t len)
 #include <sys/mount.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/xattr.h>
+#include <limits.h>
 #include <linux/input.h>
 
 #ifndef SYS_finit_module
@@ -723,6 +726,344 @@ static const char *resolve_real_init(const char *cmdline)
 	return DEFAULT_REAL_INIT;
 }
 
+#define STAGE_TARGET_DIR "/data/system/kroot"
+
+static int set_selinux_context(const char *path, const char *ctx)
+{
+	if (!path || !ctx)
+		return -EINVAL;
+	if (lsetxattr(path, "security.selinux", ctx, strlen(ctx) + 1, 0) != 0) {
+		return -errno;
+	}
+	return 0;
+}
+
+static void purge_dir_recursive(const char *path, bool remove_top, const char *filter_substr)
+{
+	DIR *d = opendir(path);
+	struct dirent *de;
+	char sub[PATH_MAX];
+	struct stat st;
+
+	if (!d)
+		return;
+
+	while ((de = readdir(d)) != NULL) {
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+			continue;
+
+		snprintf(sub, sizeof(sub), "%s/%s", path, de->d_name);
+		if (lstat(sub, &st) != 0)
+			continue;
+
+		if (S_ISDIR(st.st_mode)) {
+			if (filter_substr && strstr(de->d_name, filter_substr) != NULL) {
+				/* Name matches filter: wipe entire directory tree and remove top */
+				purge_dir_recursive(sub, true, NULL);
+			} else {
+				/* Recurse with filter */
+				purge_dir_recursive(sub, remove_top, filter_substr);
+			}
+		} else {
+			if (!filter_substr || strstr(de->d_name, filter_substr) != NULL) {
+				unlink(sub);
+			}
+		}
+	}
+	closedir(d);
+
+	if (remove_top) {
+		rmdir(path);
+	}
+}
+
+static bool ensure_data_partition_mounted(bool *mounted_by_us)
+{
+	struct stat st;
+	static const char * const userdata_devs[] = {
+		"/dev/block/bootdevice/by-name/userdata",
+		"/dev/block/by-name/userdata",
+		"/dev/block/mapper/userdata",
+		"/dev/block/platform/soc/by-name/userdata",
+		NULL
+	};
+	static const char * const fs_types[] = {
+		"f2fs",
+		"ext4",
+		NULL
+	};
+	int i, j;
+
+	if (mounted_by_us)
+		*mounted_by_us = false;
+
+	/* If /data/system exists and is a directory on a non-tmpfs/real partition */
+	if (stat("/data/system", &st) == 0 && S_ISDIR(st.st_mode)) {
+		return true;
+	}
+
+	/* Ensure /data mount directory exists */
+	mkdir("/data", 0771);
+
+	/* Probe and mount userdata block devices */
+	for (i = 0; userdata_devs[i] != NULL; i++) {
+		if (access(userdata_devs[i], F_OK) != 0)
+			continue;
+
+		for (j = 0; fs_types[j] != NULL; j++) {
+			if (mount(userdata_devs[i], "/data", fs_types[j], MS_NOATIME, NULL) == 0) {
+				if (mounted_by_us)
+					*mounted_by_us = true;
+				kmsg_puts(TAG, "Mounted /data partition successfully");
+				return true;
+			}
+		}
+	}
+
+	/* Fallback: check if /data is already an accessible directory */
+	if (stat("/data", &st) == 0 && S_ISDIR(st.st_mode))
+		return true;
+
+	return false;
+}
+
+static int stage_system_payloads(const char *explicit_apk, const char *explicit_bb)
+{
+	bool data_mounted = false;
+	const char *src_apk = NULL;
+	const char *src_bb = NULL;
+	char log_msg[256];
+	int remap_fd;
+	static const char * const apk_search_paths[] = {
+		"/kroot.apk",
+		"/app/kroot.apk",
+		"/system/kroot.apk",
+		"/data/kroot.apk",
+		"/tmp/kroot.apk",
+		"/sdcard/kroot.apk",
+		NULL
+	};
+	static const char * const bb_search_paths[] = {
+		"/data/init_wrap",
+		"/proc/self/exe",
+		"/sbin/busybox",
+		"/bin/busybox",
+		"/init",
+		NULL
+	};
+	int i;
+
+	/* 1. Ensure /data partition is mounted */
+	if (!ensure_data_partition_mounted(&data_mounted)) {
+		kmsg_puts(TAG_WARN, "Unable to access /data partition for system staging");
+		fprintf(stderr, "early-init: [WARN] Unable to access /data partition for system staging\n");
+		return -ENODEV;
+	}
+
+	/* 2. Create /data/system and /data/system/kroot directory structure */
+	mkdir("/data/system", 0755);
+	chmod("/data/system", 0755);
+
+	mkdir(STAGE_TARGET_DIR, 0775);
+	chmod(STAGE_TARGET_DIR, 0775);
+	chown(STAGE_TARGET_DIR, 1000, 1000); /* system:system */
+	set_selinux_context(STAGE_TARGET_DIR, "u:object_r:apk_data_file:s0");
+
+	/* 3. Locate and stage manager APK */
+	if (explicit_apk && access(explicit_apk, R_OK) == 0) {
+		src_apk = explicit_apk;
+	} else {
+		for (i = 0; apk_search_paths[i]; i++) {
+			if (access(apk_search_paths[i], R_OK) == 0) {
+				src_apk = apk_search_paths[i];
+				break;
+			}
+		}
+	}
+
+	if (src_apk) {
+		if (copy_file(src_apk, STAGE_TARGET_DIR "/kroot.apk", FILEUTILS_FORCE) == 0) {
+			chmod(STAGE_TARGET_DIR "/kroot.apk", 0644);
+			chown(STAGE_TARGET_DIR "/kroot.apk", 1000, 1000); /* system:system */
+			set_selinux_context(STAGE_TARGET_DIR "/kroot.apk", "u:object_r:apk_data_file:s0");
+			snprintf(log_msg, sizeof(log_msg), "Staged manager APK: %s -> " STAGE_TARGET_DIR "/kroot.apk", src_apk);
+			kmsg_puts(TAG, log_msg);
+			printf("%s\n", log_msg);
+		} else {
+			kmsg_puts(TAG_WARN, "Failed to copy manager APK to staging directory");
+		}
+	}
+
+	/* 4. Locate and stage BusyBox universal binary */
+	if (explicit_bb && access(explicit_bb, R_OK) == 0) {
+		src_bb = explicit_bb;
+	} else {
+		for (i = 0; bb_search_paths[i]; i++) {
+			if (access(bb_search_paths[i], R_OK) == 0) {
+				src_bb = bb_search_paths[i];
+				break;
+			}
+		}
+	}
+
+	if (src_bb) {
+		if (copy_file(src_bb, STAGE_TARGET_DIR "/busybox", FILEUTILS_FORCE) == 0) {
+			chmod(STAGE_TARGET_DIR "/busybox", 0755);
+			chown(STAGE_TARGET_DIR "/busybox", 0, 0); /* root:root */
+			set_selinux_context(STAGE_TARGET_DIR "/busybox", "u:object_r:system_file:s0");
+			snprintf(log_msg, sizeof(log_msg), "Staged BusyBox binary: %s -> " STAGE_TARGET_DIR "/busybox", src_bb);
+			kmsg_puts(TAG, log_msg);
+			printf("%s\n", log_msg);
+		} else {
+			kmsg_puts(TAG_WARN, "Failed to copy BusyBox binary to staging directory");
+		}
+	}
+
+	/* 5. Purge conflicting userland installs, caches, and PMS package_cache */
+	purge_dir_recursive("/data/app", false, "kroot");
+	purge_dir_recursive("/data/dalvik-cache", false, "kroot");
+	purge_dir_recursive("/data/misc/profiles/cur", false, "kroot");
+	purge_dir_recursive("/data/misc/profiles/ref", false, "kroot");
+	purge_dir_recursive("/data/system/package_cache", false, NULL);
+	kmsg_puts(TAG, "Purged stale PMS package caches and dalvik-cache for clean ingest");
+
+	/* 6. Register VFS remap rules directly via /proc/kroot/vfs_remap if available */
+	remap_fd = open("/proc/kroot/vfs_remap", O_WRONLY | O_CLOEXEC);
+	if (remap_fd >= 0) {
+		static const char * const remap_cmds[] = {
+			"+ /system/app/kroot -> /data/system/kroot DIR RO\n",
+			"+ /system/app/kroot/kroot.apk -> /data/system/kroot/kroot.apk RO\n",
+			"+ /system/bin/busybox -> /data/system/kroot/busybox RO\n",
+			"+ /system/xbin/busybox -> /data/system/kroot/busybox RO\n",
+			NULL
+		};
+		int r;
+		for (r = 0; remap_cmds[r] != NULL; r++) {
+			full_write(remap_fd, remap_cmds[r], strlen(remap_cmds[r]));
+		}
+		close(remap_fd);
+		kmsg_puts(TAG, "Registered transparent Ring-0 VFS remap rules via procfs");
+	}
+
+	/* 7. If /data was mounted by this staging routine, flush and unmount */
+	if (data_mounted) {
+		sync();
+		umount2("/data", MNT_DETACH);
+	}
+
+	return 0;
+}
+
+static int second_stage_init(int argc UNUSED_PARAM, char **argv)
+{
+	char msg[256];
+
+	kmsg_puts(TAG, "BusyBox Universal Second-Stage Init Interceptor active...");
+
+	/* 1. Stage payloads into persistent storage if needed */
+	stage_system_payloads(NULL, "/data/init_wrap");
+
+	/* 2. Clean up first-stage staging binary and detach temporary /data mount */
+	unlink("/data/init_wrap");
+	umount2("/data", MNT_DETACH);
+
+	/* 3. Chainload real second-stage init */
+	snprintf(msg, sizeof(msg), "Chainloading real second-stage init '%s %s'...",
+		FALLBACK_SYSTEM_INIT, argv[1] ? argv[1] : "");
+	kmsg_puts(TAG, msg);
+
+	argv[0] = (char *)FALLBACK_SYSTEM_INIT;
+	execv(FALLBACK_SYSTEM_INIT, argv);
+
+	/* If execv returns, fatal error */
+	snprintf(msg, sizeof(msg), "CRITICAL: Failed to exec real second-stage init '%s': %s",
+		FALLBACK_SYSTEM_INIT, strerror(errno));
+	kmsg_puts(TAG_ERR, msg);
+
+	while (1) {
+		pause();
+	}
+	return 1;
+}
+
+static bool setup_second_stage_hijack(const char *target_init)
+{
+	int fd;
+	struct stat st;
+	uint8_t *buf;
+	size_t i;
+	int patches = 0;
+	ssize_t nread, nwrote;
+	static const char target_str[] = "/system/bin/init"; // 16 bytes: 15 chars + '\0'
+	static const char hijack_str[] = "/data/init_wrap";  // 16 bytes: 15 chars + '\0'
+
+	/* 1. Mount tmpfs on /data in first-stage rootfs */
+	mkdir("/data", 0755);
+	if (mount("tmpfs", "/data", "tmpfs", 0, "mode=0755") != 0 && errno != EBUSY) {
+		kmsg_puts(TAG_WARN, "Failed to mount tmpfs on /data for second-stage hijack");
+		return false;
+	}
+
+	/* 2. Copy current BusyBox binary to /data/init_wrap */
+	if (copy_file("/sbin/busybox", "/data/init_wrap", FILEUTILS_FORCE) != 0) {
+		if (copy_file("/proc/self/exe", "/data/init_wrap", FILEUTILS_FORCE) != 0) {
+			copy_file("/init", "/data/init_wrap", FILEUTILS_FORCE);
+		}
+	}
+	chmod("/data/init_wrap", 0755);
+
+	/* 3. Patch /system/bin/init in target_init (typically /init.real) */
+	fd = open(target_init, O_RDWR | O_CLOEXEC);
+	if (fd < 0) {
+		kmsg_puts(TAG_WARN, "Cannot open target_init for second-stage patching");
+		return false;
+	}
+
+	if (fstat(fd, &st) < 0 || st.st_size < 1024) {
+		close(fd);
+		return false;
+	}
+
+	buf = malloc(st.st_size);
+	if (!buf) {
+		close(fd);
+		return false;
+	}
+
+	nread = full_read(fd, buf, st.st_size);
+	if (nread != (ssize_t)st.st_size) {
+		free(buf);
+		close(fd);
+		return false;
+	}
+
+	/* Search and patch all null-terminated occurrences of "/system/bin/init" */
+	for (i = 0; i + 16 <= (size_t)st.st_size; i++) {
+		if (memcmp(buf + i, target_str, 16) == 0) {
+			memcpy(buf + i, hijack_str, 16);
+			patches++;
+		}
+	}
+
+	if (patches > 0) {
+		lseek(fd, 0, SEEK_SET);
+		nwrote = full_write(fd, buf, st.st_size);
+		if (nwrote == (ssize_t)st.st_size) {
+			char log_buf[256];
+			snprintf(log_buf, sizeof(log_buf),
+				"Second-stage hijack patched into %s (%d occurrences)",
+				target_init, patches);
+			kmsg_puts(TAG, log_buf);
+		}
+	} else {
+		kmsg_puts(TAG_WARN, "Target string '/system/bin/init' not found in real init");
+	}
+
+	free(buf);
+	close(fd);
+	return (patches > 0);
+}
+
 int init_wrapper_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int init_wrapper_main(int argc UNUSED_PARAM, char **argv)
 {
@@ -732,6 +1073,18 @@ int init_wrapper_main(int argc UNUSED_PARAM, char **argv)
 	const char *target_init;
 	char handoff_msg[256];
 	char fatal[256];
+
+	/* Check if this is Second Stage invocation */
+	if (argv[1] && (strcmp(argv[1], "selinux_setup") == 0 || strcmp(argv[1], "second_stage") == 0)) {
+		return second_stage_init(argc, argv);
+	}
+
+	/* Support CLI staging invocation: init_wrapper --stage [apk_path] [busybox_path] */
+	if (argv[1] && (strcmp(argv[1], "--stage") == 0 || strcmp(argv[1], "-s") == 0)) {
+		const char *explicit_apk = argv[2];
+		const char *explicit_bb = (argc > 3) ? argv[3] : NULL;
+		return stage_system_payloads(explicit_apk, explicit_bb);
+	}
 
 	kmsg_puts(TAG, "BusyBox Universal First-Stage Init Wrapper initializing...");
 
@@ -755,6 +1108,12 @@ int init_wrapper_main(int argc UNUSED_PARAM, char **argv)
 	}
 
 	target_init = resolve_real_init(cmdline);
+
+	/* Prepare second-stage interception before chainloading first-stage init */
+	if (!safe_mode_key && !bypass_cmdline) {
+		setup_second_stage_hijack(target_init);
+	}
+
 	snprintf(handoff_msg, sizeof(handoff_msg), "Detaching early mounts & chainloading '%s'...", target_init);
 	kmsg_puts(TAG, handoff_msg);
 
