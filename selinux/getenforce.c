@@ -22,27 +22,49 @@
 
 #include "libbb.h"
 
+#if ENABLE_SELINUX
+extern void selinux_prune_anchor(void);
+#endif
+
 int getenforce_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int getenforce_main(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 {
-	int rc;
+	int rc = -1;
+	int fd;
+	char c;
 
-	rc = is_selinux_enabled();
-	if (rc < 0)
-		bb_simple_error_msg_and_die("is_selinux_enabled() failed");
-
-	if (rc == 1) {
+#if ENABLE_SELINUX
+	selinux_prune_anchor();
+	if (is_selinux_enabled() == 1) {
 		rc = security_getenforce();
-		if (rc < 0)
-			bb_simple_error_msg_and_die("getenforce() failed");
-
-		if (rc)
-			puts("Enforcing");
-		else
-			puts("Permissive");
-	} else {
-		puts("Disabled");
 	}
+#endif
+
+	/* If desktop libselinux returned -1 (or returned 0 because /etc/selinux/config
+	 * is absent, which is universal on Android), inspect /sys/fs/selinux/enforce directly */
+	if (rc < 0) {
+		fd = open("/sys/fs/selinux/enforce", O_RDONLY);
+		if (fd < 0)
+			fd = open("/selinux/enforce", O_RDONLY);
+
+		if (fd >= 0) {
+			c = 0;
+			if (read(fd, &c, 1) == 1) {
+				if (c == '1')
+					rc = 1;
+				else if (c == '0')
+					rc = 0;
+			}
+			close(fd);
+		}
+	}
+
+	if (rc == 1)
+		puts("Enforcing");
+	else if (rc == 0)
+		puts("Permissive");
+	else
+		puts("Disabled");
 
 	return 0;
 }

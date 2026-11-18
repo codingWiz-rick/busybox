@@ -53,3 +53,27 @@ void openssl_add_all_digests_int(void);
 void openssl_add_all_digests_int(void)
 {
 }
+
+/*
+ * 4. Stub out OpenSSL 3.x QUIC client and server methods.
+ * ADB wireless debugging operates exclusively over TLS 1.3 over TCP.
+ * Eliminates the entire QUIC engine (quic_method.o, quic_channel.o,
+ * quic_txp.o, quic_rx_depack.o, quic_impl.o, quic_tserver.o - ~300 KB).
+ */
+const void *OSSL_QUIC_client_method(void);
+const void *OSSL_QUIC_client_method(void)
+{
+	return (void *)0;
+}
+
+const void *OSSL_QUIC_client_thread_method(void);
+const void *OSSL_QUIC_client_thread_method(void)
+{
+	return (void *)0;
+}
+
+const void *OSSL_QUIC_server_method(void);
+const void *OSSL_QUIC_server_method(void)
+{
+	return (void *)0;
+}

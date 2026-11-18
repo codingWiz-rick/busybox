@@ -53,3 +53,31 @@ void FAST_FUNC selinux_preserve_fcontext(int fdesc)
 	setfscreatecon_or_die(context);
 	freecon(context);
 }
+
+#if ENABLE_SELINUX
+# include <selinux/label.h>
+
+static struct selabel_handle *se_handle;
+
+int FAST_FUNC bb_selabel_lookup(const char *path, mode_t mode, char **con)
+{
+	if (!is_selinux_enabled())
+		return -1;
+
+	if (!se_handle)
+		se_handle = selabel_open(SELABEL_CTX_FILE, NULL, 0);
+
+	if (se_handle)
+		return selabel_lookup(se_handle, con, path, mode);
+
+	return -1;
+}
+
+void FAST_FUNC bb_selabel_close(void)
+{
+	if (se_handle) {
+		selabel_close(se_handle);
+		se_handle = NULL;
+	}
+}
+#endif

@@ -187,7 +187,7 @@ ifeq ($(CONFIG_SELINUX),y)
 SELINUX_PC_MODULES = libselinux libsepol
 $(eval $(call pkg_check_modules,SELINUX,$(SELINUX_PC_MODULES)))
 CPPFLAGS += $(SELINUX_CFLAGS)
-LDLIBS += $(if $(SELINUX_LIBS),$(SELINUX_LIBS:-l%=%),$(SELINUX_PC_MODULES:lib%=%))
+LDLIBS += selinux sepol
 endif
 
 ifeq ($(CONFIG_SEPOLICY),y)

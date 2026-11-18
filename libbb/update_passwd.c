@@ -33,18 +33,16 @@ static void check_selinux_update_passwd(const char *username)
 	*p = '\0';
 
 	if (strcmp(seuser, username) != 0) {
-		security_class_t tclass;
-		access_vector_t av;
+		char *usercon = NULL;
+		int rc;
 
-		tclass = string_to_security_class("passwd");
-		if (tclass == 0)
-			goto die;
-		av = string_to_av_perm(tclass, "passwd");
-		if (av == 0)
-			goto die;
+		if (getprevcon(&usercon) < 0)
+			usercon = NULL;
 
-		if (selinux_check_passwd_access(av) != 0)
- die:
+		rc = selinux_check_access(usercon, usercon, "passwd", "passwd", NULL);
+		freecon(usercon);
+
+		if (rc != 0)
 			bb_simple_error_msg_and_die("SELinux: access denied");
 	}
 	if (ENABLE_FEATURE_CLEAN_UP)

@@ -82,7 +82,7 @@ static void setdefaultfilecon(const char *path)
 		return;
 	}
 
-	if (matchpathcon(path, s.st_mode, &scontext) < 0) {
+	if (bb_selabel_lookup(path, s.st_mode, &scontext) < 0) {
 		goto out;
 	}
 	if (strcmp(scontext, "<<none>>") == 0) {

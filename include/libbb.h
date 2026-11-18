@@ -1892,8 +1892,12 @@ extern context_t set_security_context_component(char *cur_context,
 						char *user, char *role, char *type, char *range) FAST_FUNC;
 extern void setfscreatecon_or_die(char *scontext) FAST_FUNC;
 extern void selinux_preserve_fcontext(int fdesc) FAST_FUNC;
+extern int bb_selabel_lookup(const char *path, mode_t mode, char **con) FAST_FUNC;
+extern void bb_selabel_close(void) FAST_FUNC;
 #else
 #define selinux_preserve_fcontext(fdesc) ((void)0)
+#define bb_selabel_lookup(path, mode, con) (-1)
+#define bb_selabel_close() ((void)0)
 #endif
 extern void selinux_or_die(void) FAST_FUNC;
 

@@ -26,5 +26,15 @@
 int selinuxenabled_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 int selinuxenabled_main(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
 {
-	return !is_selinux_enabled();
+#if ENABLE_SELINUX
+	if (is_selinux_enabled() == 1)
+		return 0;
+#endif
+
+	/* Android fallback: check if /sys/fs/selinux/enforce exists */
+	if (access("/sys/fs/selinux/enforce", F_OK) == 0 ||
+	    access("/selinux/enforce", F_OK) == 0)
+		return 0;
+
+	return 1;
 }
