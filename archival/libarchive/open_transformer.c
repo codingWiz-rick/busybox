@@ -334,8 +334,8 @@ void* FAST_FUNC xmalloc_open_zipped_read_close(const char *fname, size_t *maxsz_
 
 	image = NULL;
 	if (xstate->xformer) {
-		/* In-memory decompression */
-		xstate->mem_output_size_max = maxsz_p ? *maxsz_p : (size_t)(INT_MAX - 4095);
+		/* In-memory decompression: if maxsz_p is unset or points to 0, allow up to INT_MAX - 4095 */
+		xstate->mem_output_size_max = (maxsz_p && *maxsz_p > 0) ? *maxsz_p : (size_t)(INT_MAX - 4095);
 		xstate->xformer(xstate);
 		if (xstate->mem_output_buf) {
 			image = xstate->mem_output_buf;
