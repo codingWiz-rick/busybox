@@ -77,9 +77,30 @@ CC="$2"
 CFLAGS="$3"
 LDFLAGS="$4"
 
-# Dynamic LLD detection: Use LLD_BIN if configured by Makefile/environment, or check system ld.lld
+# Configurable static linking
+is_static=false
+test "$CONFIG_STATIC" = "y" && is_static=true
+case " $LDFLAGS " in *" -static "*) is_static=true;; esac
+
+if $is_static; then
+    case " $LDFLAGS " in *" -static "*) ;; *) LDFLAGS="-static $LDFLAGS";; esac
+fi
+
+# Optional LLD linker support if available and supported by compiler
 if test -n "$LLD_BIN" && test -x "$LLD_BIN/ld.lld"; then
-    LDFLAGS="-static -fuse-ld=lld -B$LLD_BIN -Wl,--icf=all -Wl,-O2 -Wl,--no-eh-frame-hdr -Wl,-z,max-page-size=4096 $LDFLAGS"
+    if check_cc "-fuse-ld=lld -B$LLD_BIN"; then
+        LLD_OPTS="-fuse-ld=lld -B$LLD_BIN"
+        if check_cc "$LLD_OPTS -Wl,--icf=all -Wl,-O2"; then
+            LLD_OPTS="$LLD_OPTS -Wl,--icf=all -Wl,-O2"
+        fi
+        if check_cc "$LLD_OPTS -Wl,--no-eh-frame-hdr"; then
+            LLD_OPTS="$LLD_OPTS -Wl,--no-eh-frame-hdr"
+        fi
+        if $is_static && check_cc "$LLD_OPTS -static -Wl,-z,max-page-size=4096"; then
+            LLD_OPTS="$LLD_OPTS -Wl,-z,max-page-size=4096"
+        fi
+        LDFLAGS="$LLD_OPTS $LDFLAGS"
+    fi
 fi
 
 O_FILES="$5"
@@ -162,6 +183,7 @@ if test "$LDLIBS"; then
     test -x "$STRIP_TOOL" || STRIP_TOOL="${STRIP:-strip}"
     AR_TOOL="`echo "$CC" | sed 's/gcc$/ar/'`"
     test -x "$AR_TOOL" || AR_TOOL="${AR:-ar}"
+    rm -rf .lib_stripped
     mkdir -p .lib_stripped
     for one in $LDLIBS; do
 	case "$one" in

@@ -59,8 +59,8 @@
 //usage:     "\n	--ramdisk-cat <boot|rd> <ent> Output entry from boot ramdisk to stdout"
 //usage:     "\n	--ramdisk-stat <boot|rd> <en> Display file stat metrics inside boot ramdisk"
 //usage:     "\n	--ramdisk-test <boot|rd>      Verify ramdisk archive integrity"
-//usage:     "\n	--dtb <file> [print|patch]    DTB inspector and AVB/fstab verity patcher"
-//usage:     "\n	--vbmeta <file> [disable|...] VBMeta AVB 2.0 flags inspector and verity disabler"
+//usage:     "\n	--dtb <file> [test|print|patch] [-f] DTB inspector and AVB/fstab verity patcher"
+//usage:     "\n	--vbmeta <file> [status|disable|restore|update-hash <part> <img>] VBMeta flags & hash updater"
 //usage:     "\n	--fstab <file> <print|patch>  In-place fstab configuration tool"
 //usage:     "\n	--cmdline <file> <print|patch> Kernel cmdline configuration tool"
 //usage:     "\n	--hexpatch <file> <from> <to> In-place binary hex string patch"
@@ -3989,7 +3989,235 @@ static void cpio_append_line_if_missing(cpio_node_t **head_ptr, const char *path
  * 7. Device Tree Blob (DTB) Manipulation Engine
  * ========================================================================= */
 
-static int magiskboot_dtb(int argc, char **argv) {
+#define FDT_TAG_BEGIN_NODE  0x00000001U
+#define FDT_TAG_END_NODE    0x00000002U
+#define FDT_TAG_PROP        0x00000003U
+#define FDT_TAG_NOP         0x00000004U
+#define FDT_TAG_END         0x00000009U
+
+static size_t fdt_match_verity_pattern(const char *buf, size_t remaining)
+{
+	static const char *const patterns[] = {
+		"verifyatboot",
+		"verify",
+		"avb_keys",
+		"avb",
+		"support_scfs",
+		"fsverity",
+		NULL
+	};
+	size_t prefix_len = 0;
+	size_t i;
+
+	if (remaining == 0) return 0;
+	if (buf[0] == ',') prefix_len = 1;
+
+	for (i = 0; patterns[i]; i++) {
+		size_t plen = strlen(patterns[i]);
+		if (remaining >= prefix_len + plen &&
+		    strncmp(buf + prefix_len, patterns[i], plen) == 0) {
+			size_t match_len = prefix_len + plen;
+			/* If followed by '=...', consume until delimiter */
+			if (match_len < remaining && buf[match_len] == '=') {
+				while (match_len < remaining) {
+					char c = buf[match_len];
+					if (c == ' ' || c == '\n' || c == ',' || c == '\0')
+						break;
+					match_len++;
+				}
+			}
+			return match_len;
+		}
+	}
+	return 0;
+}
+
+static bool fdt_strip_verity(char *buf, size_t len)
+{
+	size_t read_idx = 0;
+	size_t write_idx = 0;
+	bool modified = false;
+
+	while (read_idx < len && buf[read_idx] != '\0') {
+		size_t match_len = fdt_match_verity_pattern(buf + read_idx, len - read_idx);
+		if (match_len > 0) {
+			read_idx += match_len;
+			modified = true;
+		} else {
+			buf[write_idx++] = buf[read_idx++];
+		}
+	}
+
+	if (modified) {
+		if (write_idx > 0 && buf[0] == ',') {
+			memmove(buf, buf + 1, write_idx - 1);
+			write_idx--;
+		}
+		if (write_idx > 0 && buf[write_idx - 1] == ',') {
+			write_idx--;
+		}
+		memset(buf + write_idx, 0, len - write_idx);
+	}
+	return modified;
+}
+
+/*
+ * Traverses an individual FDT tree.
+ * action: 0 = test, 1 = print (all), 2 = print fstab only, 3 = patch
+ */
+static int fdt_process_single(uint8_t *dtb, size_t dtb_len, int action, int dtb_num,
+                              bool keep_verity, bool *has_system_root, int *patch_count)
+{
+	const struct fdt_header *fdt;
+	uint32_t totalsize, off_struct, off_strings;
+	const uint32_t *p, *end;
+	const char *strings;
+	size_t strings_sz;
+	int depth = 0;
+	bool in_fstab = false;
+	int fstab_depth = -1;
+	bool in_chosen = false;
+	int chosen_depth = -1;
+	char cur_node_name[128];
+
+	cur_node_name[0] = '\0';
+
+	if (dtb_len < sizeof(struct fdt_header)) return 0;
+	fdt = (const struct fdt_header *)dtb;
+	if (SWAP_BE32(fdt->magic) != FDT_MAGIC) return 0;
+
+	totalsize = SWAP_BE32(fdt->totalsize);
+	off_struct = SWAP_BE32(fdt->off_dt_struct);
+	off_strings = SWAP_BE32(fdt->off_dt_strings);
+
+	if (totalsize > dtb_len || off_struct >= totalsize || off_strings >= totalsize)
+		return 0;
+
+	p = (const uint32_t *)(dtb + off_struct);
+	end = (const uint32_t *)(dtb + totalsize);
+	strings = (const char *)(dtb + off_strings);
+	strings_sz = totalsize - off_strings;
+
+	if (action == 1) {
+		printf("=== dtb.%04d (size: %u bytes, ver: %u) ===\n",
+		       dtb_num, totalsize, SWAP_BE32(fdt->version));
+	}
+
+	while (p < end) {
+		uint32_t tag = SWAP_BE32(*p++);
+
+		if (tag == FDT_TAG_BEGIN_NODE) {
+			const char *name = (const char *)p;
+			size_t nlen = strlen(name) + 1;
+			p += (nlen + 3) / 4;
+
+			if (depth < 64) {
+				safe_strncpy(cur_node_name, name, sizeof(cur_node_name));
+			}
+
+			if (strcmp(name, "fstab") == 0) {
+				in_fstab = true;
+				fstab_depth = depth;
+				if (action == 2) {
+					printf("Found fstab in dtb.%04d:\n", dtb_num);
+				}
+			}
+			if (strcmp(name, "chosen") == 0) {
+				in_chosen = true;
+				chosen_depth = depth;
+			}
+
+			if (action == 1 || (action == 2 && in_fstab)) {
+				printf("%*s%s {\n", depth * 2, "", name[0] ? name : "/");
+			}
+			depth++;
+		} else if (tag == FDT_TAG_END_NODE) {
+			depth--;
+			if (depth == fstab_depth) {
+				in_fstab = false;
+				fstab_depth = -1;
+			}
+			if (depth == chosen_depth) {
+				in_chosen = false;
+				chosen_depth = -1;
+			}
+			if (action == 1 || (action == 2 && (in_fstab || depth == fstab_depth))) {
+				printf("%*s};\n", depth * 2, "");
+			}
+		} else if (tag == FDT_TAG_PROP) {
+			uint32_t plen = SWAP_BE32(*p++);
+			uint32_t nameoff = SWAP_BE32(*p++);
+			uint8_t *prop_data = (uint8_t *)p;
+			const char *prop_name = (nameoff < strings_sz) ? (strings + nameoff) : "";
+			p += (plen + 3) / 4;
+
+			/* Action 0: Test (detect system_root mount point) */
+			if (action == 0 && in_fstab && strcmp(cur_node_name, "system") == 0) {
+				if (strcmp(prop_name, "mnt_point") == 0 && plen > 0) {
+					if (strcmp((const char *)prop_data, "/system_root") == 0) {
+						if (has_system_root) *has_system_root = true;
+					}
+				}
+			}
+
+			/* Action 1 & 2: Print */
+			if (action == 1 || (action == 2 && in_fstab)) {
+				bool is_str = (plen > 1 && prop_data[plen - 1] == '\0');
+				if (is_str) {
+					size_t k;
+					for (k = 0; k < plen - 1; k++) {
+						if (prop_data[k] < 32 || prop_data[k] > 126) {
+							is_str = false;
+							break;
+						}
+					}
+				}
+				if (is_str) {
+					printf("%*s%s = \"%s\";\n", (depth + 1) * 2, "", prop_name, (const char *)prop_data);
+				} else if (plen == 4) {
+					printf("%*s%s = <0x%08x>;\n", (depth + 1) * 2, "", prop_name, SWAP_BE32(*(const uint32_t *)prop_data));
+				} else {
+					printf("%*s%s = [%u bytes];\n", (depth + 1) * 2, "", prop_name, plen);
+				}
+			}
+
+			/* Action 3: Patch */
+			if (action == 3) {
+				/* 1. In /chosen, patch skip_initramfs -> want_initramfs */
+				if (in_chosen && strcmp(prop_name, "bootargs") == 0 && plen >= 14) {
+					char *cmdline = (char *)prop_data;
+					size_t ci;
+					for (ci = 0; ci + 14 <= plen; ci++) {
+						if (memcmp(cmdline + ci, "skip_initramfs", 14) == 0) {
+							memcpy(cmdline + ci, "want_initramfs", 14);
+							printf("  [+] dtb.%04d: Patched [skip_initramfs] -> [want_initramfs]\n", dtb_num);
+							if (patch_count) (*patch_count)++;
+						}
+					}
+				}
+
+				/* 2. In /fstab child nodes, strip verity/avb flags */
+				if (in_fstab && !keep_verity && strcmp(prop_name, "fsmgr_flags") == 0 && plen > 0) {
+					if (fdt_strip_verity((char *)prop_data, plen)) {
+						printf("  [+] dtb.%04d: Stripped verity/avb from node '%s'\n", dtb_num, cur_node_name);
+						if (patch_count) (*patch_count)++;
+					}
+				}
+			}
+		} else if (tag == FDT_TAG_NOP) {
+			/* NOP token: do nothing */
+		} else if (tag == FDT_TAG_END) {
+			break;
+		} else {
+			/* Unknown or corrupt token */
+			break;
+		}
+	}
+	return (int)totalsize;
+}
+
+static int magiskboot_dtb(int argc, char **argv)
+{
 	static const char dtb_acts[] ALIGN1 =
 		"test\0"
 		"print\0"
@@ -4006,79 +4234,85 @@ static int magiskboot_dtb(int argc, char **argv) {
 	int fd;
 	struct stat st;
 	uint8_t *p;
+	int act_idx;
+	bool fstab_only = false;
+	bool keep_verity = false;
+	size_t cur = 0;
+	int dtb_num = 0;
+	int patch_count = 0;
+	bool has_system_root = false;
 
 	if (argc < 3) bb_show_usage();
 	dtb_file = argv[2];
 	action = (argc >= 4) ? argv[3] : "test";
 
-	fd = open_or_warn(dtb_file, O_RDWR | O_CLOEXEC);
+	if (argc >= 5 && strcmp(argv[4], "-f") == 0) {
+		fstab_only = true;
+	}
+
+	act_idx = index_in_strings(dtb_acts, action);
+	if (act_idx < 0) {
+		bb_error_msg("unknown dtb action '%s' (supported: test, print [-f], patch)", action);
+		return 1;
+	}
+
+	fd = open_or_warn(dtb_file, (act_idx == DTB_ACT_patch) ? (O_RDWR | O_CLOEXEC) : (O_RDONLY | O_CLOEXEC));
 	if (fd < 0) return 1;
 	if (fstat(fd, &st) < 0 || st.st_size < 16) {
 		close(fd);
 		return 1;
 	}
 
-	p = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	p = mmap(NULL, st.st_size, (act_idx == DTB_ACT_patch) ? (PROT_READ | PROT_WRITE) : PROT_READ,
+	         (act_idx == DTB_ACT_patch) ? MAP_SHARED : MAP_PRIVATE, fd, 0);
 	if (p == MAP_FAILED || !p) {
 		close(fd);
 		return 1;
 	}
 
-	switch (index_in_strings(dtb_acts, action)) {
-	case DTB_ACT_test: {
-		int32_t off = boot_find_dtb_offset(p, st.st_size);
-		if (off >= 0) {
-			printf("Valid DTB @ offset: 0x%X (%zu bytes)\n", off, (size_t)st.st_size - off);
-			munmap(p, st.st_size);
-			close(fd);
-			return 0;
-		} else {
-			printf("No DTB found in '%s'\n", dtb_file);
-			munmap(p, st.st_size);
-			close(fd);
-			return 1;
-		}
+	if (getenv("KEEPVERITY") && (strcmp(getenv("KEEPVERITY"), "true") == 0 || strcmp(getenv("KEEPVERITY"), "1") == 0)) {
+		keep_verity = true;
 	}
-	case DTB_ACT_print:
-	case DTB_ACT_dump: {
-		int32_t off = boot_find_dtb_offset(p, st.st_size);
-		if (off >= 0) {
-			const uint8_t *dtb = p + off;
-			uint32_t dtb_total_sz = ((uint32_t)dtb[4] << 24) | ((uint32_t)dtb[5] << 16) | ((uint32_t)dtb[6] << 8) | (uint32_t)dtb[7];
-			uint32_t dtb_ver = ((uint32_t)dtb[20] << 24) | ((uint32_t)dtb[21] << 16) | ((uint32_t)dtb[22] << 8) | (uint32_t)dtb[23];
-			printf("DTB Magic: 0x%08X\n", ((uint32_t)dtb[0] << 24) | ((uint32_t)dtb[1] << 16) | ((uint32_t)dtb[2] << 8) | (uint32_t)dtb[3]);
-			printf("DTB Total Size: %u bytes\n", dtb_total_sz);
-			printf("FDT Version: %u\n", dtb_ver);
+
+	while (cur + sizeof(struct fdt_header) <= (size_t)st.st_size) {
+		uint32_t magic = SWAP_BE32(*(const uint32_t *)(p + cur));
+		if (magic != FDT_MAGIC) {
+			cur += 4;
+			continue;
 		}
-		break;
-	}
-	case DTB_ACT_patch: {
-		size_t i;
-		int count = 0;
-		for (i = 0; i + 8 <= (size_t)st.st_size; i++) {
-			if (memcmp(p + i, ",verify", 7) == 0) {
-				memset(p + i, 0, 7);
-				printf("Patched fstab verity @ 0x%08zX\n", i);
-				count++;
-			} else if (memcmp(p + i, ",avb", 4) == 0) {
-				memset(p + i, 0, 4);
-				printf("Patched fstab avb @ 0x%08zX\n", i);
-				count++;
+		{
+			const struct fdt_header *hdr = (const struct fdt_header *)(p + cur);
+			uint32_t tsize = SWAP_BE32(hdr->totalsize);
+			int action_code;
+
+			if (tsize < 132 || cur + tsize > (size_t)st.st_size) {
+				cur += 4;
+				continue;
 			}
+			action_code = (act_idx == DTB_ACT_test) ? 0 :
+			              (act_idx == DTB_ACT_print || act_idx == DTB_ACT_dump) ? (fstab_only ? 2 : 1) : 3;
+
+			fdt_process_single(p + cur, tsize, action_code, dtb_num, keep_verity, &has_system_root, &patch_count);
+			cur += tsize;
+			dtb_num++;
 		}
-		msync(p, st.st_size, MS_SYNC);
-		printf("DTB patch complete: %d patches applied\n", count);
-		break;
 	}
-	default:
-		bb_error_msg("unknown dtb action '%s' (supported: test, print, patch)", action);
-		munmap(p, st.st_size);
-		close(fd);
-		return 1;
+
+	if (dtb_num == 0) {
+		printf("[-] No valid DTB ('\\xd0\\x0d\\xfe\\xed') found in '%s'\n", dtb_file);
+	} else if (act_idx == DTB_ACT_patch) {
+		msync(p, st.st_size, MS_SYNC);
+		printf("[✓] DTB patch complete: %d patches applied across %d DTB(s)\n", patch_count, dtb_num);
+	} else if (act_idx == DTB_ACT_test) {
+		printf("[✓] DTB test: %d DTB(s) scanned, system_root=%s\n", dtb_num, has_system_root ? "true [2SI]" : "false");
 	}
 
 	munmap(p, st.st_size);
 	close(fd);
+
+	if (act_idx == DTB_ACT_test && has_system_root) {
+		return 1;
+	}
 	return 0;
 }
 
@@ -4957,7 +5191,8 @@ static int magiskboot_vbmeta_op(int argc, char **argv) {
 		"disable-verification\0"
 		"patch\0"
 		"restore\0"
-		"enable\0";
+		"enable\0"
+		"update-hash\0";
 	enum {
 		VBMETA_ACT_status = 0,
 		VBMETA_ACT_print,
@@ -4968,6 +5203,7 @@ static int magiskboot_vbmeta_op(int argc, char **argv) {
 		VBMETA_ACT_patch,
 		VBMETA_ACT_restore,
 		VBMETA_ACT_enable,
+		VBMETA_ACT_update_hash,
 	};
 	const char *target;
 	const char *action = "status";
@@ -5122,8 +5358,120 @@ static int magiskboot_vbmeta_op(int argc, char **argv) {
 		break;
 	}
 
+	case VBMETA_ACT_update_hash: {
+		const char *part_name;
+		const char *comp_path;
+		int comp_fd;
+		struct stat comp_st;
+		uint8_t *comp_data;
+		uint64_t aux_sz = SWAP_BE64(hdr->auxiliary_data_block_size);
+		uint64_t desc_off = SWAP_BE64(hdr->descriptors_offset);
+		uint64_t desc_sz = SWAP_BE64(hdr->descriptors_size);
+		const uint8_t *aux_base = (const uint8_t *)hdr + sizeof(*hdr) + SWAP_BE64(hdr->authentication_data_block_size);
+		uint64_t off;
+		bool desc_updated = false;
+
+		if (argc < 6) {
+			bb_error_msg("usage: aimg vbmeta <image|vbmeta> update-hash <partition_name> <component_file>");
+			munmap(map, map_sz);
+			close(fd);
+			return 1;
+		}
+		part_name = argv[4];
+		comp_path = argv[5];
+
+		comp_fd = open_or_warn(comp_path, O_RDONLY | O_CLOEXEC);
+		if (comp_fd < 0) {
+			munmap(map, map_sz);
+			close(fd);
+			return 1;
+		}
+		if (fstat(comp_fd, &comp_st) < 0 || comp_st.st_size == 0) {
+			bb_perror_msg("invalid component file '%s'", comp_path);
+			close(comp_fd);
+			munmap(map, map_sz);
+			close(fd);
+			return 1;
+		}
+
+		comp_data = mmap(NULL, comp_st.st_size, PROT_READ, MAP_PRIVATE, comp_fd, 0);
+		if (comp_data == MAP_FAILED || !comp_data) {
+			bb_perror_msg("failed to mmap component '%s'", comp_path);
+			close(comp_fd);
+			munmap(map, map_sz);
+			close(fd);
+			return 1;
+		}
+
+		for (off = desc_off; off + sizeof(struct avb_descriptor) <= desc_off + desc_sz && off < aux_sz; ) {
+			struct avb_descriptor *d = (struct avb_descriptor *)(aux_base + off);
+			uint64_t tag = SWAP_BE64(d->tag);
+			uint64_t nbf = SWAP_BE64(d->num_bytes_following);
+			uint8_t *d_data = (uint8_t *)aux_base + off + sizeof(struct avb_descriptor);
+
+			if (off + sizeof(struct avb_descriptor) + nbf > desc_off + desc_sz) break;
+
+			if (tag == AVB_DESCRIPTOR_TAG_HASH) {
+				struct avb_hash_descriptor *hd = (struct avb_hash_descriptor *)d;
+				uint32_t nlen = SWAP_BE32(hd->partition_name_len);
+				uint32_t dlen = SWAP_BE32(hd->digest_len);
+				uint32_t slen = SWAP_BE32(hd->salt_len);
+				const char *pname = (const char *)(d_data + sizeof(*hd) - sizeof(*d));
+				const uint8_t *salt = (const uint8_t *)pname + nlen;
+				uint8_t *digest = (uint8_t *)salt + slen;
+
+				if (nlen == strlen(part_name) && strncmp(pname, part_name, nlen) == 0) {
+					sha256_ctx_t sctx;
+					uint8_t new_digest[32];
+					char old_hex[65], new_hex[65];
+					uint32_t k;
+
+					memset(old_hex, 0, sizeof(old_hex));
+					memset(new_hex, 0, sizeof(new_hex));
+
+					for (k = 0; k < dlen && k < 32; k++)
+						sprintf(old_hex + k * 2, "%02x", digest[k]);
+
+					sha256_begin(&sctx);
+					if (slen > 0)
+						sha256_hash(&sctx, salt, slen);
+					sha256_hash(&sctx, comp_data, comp_st.st_size);
+					sha256_end(&sctx, new_digest);
+
+					for (k = 0; k < dlen && k < 32; k++)
+						sprintf(new_hex + k * 2, "%02x", new_digest[k]);
+
+					hd->image_size = SWAP_BE64((uint64_t)comp_st.st_size);
+					memcpy(digest, new_digest, (dlen < 32) ? dlen : 32);
+
+					msync(map, map_sz, MS_SYNC);
+					pwrite(fd, hdr, sizeof(*hdr), vbmeta_off);
+
+					printf("[✓] SUCCESS: Updated AVB hash descriptor for '%s':\n", part_name);
+					printf("    Image Size: %llu bytes\n", (unsigned long long)comp_st.st_size);
+					printf("    Old Digest: %s\n", old_hex);
+					printf("    New Digest: %s\n", new_hex);
+					desc_updated = true;
+					break;
+				}
+			}
+			off += sizeof(struct avb_descriptor) + nbf;
+		}
+
+		munmap(comp_data, comp_st.st_size);
+		close(comp_fd);
+
+		if (!desc_updated) {
+			bb_error_msg("AVB hash descriptor for partition '%s' not found", part_name);
+			munmap(map, map_sz);
+			close(fd);
+			return 1;
+		}
+		break;
+	}
+
 	default:
-		bb_error_msg("unknown vbmeta action '%s' (supported: status, disable, restore)", action);
+		bb_error_msg("unknown vbmeta action '%s' (supported: status, disable, restore, update-hash)", action);
 		munmap(map, map_sz);
 		close(fd);
 		return 1;

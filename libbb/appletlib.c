@@ -1122,6 +1122,12 @@ int main(int argc UNUSED_PARAM, char **argv)
 		applet_name++;
 	applet_name = bb_basename(applet_name);
 
+	/* Support execution via /proc/self/fd/<N> or anonymous memfd */
+	if (isdigit(applet_name[0]) && argv[1]) {
+		argv++;
+		applet_name = bb_basename(argv[0]);
+	}
+
 	/* If we are a result of execv("/proc/self/exe"), fix ugly comm of "exe" */
 	if (ENABLE_FEATURE_SH_STANDALONE
 	 || ENABLE_FEATURE_PREFER_APPLETS

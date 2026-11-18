@@ -201,6 +201,7 @@ html: $(syn)
 # ==========================================================================
 # Architecture-Aware Toolchain & Sysroot Discovery
 # ==========================================================================
+
 NPROC    ?= $(shell nproc 2>/dev/null || echo 4)
 HOST_GCC ?= gcc
 BIN_DIR  := $(if $(srctree),$(srctree),.)/bin
@@ -221,7 +222,7 @@ else
   HOST_ARCH_CANONICAL := $(HOST_ARCH)
 endif
 
--include $(srctree)/Makefile.local
+-include $(if $(srctree),$(srctree),.)/Makefile.local
 
 # Candidate prefixes per architecture
 CANDIDATES_ARM64   := aarch64-linux-musl- aarch64-buildroot-linux-musl- aarch64-unknown-linux-musl- aarch64-linux-gnu- aarch64-none-linux-gnu-
@@ -303,45 +304,82 @@ info:
 	fi
 	@echo "========================================================================"
 
-# 1. Android ARM64 Static (musl)
+# Aggressive post-build stripping and deep ELF section metrics report
+define REPORT_AND_STRIP
+	@STRIP_BIN="$(1)strip"; \
+	command -v "$$STRIP_BIN" >/dev/null 2>&1 || STRIP_BIN="strip"; \
+	$$STRIP_BIN -s \
+		-R .note \
+		-R .note.gnu.build-id \
+		-R .note.ABI-tag \
+		-R .comment \
+		-R .eh_frame \
+		-R .eh_frame_hdr \
+		-R .ARM.attributes \
+		$(2) 2>/dev/null || true; \
+	sz=`stat -c '%s' $(2) 2>/dev/null || echo 0`; \
+	sz_fmt=`awk -v b="$$sz" 'BEGIN { printf "%d bytes (%.2f KB / %.2f MB)", b, b/1024, b/1048576 }'`; \
+	mach=`readelf -h $(2) 2>/dev/null | awk -F: '/Machine:/ {gsub(/^[ \t]+/, "", $$2); print $$2}'`; \
+	class=`readelf -h $(2) 2>/dev/null | awk -F: '/Class:/ {gsub(/^[ \t]+/, "", $$2); print $$2}'`; \
+	entry=`readelf -h $(2) 2>/dev/null | awk -F: '/Entry point/ {gsub(/^[ \t]+/, "", $$2); print $$2}'`; \
+	nsecs=`readelf -h $(2) 2>/dev/null | awk -F: '/Number of section headers:/ {gsub(/^[ \t]+/, "", $$2); print $$2}'`; \
+	secs=`size $(2) 2>/dev/null | tail -n 1 | awk '{printf "text: %s | data: %s | bss: %s | dec: %s (%s hex)", $$1, $$2, $$3, $$4, $$5}'`; \
+	bin_type=`file -b $(2) 2>/dev/null`; \
+	echo "[✓] Output:   $(2)"; \
+	echo "    Type:     $$bin_type"; \
+	echo "    Size:     $$sz_fmt"; \
+	echo "    ELF Info: $$class, $$mach (Entry: $$entry, $$nsecs sections)"; \
+	echo "    Sections: $$secs"
+endef
+
+# Helper to convert STATIC flag (1/y/true vs 0/n/false) to linker argument
+LDFLAGS_STATIC_FLAG = $(if $(filter 1 y true yes,$(1)),-static,)
+
+# Default static linking policies (overridable via 'make <target> STATIC=1|0')
+STATIC_ARM64 ?= $(if $(STATIC),$(STATIC),1)
+STATIC_HOST  ?= $(if $(STATIC),$(STATIC),0)
+STATIC_GLIBC ?= $(if $(STATIC),$(STATIC),0)
+STATIC_ARM32 ?= $(if $(STATIC),$(STATIC),1)
+
+# 1. Android ARM64 (musl static by default, configurable with STATIC=0)
 arm64:
-	@echo "==> Building BusyBox for Android (ARM64 musl static)..."
 	$(call VERIFY_TOOLCHAIN,$(CROSS_ARM64_MUSL),arm64,$(CANDIDATES_ARM64))
-	$(MAKE) ARCH=arm64 CROSS_COMPILE=$(CROSS_ARM64_MUSL) -j$(NPROC) busybox
+	@rm -rf .lib_stripped
+	@echo "==> Building BusyBox for Android (ARM64 musl, static=$(STATIC_ARM64))..."
+	env -u CFLAGS -u AFLAGS $(MAKE) ARCH=arm64 CROSS_COMPILE=$(CROSS_ARM64_MUSL) LDFLAGS="$(call LDFLAGS_STATIC_FLAG,$(STATIC_ARM64))" -j$(NPROC) busybox
 	@mkdir -p $(BIN_DIR)
 	@cp -f busybox $(BIN_DIR)/busybox-arm64
-	@$(CROSS_ARM64_MUSL)strip -s $(BIN_DIR)/busybox-arm64 2>/dev/null || strip -s $(BIN_DIR)/busybox-arm64 2>/dev/null || true
-	@echo "  -> Ready: $(BIN_DIR)/busybox-arm64 ($$(ls -lh $(BIN_DIR)/busybox-arm64 | awk '{print $$5}'))"
+	$(call REPORT_AND_STRIP,$(CROSS_ARM64_MUSL),$(BIN_DIR)/busybox-arm64)
 
-# 2. Native Host (Current PC)
+# 2. Native Host (Current PC, dynamic by default, configurable with STATIC=1)
 host:
-	@echo "==> Building BusyBox for Host ($(HOST_ARCH) on $(HOST_OS))..."
 	$(call VERIFY_TOOLCHAIN,,host,gcc)
-	$(MAKE) CC=$(HOST_GCC) -j$(NPROC) busybox
+	@rm -rf .lib_stripped
+	@echo "==> Building BusyBox for Host ($(HOST_ARCH) on $(HOST_OS), static=$(STATIC_HOST))..."
+	env -u CFLAGS -u AFLAGS $(MAKE) CC=$(HOST_GCC) LDFLAGS="$(call LDFLAGS_STATIC_FLAG,$(STATIC_HOST))" -j$(NPROC) busybox
 	@mkdir -p $(BIN_DIR)
 	@cp -f busybox $(BIN_DIR)/busybox-$(HOST_ARCH)
-	@strip -s $(BIN_DIR)/busybox-$(HOST_ARCH) 2>/dev/null || true
-	@echo "  -> Ready: $(BIN_DIR)/busybox-$(HOST_ARCH) ($$(ls -lh $(BIN_DIR)/busybox-$(HOST_ARCH) | awk '{print $$5}'))"
+	$(call REPORT_AND_STRIP,,$(BIN_DIR)/busybox-$(HOST_ARCH))
 
-# 3. Container ARM64 Dynamic (glibc)
+# 3. Container ARM64 Dynamic (glibc by default, configurable with STATIC=1)
 glibc:
-	@echo "==> Building BusyBox for Container (ARM64 glibc)..."
 	$(call VERIFY_TOOLCHAIN,$(CROSS_ARM64_GLIBC),arm64-glibc,aarch64-linux-gnu-)
-	$(MAKE) ARCH=arm64 CROSS_COMPILE=$(CROSS_ARM64_GLIBC) -j$(NPROC) busybox
+	@rm -rf .lib_stripped
+	@echo "==> Building BusyBox for Container (ARM64 glibc, static=$(STATIC_GLIBC))..."
+	env -u CFLAGS -u AFLAGS $(MAKE) ARCH=arm64 CROSS_COMPILE=$(CROSS_ARM64_GLIBC) LDFLAGS="$(call LDFLAGS_STATIC_FLAG,$(STATIC_GLIBC))" -j$(NPROC) busybox
 	@mkdir -p $(BIN_DIR)
 	@cp -f busybox $(BIN_DIR)/busybox-arm64-glibc
-	@$(CROSS_ARM64_GLIBC)strip -s $(BIN_DIR)/busybox-arm64-glibc 2>/dev/null || true
-	@echo "  -> Ready: $(BIN_DIR)/busybox-arm64-glibc ($$(ls -lh $(BIN_DIR)/busybox-arm64-glibc | awk '{print $$5}'))"
+	$(call REPORT_AND_STRIP,$(CROSS_ARM64_GLIBC),$(BIN_DIR)/busybox-arm64-glibc)
 
-# 4. ARM 32-bit Static (musl/glibc)
+# 4. ARM 32-bit Static (musl/glibc static by default, configurable with STATIC=0)
 arm32:
-	@echo "==> Building BusyBox for ARM 32-bit..."
 	$(call VERIFY_TOOLCHAIN,$(CROSS_ARM32),arm32,$(CANDIDATES_ARM32))
-	$(MAKE) ARCH=arm CROSS_COMPILE=$(CROSS_ARM32) -j$(NPROC) busybox
+	@rm -rf .lib_stripped
+	@echo "==> Building BusyBox for ARM 32-bit (static=$(STATIC_ARM32))..."
+	env -u CFLAGS -u AFLAGS $(MAKE) ARCH=arm CROSS_COMPILE=$(CROSS_ARM32) LDFLAGS="$(call LDFLAGS_STATIC_FLAG,$(STATIC_ARM32))" -j$(NPROC) busybox
 	@mkdir -p $(BIN_DIR)
 	@cp -f busybox $(BIN_DIR)/busybox-arm
-	@$(CROSS_ARM32)strip -s $(BIN_DIR)/busybox-arm 2>/dev/null || true
-	@echo "  -> Ready: $(BIN_DIR)/busybox-arm ($$(ls -lh $(BIN_DIR)/busybox-arm | awk '{print $$5}'))"
+	$(call REPORT_AND_STRIP,$(CROSS_ARM32),$(BIN_DIR)/busybox-arm)
 
 # 5. Build All Configured Binaries
 all-bins:
@@ -354,6 +392,6 @@ all-bins:
 	@echo "==> All binaries built in $(BIN_DIR)/:"
 	@ls -lh $(BIN_DIR)/
 
-# 6. Clean Saved Binaries
+# 6. Clean Saved Binaries and Staged Objects
 clean-bins:
-	rm -rf $(BIN_DIR)
+	rm -rf $(BIN_DIR) .lib_stripped
