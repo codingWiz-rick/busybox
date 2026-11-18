@@ -63,6 +63,33 @@ busybox aimg -e payload.bin boot boot.img
 
 ---
 
+#### `simg2img` & `img2simg`
+Zero-dependency Android Sparse Image (`0xed26ff3a`) conversion and compression suite.
+
+* **`simg2img <sparse_1> [sparse_2 ...] <out_raw_image>`**:
+  * Unpacks Android sparse images into raw partition images (`ext4`, `erofs`, `f2fs`).
+  * **Multi-Chunk Fastboot/OTA Concatenation**: Automatically stitches split sparse chunks (e.g., `system.img.sparsechunk.0 .. N`) into a single raw file.
+  * **Sparse Hole Optimization**: Uses `lseek()` for `CHUNK_TYPE_DONT_CARE` chunks to create sparse filesystem holes, delivering >5 GB/s decompression speed with zero physical disk block waste.
+  * **Block Device Streaming**: Automatically detects block device targets (`/dev/block/by-name/...`) and non-seekable pipes, streaming zero-filled buffers safely.
+
+* **`img2simg [-c] [-v] [-b BLOCK_SIZE] <raw_image> <sparse_image>`**:
+  * Compresses raw partition images into Android sparse format for Fastboot / `fastbootd` flashing.
+  * **Memory-Bus Block Analysis**: Evaluates 4 KB blocks using 64-bit vector checks to identify unallocated holes (`DONT_CARE`) and repeating words (`FILL`) at >10 GB/s.
+  * **Chunk Coalescing**: Merges thousands of identical contiguous blocks into compact 12-byte headers.
+  * `-c`: Computes and appends CRC32 checksum chunk.
+  * `-v`: Prints verbose block breakdown and compression ratios.
+  * `-b <size>`: Custom block size (default: 4096).
+
+```bash
+# Decompress split fastboot sparse chunks into raw partition image
+busybox simg2img system.img.sparsechunk.* system_raw.img
+
+# Compress raw partition image into Android sparse image with metrics
+busybox img2simg -v -c vendor_patched.img vendor.simg
+```
+
+---
+
 ### 2. Binary Engineering, Inspection & In-Memory Execution
 
 #### `fexec` (alias: `memrun`)
@@ -353,7 +380,133 @@ busybox adb shell id
 
 ---
 
-### 6. Build Targets
+### 6. Hardware Bus, Silicon Probing & Linux GPIO (Character Device v2/v1 ABI)
+
+#### `i2c-tools` (`i2cdetect`, `i2cdump`, `i2cget`, `i2cset`, `i2ctransfer`)
+Zero-dependency I2C hardware bus inspection suite for direct Qualcomm SoC, PMIC, fuel gauge, and touchscreen debugging over `/dev/i2c-*`.
+
+* **`i2cdetect`**:
+  * `-l`: Enumerate all registered I2C adapters and bus numbers (e.g., Qualcomm `Geni-I2C`).
+  * `-y [-a] [-q|-r] <bus_num> [first last]`: Non-interactive address scan detecting connected slave devices (`0x03` - `0x77`). Reports active devices with probe addresses or `UU` if already bound by a kernel driver.
+  * `-F <bus_num>`: Displays adapter hardware functionality flags (SMBus Quick, Read/Write Byte, Block Data, I2C transfer).
+* **`i2cdump`**: Hexdumps device register banks (0x00 - 0xFF) in byte (`b`), word (`w`), or block (`i`) modes.
+* **`i2cget`**: Reads single registers or byte arrays directly from target slave addresses.
+* **`i2cset`**: Writes single or block values to target registers with optional mask and readback verification.
+* **`i2ctransfer`**: Executes atomic multi-message I2C read/write transaction sequences in a single ioctl.
+
+```bash
+# List available I2C busses on SoC
+busybox i2cdetect -l
+
+# Scan I2C bus 1 for connected PMIC, fuel gauge, and touchscreen chips
+busybox i2cdetect -y 1
+
+# Read single byte from PMIC register 0x10 at address 0x56
+busybox i2cget -y 1 0x56 0x10
+
+# Hexdump all registers of battery fuel gauge (e.g. SMB1360 / BQ25601 at 0x55)
+busybox i2cdump -y 1 0x55 b
+```
+
+---
+
+#### `gpio-tools` (`gpiodetect`, `gpioinfo`, `gpioget`, `gpioset`, `gpiomon`)
+High-performance character device GPIO controller and line manipulation suite utilizing the modern Linux `/dev/gpiochip*` ioctl ABI with automatic dual-ABI fallback (GPIO v2 ioctls on Linux 5.10+ / mainline, v1 on Linux 4.19 / Android).
+
+* **`gpiodetect`**:
+  * Discovers all GPIO chips in `/dev/gpiochip*`.
+  * Reports chip device names, controller labels (e.g., `400000.pinctrl`, `1c40000.qcom,spmi:qcom,pm6125@0`), and total line counts.
+* **`gpioinfo [gpiochip...] [line...]`**:
+  * Displays real-time kernel line state: direction (`input`/`output`), active-low, drive flags (`open-drain`, `open-source`), bias (`pull-up`, `pull-down`), and active kernel consumer labels (`consumer="volume_up"`).
+* **`gpioget [-l] <gpiochip> <line...>`**:
+  * Reads logical or physical values (`0` or `1`) across one or multiple pins simultaneously in a single atomic ioctl.
+  * `-l`: Active-low inversion.
+* **`gpiomon [-r] [-f] [-l] [-u [DRV[:DEV]]] <gpiochip> <line>`**:
+  * Real-time hardware edge transition monitor with nanosecond timestamp precision.
+  * Captures rising (`-r`), falling (`-f`), or both edge transitions with zero CPU polling via kernel event queues.
+  * **Dynamic Driver Unbind & Auto-Restore (`-u`)**: Seamlessly unbinds the in-kernel consumer driver (e.g., `gpio-keys`) from `/sys/bus/<bus>/drivers/<driver>/unbind` to release the pin, monitors hardware interrupts, and **automatically restores** the driver binding via signal handlers and `atexit` when monitoring exits. Supports auto-detecting consumer drivers or explicit `[DRIVER[:DEVICE]]` overrides.
+* **`gpioset [-l] [-m MS] [-t] <gpiochip> <line=val...>`**:
+  * Drives output pins directly from userland with optional active-low (`-l`), state hold duration (`-m`), or continuous toggle square-wave mode (`-t`).
+
+```bash
+# Discover all SoC and PMIC GPIO controllers
+busybox gpiodetect
+
+# Query line information for SPMI PMIC controller
+busybox gpioinfo gpiochip1
+
+# Read SoC GPIO pin values (e.g., lines 0 through 3)
+busybox gpioget gpiochip0 0 1 2 3
+
+# Monitor real-time Volume Up button edge interrupts with automatic kernel driver unbind & restore
+busybox gpiomon -u gpio-keys gpiochip1 4
+
+# Toggle test pin every 500ms
+busybox gpioset -t -m 500 gpiochip0 12=1
+```
+
+---
+
+### 7. Mobile Display Switcher & Hardware GPU/Framebuffer Suite (`displayswitch`, `fbswitch`, `fbtools`)
+
+Zero-dependency display environment switcher and direct hardware GPU/framebuffer tool designed for seamless transitions between Android (SurfaceFlinger) and native Linux mobile desktop environments (Xorg, Phoc, Phosh, Wayland).
+
+Inspired by systemd-nspawn container graphics handoff (`nspawn-android.c` / `nspawn-android-hw.h`), `displayswitch` provides deterministic process lifecycle coordination, display lock auditing, SMPTE test pattern rendering, backlight management, and VRAM memory dumping across both modern **DRM/KMS** (`/dev/dri/card0`) and legacy **FBDEV** (`/dev/graphics/fb0`, `/dev/fb0`) pipelines.
+
+* **`displayswitch status` / `info`**:
+  * Probes active display pipeline (DRM/KMS dumb buffers, connectors `DSI-1`/`eDP`, or FBDEV resolution, virtual panning, bpp, and VRAM size).
+  * Enumerate GPU acceleration device nodes (`/dev/kgsl-3d0` Adreno, `/dev/dri/renderD128`, `/dev/mali0`).
+  * Reports screen backlight level and sysfs hardware interface.
+  * Audits display device locks (`/proc/*/fd`) identifying the active owner (e.g. `composer-servic`, `surfaceflinger`, `Xorg`).
+  * Inspects `system_server`, `surfaceflinger`, and HAL execution states.
+* **`displayswitch linux` / `to-linux`**:
+  * Halts Android display pipeline (`surfaceflinger`, `vendor.qti.hardware.display.composer`, `vendor.hwcomposer*`, `display-color-hal`, `audioserver`).
+  * Awaits clean release of `/dev/dri/card0` / `/dev/graphics/fb0` descriptors.
+  * Suspends `system_server` via `SIGSTOP` immediately after display release, preventing the Android Watchdog from aborting and rebooting the device.
+  * Configures LCD backlight brightness and unblanks display controller.
+  * Clears VRAM to dark slate (`#181818`) and kicks the display controller to hand off a clean frame to Linux Xorg or Wayland compositors (Phoc/Weston).
+* **`displayswitch android` / `to-android`**:
+  * Terminates Linux desktop compositors (`phoc`, `phosh`, `Xorg`, `squeekboard`).
+  * Resumes `system_server` via `SIGCONT`.
+  * Restores Hardware Composer HALs and SurfaceFlinger display server.
+  * Dismisses lockscreen keyguard, wakes display, and transitions directly to Android Home launcher.
+* **`displayswitch test`**:
+  * Renders SMPTE 8-color test bars and grayscale ramp directly into hardware VRAM (via DRM dumb buffer or FBDEV mmap).
+* **`displayswitch clear [HEX]`**:
+  * Fills screen VRAM with a solid hex color (e.g., `000000` black, `FF0000` red, `00FF00` green).
+* **`displayswitch kick`**:
+  * Triggers immediate hardware display refresh, unblanking, and panning page-flip.
+* **`displayswitch backlight [PCT]`**:
+  * Reads current backlight brightness percentage or sets target brightness (`0-100%` or raw value).
+* **`displayswitch dump [FILE.ppm]`**:
+  * Captures live screen VRAM directly to an uncompressed standard PPM (Portable Pixmap) image file.
+
+```bash
+# Audit display pipeline, GPU nodes, and process locks
+busybox displayswitch status
+
+# Render SMPTE 8-color test pattern directly to physical screen
+busybox displayswitch test
+
+# Set screen backlight to 60%
+busybox displayswitch backlight 60%
+
+# Clear display to solid navy blue
+busybox displayswitch clear 001133
+
+# Transition mobile display environment to Linux desktop
+busybox displayswitch linux
+
+# Restore physical screen back to Android UI
+busybox displayswitch android
+
+# Dump current framebuffer to image
+busybox displayswitch dump /data/local/tmp/screenshot.ppm
+```
+
+---
+
+### 8. Build Targets
 
 The custom build system (`Makefile.custom`) automatically resolves cross-compilation toolchains and sysroots:
 
