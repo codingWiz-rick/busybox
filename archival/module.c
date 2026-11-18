@@ -2638,6 +2638,22 @@ static char *resolve_init_wrapper_binary(const char *custom)
 	return NULL;
 }
 
+static void cpio_rm_file(cpio_node_t **head_ptr, const char *name)
+{
+	cpio_node_t **curr = head_ptr;
+	while (*curr) {
+		cpio_node_t *entry = *curr;
+		if (strcmp(entry->name, name) == 0) {
+			*curr = entry->next;
+			free(entry->name);
+			free(entry->data);
+			free(entry);
+			return;
+		}
+		curr = &(*curr)->next;
+	}
+}
+
 static int ramdisk_inject_kernel_module(const char *cpio_path, const char *mod_path, const char *mod_filename)
 {
 	cpio_node_t *head;
@@ -2647,6 +2663,11 @@ static int ramdisk_inject_kernel_module(const char *cpio_path, const char *mod_p
 	bool has_system_modules = false;
 	char mod_target[PATH_MAX];
 	char dep_line[PATH_MAX];
+	char stem[64];
+	char stale_path[256];
+	static const char * const exts[] = { ".ko", ".ko.xz", ".ko.gz" };
+	int e;
+	char *dot;
 
 	head = cpio_read_all(cpio_path);
 	if (!head) {
@@ -2668,6 +2689,20 @@ static int ramdisk_inject_kernel_module(const char *cpio_path, const char *mod_p
 			has_system_modules = true;
 			break;
 		}
+	}
+
+	/* Purge any stale module variants from prior installations */
+	safe_strncpy(stem, mod_filename, sizeof(stem));
+	dot = strstr(stem, ".ko");
+	if (dot) *dot = '\0';
+
+	for (e = 0; e < 3; e++) {
+		snprintf(stale_path, sizeof(stale_path), "%s%s", stem, exts[e]);
+		cpio_rm_file(&head, stale_path);
+		snprintf(stale_path, sizeof(stale_path), "lib/modules/%s%s", stem, exts[e]);
+		cpio_rm_file(&head, stale_path);
+		snprintf(stale_path, sizeof(stale_path), "system/lib/modules/%s%s", stem, exts[e]);
+		cpio_rm_file(&head, stale_path);
 	}
 
 	/* Format dependency entry (<filename>:\n) */
@@ -2832,6 +2867,12 @@ static int magiskboot_add_module_op(int argc, char **argv)
 	char abs_module_ko[PATH_MAX];
 	char staged_module[PATH_MAX];
 	char repacked_img[PATH_MAX];
+	char inject_path[PATH_MAX];
+	char inject_filename[128];
+	char comp_target[PATH_MAX];
+	bool compressed_ok = false;
+	size_t uncomp_sz = 0;
+	void *uncomp_data = NULL;
 	int i;
 	int ret = 0;
 
@@ -2926,12 +2967,66 @@ static int magiskboot_add_module_op(int argc, char **argv)
 
 	snprintf(staged_module, sizeof(staged_module), "%s/%s", tmp_work_dir, mod_filename);
 	copy_file(abs_module_ko, staged_module, FILEUTILS_FORCE);
+
+	/* If module is compressed, decompress first so vermagic/relocations can be patched */
+	if (is_suffixed_with(staged_module, ".xz") || is_suffixed_with(staged_module, ".gz")) {
+		uncomp_data = xmalloc_open_zipped_read_close(staged_module, &uncomp_sz);
+		if (uncomp_data && uncomp_sz > 0) {
+			char *dot_ext;
+			int out_fd;
+			unlink(staged_module);
+			dot_ext = strrchr(staged_module, '.');
+			if (dot_ext)
+				*dot_ext = '\0';
+			out_fd = open3_or_warn(staged_module, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (out_fd >= 0) {
+				full_write(out_fd, uncomp_data, uncomp_sz);
+				close(out_fd);
+			}
+			free(uncomp_data);
+			uncomp_data = NULL;
+			mod_filename = bb_basename(staged_module);
+		} else {
+			bb_error_msg("failed to decompress staged module '%s' for vermagic patching", staged_module);
+			ret = 1;
+			goto cleanup;
+		}
+	}
+
 	module_patch_file(staged_module, staged_module, NULL, boot_img);
 
-	/* 3. Inject module and autoload lists into ramdisk.cpio */
+	/* 3. In-memory GZIP compression: compress patched module into .ko.gz before ramdisk injection */
+	if (!is_suffixed_with(mod_filename, ".gz") && !is_suffixed_with(mod_filename, ".xz")) {
+		if (snprintf(comp_target, sizeof(comp_target), "%s.gz", staged_module) >= (int)sizeof(comp_target)) {
+			bb_error_msg("module path too long");
+			ret = 1;
+			goto cleanup;
+		}
+		if (snprintf(inject_filename, sizeof(inject_filename), "%s.gz", mod_filename) >= (int)sizeof(inject_filename)) {
+			bb_error_msg("module filename too long");
+			ret = 1;
+			goto cleanup;
+		}
+
+		printf("[*] Compressing patched module with GZIP (gzip -9) -> %s...\n", inject_filename);
+		if (compress_file_format(staged_module, comp_target, BOOT_FMT_GZIP) == 0 && access(comp_target, R_OK) == 0) {
+			safe_strncpy(inject_path, comp_target, sizeof(inject_path));
+			compressed_ok = true;
+			printf("[+] Module footprint reduced via GZIP compression\n");
+		} else {
+			printf("[!] Warning: GZIP compression failed; falling back to uncompressed module\n");
+		}
+	}
+
+	if (!compressed_ok) {
+		safe_strncpy(inject_path, staged_module, sizeof(inject_path));
+		safe_strncpy(inject_filename, mod_filename, sizeof(inject_filename));
+	}
+
+	/* 4. Inject module and autoload lists into ramdisk.cpio */
 	if (access("ramdisk.cpio", F_OK) == 0) {
-		printf("[*] Injecting module '%s' into ramdisk.cpio...\n", mod_filename);
-		if (ramdisk_inject_kernel_module("ramdisk.cpio", staged_module, mod_filename) != 0) {
+		printf("[*] Injecting module '%s' into ramdisk.cpio...\n", inject_filename);
+		if (ramdisk_inject_kernel_module("ramdisk.cpio", inject_path, inject_filename) != 0) {
 			bb_error_msg("failed to inject module into ramdisk.cpio");
 			ret = 1;
 			goto cleanup;
