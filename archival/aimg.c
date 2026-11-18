@@ -2289,22 +2289,28 @@ static int compress_file_format(const char *src, const char *dst, uint8_t fmt) {
 
 	pid = fork();
 	if (pid == 0) {
-		int applet;
 		char *args[4];
-		dup2(out_tfd, STDOUT_FILENO);
-		close(out_tfd);
+		if (out_tfd != STDOUT_FILENO) {
+			dup2(out_tfd, STDOUT_FILENO);
+			close(out_tfd);
+		}
 		args[0] = (char *)prog;
 		args[1] = (char *)arg;
 		args[2] = (char *)src;
 		args[3] = NULL;
-		applet = find_applet_by_name(prog);
-		if (applet >= 0) {
-			run_applet_no_and_exit(applet, prog, args);
+#ifndef BUILD_INDIVIDUAL
+		{
+			int applet = find_applet_by_name(prog);
+			if (applet >= 0) {
+				run_applet_no_and_exit(applet, prog, args);
+			}
 		}
+#endif
 		BB_EXECVP(prog, args);
 		_exit(127);
 	}
-	close(out_tfd);
+	if (out_tfd != STDOUT_FILENO)
+		close(out_tfd);
 	if (pid > 0) {
 		int status;
 		waitpid(pid, &status, 0);
