@@ -2,51 +2,67 @@
 
 A specialized BusyBox distribution providing native, zero-dependency tooling for Android low-level systems engineering, boot partition patching, runtime property manipulation, binary analysis, and early-boot kernel module loading.
 
-All applets compile into a single static musl binary for AArch64 (as well as x86_64 host and AArch64 glibc container builds), replacing external standalone dependencies (`magiskboot`, `resetprop`, `patchelf`, `readelf`, `adb`, and ad-hoc shell scripts).
+All applets compile into a standalone static musl binary for AArch64 target devices (`bin/busybox-arm64`), with optional build targets for x86_64 host workstations (`bin/busybox-x86_64`) and dynamic AArch64 GNU glibc containers (`bin/busybox-arm64-glibc`), replacing external standalone dependencies (`magiskboot`, `resetprop`, `patchelf`, `readelf`, `adb`, and ad-hoc shell scripts).
 
 ---
 
 ## Applet Index
 
+| Category | Applets | Description |
+| :--- | :--- | :--- |
+| **1. Boot & Ramdisk** | `init_wrapper`, `aimg`, `simg2img`, `img2simg` | PID 1 init wrapper, boot image patcher, and sparse conversion suite |
+| **2. ELF & Binary Tooling** | `fexec`, `readelf`, `patchelf`, `ksyms`, `nm`, `objdump`, `strip`, `file` | In-memory binary execution, ELF dynamic patching, and symbol analysis |
+| **3. Platform & SELinux** | `resetprop`, `getprop`, `setprop`, `sepolicy`, `getenforce`, `setenforce`, `selinuxenabled`, `sendevent`, `log`, `klog` | Shared-memory property engine, SELinux injector, input injection, and kernel ring buffer monitor |
+| **4. Android Binder IPC** | `servicelist`, `binder_ping`, `binder_dump`, `binder_call` | Pure C `/dev/binder` service discovery, latency benchmarking, and typed RPC transactions |
+| **5. Networking & Debugging** | `adb` | Standalone Android Debug Bridge client with wireless debugging discovery |
+| **6. Hardware Bus & GPIO** | `i2c-tools` (`i2cdetect`, `i2cdump`, `i2cget`, `i2cset`, `i2ctransfer`), `gpio-tools` (`gpiodetect`, `gpioinfo`, `gpioget`, `gpioset`, `gpiomon`) | Linux I2C bus tools and character device GPIO controller suite |
+| **7. Display Switcher** | `displayswitch` (`fbswitch`, `fbtools`) | DRM/KMS and FBDEV graphics compositor lifecycle and display buffer manager |
+| **8. Mobile SoC Silicon Engine** | `socprobe` (`socreg`, `regprobe`, `pllprobe`) | In-memory Qualcomm SDM439/MSM8937 silicon database and live EL0 assembly register audit |
+
+---
+
 ### 1. Boot, Ramdisk & Kernel Module Engines
 
 #### `init_wrapper` (aliases: `init`, `early_init`, `init_wrap`)
-Dual-stage Android bootloader wrapper designed to execute as PID 1 (`/init`) in Android ramdisks and intercept second-stage init before SELinux enforcement.
+Dual-stage Android init wrapper executing as PID 1 (`/init`) in Android ramdisks to coordinate early module loading and intercept second-stage init prior to SELinux policy enforcement.
 
 * **First-Stage PID 1 (`/init`)**:
-  * Mounts early pseudo-filesystems (`/dev`, `/proc`, `/sys`).
+  * Creates `/dev` and mounts early pseudo-filesystems (`/proc`, `/sys`).
   * **Emergency Safe Mode**: Probes `/dev/input/event*` for `KEY_VOLUMEDOWN` (114). If held, aborts custom module loading to prevent bootloops.
-  * **In-Memory Module Loader**: Discovers modules listed in `modules.load` or the rootfs. Supports raw `.ko` and compressed `.ko.gz` / `.ko.xz` archives. Archives are decompressed into anonymous memory and loaded via `sys_finit_module` (or `sys_init_module`) entirely in RAM—zero temporary files written to storage.
-  * **Second-Stage Interception**: Patches `/system/bin/init` inside `/init.real` to redirect second-stage execution to `/data/init_wrap`.
-  * **Pristine Handoff**: Detaches early mounts via `umount2(..., MNT_DETACH)` and chainloads `/init.real`.
+  * **In-Memory Module Loader**: Discovers modules listed in `modules.load` or the rootfs. Decompresses raw `.ko` and compressed `.ko.gz` / `.ko.xz` archives into anonymous memory and loads them via `sys_finit_module` (or `sys_init_module`) entirely in RAM without temporary files.
+  * **Second-Stage Interception**: In-memory string redirection on the renamed ramdisk init binary (`/init.real`, created during ramdisk repack) to redirect second-stage execution to the wrapper handoff path.
+  * **Clean Handoff**: Detaches early mounts via `umount2(..., MNT_DETACH)` and chainloads `/init.real`.
 
 * **Second-Stage Interception (`selinux_setup`)**:
   * Executes before Android init compiles and enforces SELinux policy.
-  * **System Payload Staging**: Stages manager payloads (`kroot.apk` as `0644 system:system u:object_r:apk_data_file:s0` and `busybox` as `0755 root:root u:object_r:system_file:s0`) into `/data/system/kroot/`.
-  * **PMS Cache Purge**: Clears `/data/system/package_cache/*` and conflicting external userland installs/dalvik caches to force clean PackageManagerService indexing on boot.
-  * **Zero Userland Mount Hacks**: Replaces fragile `/sbin` or `/system/xbin` tmpfs mounts with Ring-0 transparent VFS remap rules registered to `/proc/kroot/vfs_remap`.
+  * **System Payload Staging**: Stages manager payloads (`kroot.apk` as `0644 system:system u:object_r:apk_data_file:s0` and `busybox` as `0755 root:root u:object_r:system_file:s0`) into `/data/system/kroot/` before userland handoff.
+  * **PMS Cache Purge**: Clears `/data/system/package_cache/*` and conflicting external userland installs/dalvik caches to ensure clean PackageManagerService indexing.
+  * **In-Kernel VFS Redirection**: Replaces `/sbin` and `/system/xbin` tmpfs overlay mounts with in-kernel transparent VFS remap rules registered to `/proc/kroot/vfs_remap` at AArch64 EL1 (provided by the sovereign `kcompat`/`kroot` kernel module).
   * Detaches temporary staging mounts and chainloads `/system/bin/init selinux_setup`.
 
-* **CLI Staging Mode (`--stage`)**:
-  ```bash
-  # Stage manager APK and BusyBox into /data/system/kroot from recovery installer scripts
-  busybox init_wrapper --stage /path/to/kroot.apk /path/to/busybox
-  ```
+* **CLI Staging Mode (`--stage`)**: Stages manager APK and BusyBox into target directories from recovery installer scripts.
+
+```bash
+# Stage manager APK and BusyBox into /data/system/kroot from recovery installer scripts
+busybox init_wrapper --stage /path/to/kroot.apk /path/to/busybox
+```
 
 ---
 
 #### `aimg`
 Universal Android boot, recovery, and vendor image inspection, unpack, repack, and patching suite across Header v0 through v4.
 
-* **Header Support**: Full parsing and rebuilding for Header v0/v1/v2 (legacy split images), Header v3 (Android 11/12+ SAR), and Header v4 (Android 13+ with bootconfig).
+* **Header Support**: Full parsing and rebuilding for Header v0/v1/v2 (legacy split images), Header v3 (Android 11/12+ System-as-Root [SAR]), and Header v4 (Android 13+ with bootconfig).
 * **In-Memory Buffer Mutation**: Modifies kernel command lines, ramdisk properties, and bootconfig sections directly in memory without unpack/repack cycles.
 * **Build Flag & Debug Manipulation**:
   * `aimg --build-status <boot.img|--live>`: Audits whether the image/system is `user`, `userdebug`, or `eng`.
   * `aimg --set-build-type <boot.img|--live> <user|userdebug|eng>`: Flips build type across cmdline, ramdisk properties, and bootconfig in one pass.
-  * `aimg --set-debuggable <1|0>`: Sets `ro.debuggable` and `ro.force.debuggable`.
-  * `aimg --set-insecure-adb <1|0>`: Disables USB adb authorization and authentication checks.
-* **Direct Block Flashing**: Flashes patched images directly to raw block partitions (e.g., `/dev/block/by-name/boot_b`) with verified sector alignment and write speed metrics.
-* **Extended Patching**: Native AnyKernel3 flashing (`--ak3-flash`), FDT/DTB patcher, AVB hash tree updater, dynamic ELF64 kernel ABI resolution (`--kabi-check`), and OTA `payload.bin` extraction.
+  * `aimg --set-debuggable <boot.img|--live> <1|0>`: Sets `ro.debuggable` and `ro.force.debuggable`.
+  * `aimg --set-insecure-adb <boot.img|--live> <1|0>`: Disables USB adb authorization and authentication checks.
+* **Direct Block Flashing & Payload Extraction**:
+  * `aimg --flash-kernel <boot.img> <partition>`: Flashes patched images directly to raw block partitions with verified sector alignment. *(Note: Mutating live boot partitions on AVB 2.0-enforcing devices requires an unlocked bootloader and verification disabled in vbmeta).*
+  * `aimg -e <payload.bin> <partition> <out.img>`: Extracts partition images directly from OTA `payload.bin` archives.
+* **Extended Patching**: Spliced AnyKernel3-compatible kernel flashing (`--flash-kernel`), ZIP distribution generation (`--dist`), FDT/DTB patching, AVB hash tree updating, and dynamic ELF64 kernel module symbol auditing (`--mod-audit`).
 
 ```bash
 # Check image or live partition build status
@@ -69,13 +85,13 @@ Zero-dependency Android Sparse Image (`0xed26ff3a`) conversion and compression s
 * **`simg2img <sparse_1> [sparse_2 ...] <out_raw_image>`**:
   * Unpacks Android sparse images into raw partition images (`ext4`, `erofs`, `f2fs`).
   * **Multi-Chunk Fastboot/OTA Concatenation**: Automatically stitches split sparse chunks (e.g., `system.img.sparsechunk.0 .. N`) into a single raw file.
-  * **Sparse Hole Optimization**: Uses `lseek()` for `CHUNK_TYPE_DONT_CARE` chunks to create sparse filesystem holes, delivering >5 GB/s decompression speed with zero physical disk block waste.
+  * **Sparse Hole Optimization**: Uses `lseek()` for `CHUNK_TYPE_DONT_CARE` chunks on seekable files to create sparse filesystem extents, avoiding physical disk block allocation.
   * **Block Device Streaming**: Automatically detects block device targets (`/dev/block/by-name/...`) and non-seekable pipes, streaming zero-filled buffers safely.
 
 * **`img2simg [-c] [-v] [-b BLOCK_SIZE] <raw_image> <sparse_image>`**:
   * Compresses raw partition images into Android sparse format for Fastboot / `fastbootd` flashing.
-  * **Memory-Bus Block Analysis**: Evaluates 4 KB blocks using 64-bit vector checks to identify unallocated holes (`DONT_CARE`) and repeating words (`FILL`) at >10 GB/s.
-  * **Chunk Coalescing**: Merges thousands of identical contiguous blocks into compact 12-byte headers.
+  * **Memory-Bus Block Analysis**: Evaluates 4 KB blocks using 64-bit vector checks to identify unallocated holes (`DONT_CARE`) and repeating words (`FILL`).
+  * **Chunk Coalescing**: Merges contiguous identical blocks into compact 12-byte headers.
   * `-c`: Computes and appends CRC32 checksum chunk.
   * `-v`: Prints verbose block breakdown and compression ratios.
   * `-b <size>`: Custom block size (default: 4096).
@@ -168,6 +184,20 @@ Standard binary utilities compiled natively:
 * **`strip`**: Removes symbols, debug sections, and notes (`.comment`, `.note*`, `.eh_frame`).
 * **`file`**: Identifies file types and ELF architectures.
 
+```bash
+# List dynamic symbols from shared library
+busybox nm -D libnative.so
+
+# Disassemble machine code in .text section
+busybox objdump -d /system/bin/app_process64
+
+# Strip unneeded debug symbols and notes
+busybox strip --strip-unneeded libnative.so
+
+# Identify ELF architecture and link properties
+busybox file /system/bin/init
+```
+
 ---
 
 ### 3. Android Platform, SELinux & Diagnostics
@@ -192,7 +222,15 @@ busybox resetprop --adbd-root
 ---
 
 #### `getprop` & `setprop`
-Lightweight native implementations for querying and setting Android system properties via Bionic property service sockets.
+Native implementations for querying and modifying Android system properties: `getprop` memory-maps and traverses `/dev/__properties__/` trie structures directly for lockless reads, while `setprop` dispatches property change requests via `/dev/socket/property_service`.
+
+```bash
+# Query system property via direct trie memory-map
+busybox getprop ro.build.type
+
+# Set system property via Bionic property service
+busybox setprop debug.stagefright.omx 1
+```
 
 ---
 
@@ -213,14 +251,17 @@ busybox sepolicy -l permissive my_daemon
 
 ---
 
-#### `getenforce` & `setenforce`
-SELinux enforcement mode query and modification utilities linked directly against `libselinux`.
+#### `getenforce`, `setenforce` & `selinuxenabled`
+SELinux enforcement mode query and modification utilities operating directly against `/sys/fs/selinux/enforce` with zero external library dependencies.
 
 * **`getenforce`**: Queries running kernel SELinux enforcement status (`Enforcing`, `Permissive`, or `Disabled`).
 * **`setenforce <1|0|Enforcing|Permissive>`**: Toggles running kernel SELinux mode.
 * **`selinuxenabled`**: Returns exit status `0` if SELinux is active in the running kernel, `1` otherwise.
 
 ```bash
+# Check if SELinux is active
+busybox selinuxenabled && echo "SELinux is active"
+
 # Query current SELinux mode
 busybox getenforce
 
@@ -260,17 +301,17 @@ busybox log -b main -p i -t "early_boot" "Payload staging complete"
 High-resolution kernel ring-buffer watcher and live stream monitor with microsecond delta-timing, subsystem tag filtering, and ANSI priority coloring.
 
 * Displays delta elapsed time `[ 11.729733 (+ 0.000203s)]` between consecutive kernel messages for latency profiling.
-* `-f`, `--follow`: Continuous streaming follow mode via `/proc/kmsg`.
+* `-f`, `--follow`: Continuous streaming follow mode via `/dev/kmsg`.
 * `-s <subsystems>`: Filter messages matching comma-separated subsystem tags (e.g. `-s sucompat,kroot,binder,init`).
-* `-n <lines>`: Display only the trailing N lines of the ring buffer.
-* `-c` / `-C`: Force ANSI priority coloring on / off (red for err/crit/emerg, yellow for warning, cyan for info/notice, dim for debug).
+* `-c`, `--clear`: Clear the kernel ring buffer (`klogctl(SYSLOG_ACTION_CLEAR)`).
+* `--color` / `--no-color`: Force ANSI priority coloring on / off (red for err/crit/emerg, yellow for warning, cyan for info/notice, dim for debug).
 
 ```bash
 # Follow live kernel log filtering for sucompat and binder events
 busybox klog -f -s sucompat,binder
 
-# Inspect last 100 kernel messages with microsecond delta-timing
-busybox klog -n 100 -c
+# Dump kernel messages with microsecond delta-timing and ANSI color
+busybox klog --color
 ```
 
 ---
@@ -285,7 +326,6 @@ Enumerates registered Binder services and resolves their live status, handle ass
 * `-d <dev>`: Target binder device node (default: `/dev/binder`, supports `/dev/hwbinder`, `/dev/vndbinder`).
 * `-i`: Resolve AIDL interface descriptor (e.g., `android.app.IActivityManager`) via `_NTF` (`0x5f4e5446`).
 * `-p`: Measure round-trip ping latency in microseconds via `_PNG` (`0x5f504e47`).
-* `-a`: Filter alive services only.
 
 ```bash
 # List all registered Binder services with interface descriptors and ping latency
@@ -337,16 +377,19 @@ busybox binder_dump activity services
 ---
 
 #### `binder_call`
-Low-level interactive AIDL transaction caller. Formats typed parcel arguments, dispatches transactions to arbitrary handles, and decodes transaction reply parcels.
+Command-line AIDL transaction dispatcher. Formats typed parcel arguments, dispatches transactions to specified services, and decodes transaction reply parcels.
 
-* `-d <dev>`: Target binder device node.
+* **Syntax**: `binder_call [-d <dev>] <service|0> <opcode> [type val ...]`
+  * `<service|0>`: Registered service name (e.g., `batterystats`, `SurfaceFlinger`), or `0` / `servicemanager` for context manager. Note: `binder_call` automatically queries and writes the AIDL interface descriptor token via `_NTF`.
+  * `<opcode>`: AIDL transaction code (`1` for standard first method, etc.).
+* `-d <dev>`: Target binder device node (default: `/dev/binder`).
 * Argument types:
   * `i32 <val>`: 32-bit signed integer.
   * `i64 <val>`: 64-bit signed integer.
-  * `s16 <str>`: UTF-16 String16 (AOSP standard interface token / string).
+  * `s16 <str>`: UTF-16 String16.
   * `utf8 <str>`: UTF-8 string.
   * `null`: Null object pointer.
-  * `fd <num>`: File descriptor object (`BINDER_TYPE_FD`).
+  * `fd <path>`: Passes opened file descriptor object (`BINDER_TYPE_FD`) from file path.
 * Automatically decodes AIDL exception status codes (`EX_NONE`, `EX_SECURITY`, `EX_BAD_PARCELABLE`, `EX_ILLEGAL_ARGUMENT`, `EX_NULL_POINTER`, `EX_ILLEGAL_STATE`, `EX_NETWORK_MAIN_THREAD`, `EX_UNSUPPORTED_OPERATION`, `EX_SERVICE_SPECIFIC`).
 * Prints formatted hex and ASCII parcel reply dumps with word-aligned offsets.
 
@@ -354,8 +397,8 @@ Low-level interactive AIDL transaction caller. Formats typed parcel arguments, d
 # Query servicemanager (handle 0) listServices (opcode 6, dump_priority 15)
 busybox binder_call 0 6 i32 15
 
-# Call custom service method with interface token and arguments
-busybox binder_call 1 1 s16 "android.os.IBatteryStats" i32 0
+# Call service method on battery stats with arguments
+busybox binder_call batterystats 1 i32 0
 ```
 
 ---
@@ -421,10 +464,10 @@ High-performance character device GPIO controller and line manipulation suite ut
 * **`gpioget [-l] <gpiochip> <line...>`**:
   * Reads logical or physical values (`0` or `1`) across one or multiple pins simultaneously in a single atomic ioctl.
   * `-l`: Active-low inversion.
-* **`gpiomon [-r] [-f] [-l] [-u [DRV[:DEV]]] <gpiochip> <line>`**:
+* **`gpiomon [-r] [-f] [-l] [-U] [-u DRV[:DEV]] <gpiochip> <line>`**:
   * Real-time hardware edge transition monitor with nanosecond timestamp precision.
   * Captures rising (`-r`), falling (`-f`), or both edge transitions with zero CPU polling via kernel event queues.
-  * **Dynamic Driver Unbind & Auto-Restore (`-u`)**: Seamlessly unbinds the in-kernel consumer driver (e.g., `gpio-keys`) from `/sys/bus/<bus>/drivers/<driver>/unbind` to release the pin, monitors hardware interrupts, and **automatically restores** the driver binding via signal handlers and `atexit` when monitoring exits. Supports auto-detecting consumer drivers or explicit `[DRIVER[:DEVICE]]` overrides.
+  * **Dynamic Driver Unbind & Auto-Restore (`-U` / `-u`)**: Unbinds the in-kernel consumer driver (e.g., `gpio-keys`) from `/sys/bus/<bus>/drivers/<driver>/unbind` to release the pin, monitors hardware interrupts, and restores the driver binding via signal handlers and `atexit` when monitoring exits. Supports auto-detecting consumer drivers (`-U`) or explicit `[DRIVER[:DEVICE]]` overrides (`-u DRV`).
 * **`gpioset [-l] [-m MS] [-t] <gpiochip> <line=val...>`**:
   * Drives output pins directly from userland with optional active-low (`-l`), state hold duration (`-m`), or continuous toggle square-wave mode (`-t`).
 
@@ -447,11 +490,13 @@ busybox gpioset -t -m 500 gpiochip0 12=1
 
 ---
 
-### 7. Mobile Display Switcher & Hardware GPU/Framebuffer Suite (`displayswitch`, `fbswitch`, `fbtools`)
+### 7. Mobile Display Switcher & Hardware GPU/Framebuffer Suite
 
-Zero-dependency display environment switcher and direct hardware GPU/framebuffer tool designed for seamless transitions between Android (SurfaceFlinger) and native Linux mobile desktop environments (Xorg, Phoc, Phosh, Wayland).
+#### `displayswitch` (aliases: `fbswitch`, `fbtools`)
 
-Inspired by systemd-nspawn container graphics handoff (`nspawn-android.c` / `nspawn-android-hw.h`), `displayswitch` provides deterministic process lifecycle coordination, display lock auditing, SMPTE test pattern rendering, backlight management, and VRAM memory dumping across both modern **DRM/KMS** (`/dev/dri/card0`) and legacy **FBDEV** (`/dev/graphics/fb0`, `/dev/fb0`) pipelines.
+Display environment switcher and hardware GPU/framebuffer coordination tool designed for switching display output between Android (SurfaceFlinger) and native Linux mobile desktop environments (Xorg, Phoc, Phosh, Wayland).
+
+`displayswitch` provides deterministic process lifecycle coordination, display descriptor leasing, SMPTE test pattern generation, backlight management, and VRAM capture across both **DRM/KMS** (`/dev/dri/card0`) and legacy **FBDEV** (`/dev/graphics/fb0`) pipelines.
 
 * **`displayswitch status` / `info`**:
   * Probes active display pipeline (DRM/KMS dumb buffers, connectors `DSI-1`/`eDP`, or FBDEV resolution, virtual panning, bpp, and VRAM size).
@@ -462,9 +507,9 @@ Inspired by systemd-nspawn container graphics handoff (`nspawn-android.c` / `nsp
 * **`displayswitch linux` / `to-linux`**:
   * Halts Android display pipeline (`surfaceflinger`, `vendor.qti.hardware.display.composer`, `vendor.hwcomposer*`, `display-color-hal`, `audioserver`).
   * Awaits clean release of `/dev/dri/card0` / `/dev/graphics/fb0` descriptors.
-  * Suspends `system_server` via `SIGSTOP` immediately after display release, preventing the Android Watchdog from aborting and rebooting the device.
+  * Quiesces Android graphics compositors and manages display ownership to prevent watchdog starvation during container transitions.
   * Configures LCD backlight brightness and unblanks display controller.
-  * Clears VRAM to dark slate (`#181818`) and kicks the display controller to hand off a clean frame to Linux Xorg or Wayland compositors (Phoc/Weston).
+  * Clears VRAM to dark slate (`#181818`) and triggers a hardware display refresh and page-flip to hand off a clean frame to Linux compositors (Phoc/Weston/Xorg).
 * **`displayswitch android` / `to-android`**:
   * Terminates Linux desktop compositors (`phoc`, `phosh`, `Xorg`, `squeekboard`).
   * Resumes `system_server` via `SIGCONT`.
@@ -506,18 +551,26 @@ busybox displayswitch dump /data/local/tmp/screenshot.ppm
 
 ---
 
-### 8. Pure In-Memory Mobile SoC Silicon Hardware & Machine Engine (`socprobe`, `socreg`, `regprobe`, `pllprobe`)
+### 8. Mobile SoC Silicon Engine
 
-Zero-dependency silicon hardware diagnostic and machine-code analysis suite designed specifically for restricted environments where `debugfs` is omitted/blocked, `/dev/mem` is denied, and filesystem endpoints (`/proc`, `/sys`) are inaccessible or locked down. Operates with **zero filesystem access** (0 `open()`, 0 `fopen()`, 0 `opendir()`, 0 disk I/O) using pure AArch64 inline assembly, cycle-timing loops, in-memory silicon tables, and instruction disassembly.
+#### `socprobe` (aliases: `socreg`, `regprobe`, `pllprobe`)
 
-* **`socprobe status` / `info`**:
-  * Silicon telemetry overview: CPU implementer/part, exception level (`CurrentEL`), hardware crystal frequency (`CNTFRQ_EL0`), live measured core clock, and in-memory MMIO/PMIC register definitions.
-* **`socprobe cpu`**:
-  * Pure inline assembly register audit with `SIGILL` trap recovery: `MIDR_EL1` (Implementer, Part, Variant, Revision), `MPIDR_EL1` (Cluster/Core affinity), `REVIDR_EL1`, `CTR_EL0` (D-Cache/I-Cache line sizes), `DCZID_EL0`, `ID_AA64ISAR0/1_EL1` (Hardware AES/SHA1/SHA2/CRC32/Atomics), `ID_AA64PFR0_EL1` (AdvSIMD/FP/GIC/CSV2), `ID_AA64MMFR0_EL1` (Physical address width), `CNTFRQ_EL0`, `CNTVCT_EL0`, `CurrentEL`, and `DAIF`.
-* **`socprobe pll` / `clocks`**:
-  * Hardware crystal oscillator base frequency (`19.200 MHz TCXO`).
-  * Real-time CPU core clock frequency measured dynamically via unrolled instruction loop against `CNTVCT_EL0` / `CNTFRQ_EL0` cycle deltas.
-  * In-memory Qualcomm GCC PLL network: GPLL0 (600MHz System/NoC), GPLL1 (576MHz Audio/Crypto), GPLL3 (1100MHz Display/CAM), GPLL4 (1600MHz UFS/PCIe), GPLL6 (384MHz Sleep), GPLL7 (533MHz DDR/BIMC), GPLL8 (825MHz GPU).
+AArch64 CPU diagnostic and Qualcomm SoC hardware reference suite. Combines live EL0 inline assembly instruction probes and cycle-timing loops with a compiled-in silicon architecture catalog (targeting Qualcomm Snapdragon 439 / MSM8937 / PM6125 platforms)—requiring zero filesystem endpoints (`/proc`, `/sys`) or `/dev/mem` access.
+
+Unprivileged EL0 execution cannot directly read physical MMIO registers or execute `SMC`/`HVC` calls without kernel driver mediation. Subcommands are divided into **Live EL0 Hardware Probes** (direct CPU register and timer queries with `SIGILL` trap handlers) and the **In-Memory Silicon Database** (offline architectural registers, clock trees, and PMIC equations).
+
+##### Live Architectural Probes (EL0 Assembly & Timers)
+
+* **`socprobe status` / `info`**: Silicon telemetry overview: CPU implementer/part, exception level, hardware crystal frequency (`CNTFRQ_EL0`), live measured core clock, and platform summary.
+* **`socprobe cpu`**: Inline assembly register audit with `SIGILL` trap recovery: `MIDR_EL1` (via kernel emulation), `CTR_EL0` (D-Cache/I-Cache line sizes), `DCZID_EL0`, `ID_AA64ISAR0/1_EL1`, `CNTFRQ_EL0`, and `CNTVCT_EL0`.
+* **`socprobe pll`**: Real-time CPU core clock frequency dynamically measured via unrolled assembly loops against `CNTVCT_EL0` / `CNTFRQ_EL0` cycle deltas.
+* **`socprobe pmu` / `perf`**: Inline assembly audit of ARMv8 Performance Monitor Unit (PMU) registers with `SIGILL` trap recovery:
+  * Hardware counters: `PMCR_EL0` (prescaler, counter enable), `PMCCNTR_EL0` (64-bit hardware cycle counter), `PMCNTENSET_EL0` (event enable), `PMCCFILTR_EL0` (filtering). Note: EL0 unprivileged access is detected empirically via trap recovery on `PMCCNTR_EL0`.
+  * Event catalog: `L1I_CACHE_REFILL` (0x0001), `L1D_CACHE_REFILL` (0x0003), `L1D_CACHE` (0x0004), `INST_RETIRED` (0x0008), `BR_MIS_PRED` (0x0010), `CPU_CYCLES` (0x0011), `L2D_CACHE` (0x0016), `L2D_CACHE_REFILL` (0x0017), `MEM_ACCESS` (0x0023).
+* **`socprobe disasm <HEX...>`**: Standalone AArch64 machine-instruction disassembler with automatic SMC, PMU, and SMCCC / PSCI function annotations.
+
+##### In-Memory Silicon Hardware Database (Qualcomm SDM439 / MSM8937)
+
 * **`socprobe pmic`**:
   * Qualcomm SPMI Arbiter architecture: Configuration (`0x01C0A000`), Core (`0x01C40000`), Channel Windows (`0x01E00000`), and Observer Windows (`0x03E00000`).
   * Per-peripheral register specifications: REVID (0x0100), PON reset/power-on control (0x0800), BUA backup battery (0x1000), TSENS on-die temp alarm (0x2400), SMBB charger (0x3100), FG_BATT fuel gauge (0x4000), GPIOs (0xC000), and MPPs (0xD000).
@@ -529,7 +582,7 @@ Zero-dependency silicon hardware diagnostic and machine-code analysis suite desi
   * Active silicon core power estimation profiles (Sleep, LITTLE Eco, BIG Burst, Adreno 3D GPU).
 * **`socprobe mmio [filter]`**:
   * In-memory physical MMIO register map covering 56+ hardware silicon blocks: GCC, TLMM, SPMI, QFPROM, PSHOLD, TSENS, SDHC, UFSHC, UFS-ICE, GENI-I2C, DWC3 USB, Adreno GPU, MDSS/DPU, MIPI DSI, LPASS Audio, Crypto Engine, APCS, CPUFreq-HW, CSIPHY, CSID, IFE, BPS, IPE, aDSP, cDSP, mDSP, IPA, SNOC, CNOC, MMNOC, BIMC, CE5 Crypto, BAM DMA, HWKM, UFS ICE, CPR, TSENS ROSC, Soundwire, SLIMbus, and HTP NPU.
-* **`socprobe clock` / `clk`**:
+* **`socprobe clock` / `clocks` / `clk`**:
   * Qualcomm Global Clock Controller (GCC) & RPM clock tree architecture.
   * Root Clock Generator (RCGR) layout: `CMD_RCGR` (+0x0000: Root enable, frequency switch update, root off status), `CFG_RCGR` (+0x0004: clock source select XO/GPLL, divider ratio, bypass/MND mode), `M_RCGR`, `N_RCGR`, `D_RCGR` fractional multiplier polynomials.
   * Clock Branch Control (CBCR) layout: `CLK_ENABLE`, `CLK_OFF` hardware gate status.
@@ -549,14 +602,6 @@ Zero-dependency silicon hardware diagnostic and machine-code analysis suite desi
   * Hardware compute engines: INT8, INT16, FP16, and BFLOAT16 GEMM Matrix dot-product; 1024-bit HVX SIMD vector registers (`V0`-`V31`, 128 parallel 8-bit MACs/cycle); on-die hardware ReLU, LeakyReLU, Sigmoid, and GELU activation interpolation.
   * Registers: `HTP_CORE_CFG` (clock gate, precision mode), `HTP_STATUS`, `HTP_DMA_SRC/DST_PTR` (64-bit tensor DMA addresses), `HTP_TENSOR_DIM_M_N_K` (GEMM dimensions), `HTP_ACCUM_CTRL`, and `HVX_VECTOR_CFG`.
   * Adreno GPU machine learning FP16 dot-product accelerators (`dot2acc` / `dot4acc`).
-* **`socprobe pmu` / `perf`**:
-  * Pure inline assembly audit of ARMv8 architectural Performance Monitor Unit (PMU) registers with `sigsetjmp` / `SIGILL` trap recovery:
-    * `PMCR_EL0`: Performance Monitors Control Register (hardware counter count, cycle prescaler, enable).
-    * `PMCCNTR_EL0`: 64-bit Hardware Cycle Counter (live hardware execution cycles).
-    * `PMUSERENR_EL0`: Userland Access Control Register (detects whether kernel allows EL0 unprivileged cycle/event reads).
-    * `PMCNTENSET_EL0`: Counter Enable Set Register (Cycle counter & Event counters 0-30).
-    * `PMCCFILTR_EL0`: Cycle Counter Filter (EL0/EL1/EL2/EL3 execution filters).
-  * Architectural event catalog: `L1I_CACHE_REFILL` (0x0001), `L1D_CACHE_REFILL` (0x0003), `L1D_CACHE` (0x0004), `INST_RETIRED` (0x0008), `BR_MIS_PRED` (0x0010), `CPU_CYCLES` (0x0011), `L2D_CACHE` (0x0016), `L2D_CACHE_REFILL` (0x0017), `MEM_ACCESS` (0x0023).
 * **`socprobe ardp`**:
   * Hexagon Audio Routing DSP (ARDP) & Low-Power Audio Subsystem (LPASS `0x062D0000`).
   * Digital bus controllers: MIPI Soundwire v1.1 master (`0x06280000`) for digital microphones and smart amplifiers; SLIMbus serial interconnect (`0x062DC000`).
@@ -595,9 +640,6 @@ Zero-dependency silicon hardware diagnostic and machine-code analysis suite desi
   * System Interconnect Fabrics: System NoC (SNOC), Config NoC (CNOC), Multimedia NoC (MMNOC), and BIMC LPDDR4x memory controller arbiter.
   * Traffic Quality of Service (QoS): Port priority levels (0 - 15), dynamic urgency forwarding for real-time display, and token-bucket bandwidth limiters.
   * Hardware Bandwidth Monitors (BWMON): Real-time Adreno GPU and CPU memory bus monitors with hardware sampling windows and throttling interrupts.
-* **`socprobe disasm <HEX...>`**:
-  * Pure C zero-dependency AArch64 machine-code instruction disassembler.
-  * Decodes raw 32-bit machine instructions into assembly mnemonics: MRS/MSR (system registers including PMU counters), ADRP/ADR (PC-relative), LDR/STR (32/64-bit load/store), ADD/SUB, B/BL/BLR/RET, and SMC/HVC calls with automatic ARM SMCCC / PSCI / TrustZone function annotations.
 
 ```bash
 # Display silicon hardware telemetry overview with zero filesystem dependencies
@@ -663,7 +705,7 @@ busybox socprobe disasm d5380000 d4000003 90000800 91000021 b9400000 d65f03c0
 
 ---
 
-### 9. Build Targets
+## Build Targets
 
 The custom build system (`Makefile.custom`) automatically resolves cross-compilation toolchains and sysroots:
 
@@ -685,5 +727,6 @@ make all-bins
 
 ## License & Attribution
 
-BusyBox is licensed under the **GNU General Public License, version 2** (GPLv2). See `LICENSE` for the complete license text.  
+BusyBox is licensed under the **GNU General Public License, version 2** (GPLv2). See [LICENSE](LICENSE) for the complete license text.
+
 Upstream BusyBox: [https://git.busybox.net/busybox](https://git.busybox.net/busybox)
