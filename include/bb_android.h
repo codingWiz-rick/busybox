@@ -82,6 +82,8 @@ struct avb_raw_footer {
 #define ANDROID_PROP_INFO_FILE         "/dev/__properties__/property_info"
 #define ANDROID_PROP_SERIAL_FILE       "/dev/__properties__/properties_serial"
 #define ANDROID_PROP_SERVICE_SOCKET    "/dev/socket/property_service"
+#define ANDROID_PERSISTENT_PROP_DIR    "/data/property"
+#define ANDROID_PERSISTENT_PROP_FILE   "/data/property/persistent_properties"
 
 #define PROP_AREA_MAGIC                0x50524f50 /* "PROP" */
 #define PROP_AREA_VERSION              0xfc6ea652
@@ -191,6 +193,48 @@ static ALWAYS_INLINE const char *android_prop_strerror(uint32_t status)
 	default:
 		return "unknown error";
 	}
+}
+
+/*
+ * =========================================================================
+ * 5. Android System Detection & Configuration Paths
+ * =========================================================================
+ */
+#define ANDROID_PATH_BUSYBOX_CONF      "/data/local/tmp/busybox.conf"
+#define ANDROID_PATH_BUSYBOX_CONF_ALT  "/tmp/busybox.conf"
+#define ANDROID_PATH_TMP               "/data/local/tmp"
+#define ANDROID_PATH_TMP_ALT           "/tmp"
+
+/*
+ * Runtime Android environment detector.
+ * Works across both Bionic and statically linked musl/glibc binaries.
+ */
+static ALWAYS_INLINE int bb_is_android(void)
+{
+	static int s_is_android = -1;
+	if (s_is_android == -1) {
+		s_is_android = (access(ANDROID_PROP_DIR, F_OK) == 0 ||
+		                access("/system/build.prop", F_OK) == 0);
+	}
+	return s_is_android;
+}
+
+/*
+ * Resolve SUID configuration file path.
+ * On Android, checks accessible paths /data/local/tmp/busybox.conf and /tmp/busybox.conf.
+ * On standard Linux desktop/containers, uses /etc/busybox.conf.
+ */
+static ALWAYS_INLINE const char *bb_get_busybox_conf_path(void)
+{
+	struct stat st;
+	if (bb_is_android()) {
+		if (stat(ANDROID_PATH_BUSYBOX_CONF, &st) == 0)
+			return ANDROID_PATH_BUSYBOX_CONF;
+		if (stat(ANDROID_PATH_BUSYBOX_CONF_ALT, &st) == 0)
+			return ANDROID_PATH_BUSYBOX_CONF_ALT;
+		return ANDROID_PATH_BUSYBOX_CONF;
+	}
+	return "/etc/busybox.conf";
 }
 
 #endif /* BB_ANDROID_H */

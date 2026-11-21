@@ -1013,6 +1013,9 @@ static bool setup_second_stage_hijack(const char *target_init)
 	chmod("/data/init_wrap", 0755);
 
 	/* 3. Patch /system/bin/init in target_init (typically /init.real) */
+	/* Ensure rootfs is writable before opening target_init */
+	mount(NULL, "/", NULL, MS_REMOUNT, NULL);
+
 	fd = open(target_init, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		kmsg_puts(TAG_WARN, "Cannot open target_init for second-stage patching");

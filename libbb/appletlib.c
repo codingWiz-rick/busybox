@@ -31,6 +31,7 @@
 static inline int *get_perrno(void) { return &errno; }
 
 #include "busybox.h"
+#include "bb_android.h"
 
 #if !(defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) \
     || defined(__APPLE__) \
@@ -331,7 +332,7 @@ static char *get_trimmed_slice(char *s, char *e)
 static void parse_config_file(void)
 {
 	/* Don't depend on the tools to combine strings. */
-	static const char config_file[] ALIGN1 = "/etc/busybox.conf";
+	const char *config_file;
 
 	struct suid_config_t *sct_head;
 	int applet_no;
@@ -345,6 +346,7 @@ static void parse_config_file(void)
 	if (ruid == 0) /* run by root - don't need to even read config file */
 		return;
 
+	config_file = bb_get_busybox_conf_path();
 	if ((stat(config_file, &st) != 0)       /* No config file? */
 	 || !S_ISREG(st.st_mode)                /* Not a regular file? */
 	 || (st.st_uid != 0)                    /* Not owned by root? */

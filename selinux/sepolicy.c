@@ -37,6 +37,7 @@
 //usage:     "\n	permissive <type...>"
 //usage:     "\n	enforce <type...>"
 //usage:     "\n	typeattribute <type> <attribute>"
+//usage:     "\n	type_transition <source> <target> <class> <default_type>"
 
 #include "libbb.h"
 #include <sepol/policydb/policydb.h>
@@ -253,6 +254,62 @@ static int inject_typeattribute(policydb_t *db, const char *type_name, const cha
 	return 0;
 }
 
+/* Add a type_transition rule */
+static int inject_type_transition_rule(policydb_t *db,
+				      const char *src_name, const char *tgt_name,
+				      const char *cls_name, const char *def_name)
+{
+	type_datum_t *src, *tgt, *def;
+	class_datum_t *cls;
+	avtab_key_t key;
+	avtab_ptr_t node;
+
+	src = (type_datum_t *)hashtab_search(db->p_types.table, (hashtab_key_t)src_name);
+	if (!src) {
+		bb_error_msg("source type '%s' does not exist", src_name);
+		return -1;
+	}
+
+	tgt = (type_datum_t *)hashtab_search(db->p_types.table, (hashtab_key_t)tgt_name);
+	if (!tgt) {
+		bb_error_msg("target type '%s' does not exist", tgt_name);
+		return -1;
+	}
+
+	cls = (class_datum_t *)hashtab_search(db->p_classes.table, (hashtab_key_t)cls_name);
+	if (!cls) {
+		bb_error_msg("class '%s' does not exist", cls_name);
+		return -1;
+	}
+
+	def = (type_datum_t *)hashtab_search(db->p_types.table, (hashtab_key_t)def_name);
+	if (!def) {
+		bb_error_msg("default type '%s' does not exist", def_name);
+		return -1;
+	}
+
+	memset(&key, 0, sizeof(key));
+	key.source_type = src->s.value;
+	key.target_type = tgt->s.value;
+	key.target_class = cls->s.value;
+	key.specified = AVTAB_TRANSITION;
+
+	node = avtab_search_node(&db->te_avtab, &key);
+	if (node) {
+		node->datum.data = def->s.value;
+	} else {
+		avtab_datum_t datum;
+		memset(&datum, 0, sizeof(datum));
+		datum.data = def->s.value;
+		if (avtab_insert(&db->te_avtab, &key, &datum) < 0) {
+			bb_error_msg("failed to insert type_transition rule into avtab");
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
 /* Parse and execute a single rule tokens array */
 static int execute_rule_tokens(policydb_t *db, char **argv, int argc)
 {
@@ -319,6 +376,14 @@ static int execute_rule_tokens(policydb_t *db, char **argv, int argc)
 			return -1;
 		}
 		return inject_typeattribute(db, argv[1], argv[2]);
+	}
+
+	if (strcmp(verb, "type_transition") == 0) {
+		if (argc != 5) {
+			bb_error_msg("type_transition requires <src> <tgt> <class> <default>");
+			return -1;
+		}
+		return inject_type_transition_rule(db, argv[1], argv[2], argv[3], argv[4]);
 	}
 
 	bb_error_msg("unknown sepolicy rule verb: '%s'", verb);
